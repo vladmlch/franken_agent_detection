@@ -21,6 +21,7 @@ use super::{
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
+mod generated_title;
 #[cfg(test)]
 mod read_failures;
 
@@ -752,13 +753,8 @@ fn scan_claude_with_readers<R: BufRead>(
                     // truncation; the entry is otherwise skipped as a
                     // non-conversation sidecar type.
                     if entry_type == Some("ai-title") {
-                        if let Some(title) = val
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|t| !t.is_empty())
-                        {
-                            json_title = Some(title.to_string());
+                        if let Some(title) = generated_title::generated_title(&val) {
+                            json_title = Some(title);
                         }
                         continue;
                     }
@@ -1200,6 +1196,35 @@ mod tests {
             session_dir.join("cccc-dddd.jsonl"),
             concat!(
                 r#"{"type":"ai-title","title":"Fix the flaky auth test"}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"cccc-dddd","message":{"role":"user","content":[{"type":"text","text":"please look at the auth module and fix the flaky test"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Fix the flaky auth test"));
+    }
+
+    // cass review 2026-11-02 F1
+    #[test]
+    fn scan_prefers_real_ai_title_field() {
+        let base = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(base.path());
+        let session_dir = claude_dir
+            .join("projects")
+            .join("-data-projects-demo")
+            .join("aaaa-bbbb");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("cccc-dddd.jsonl"),
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"Fix the flaky auth test","sessionId":"cccc-dddd"}"#,
                 "\n",
                 r#"{"type":"user","sessionId":"cccc-dddd","message":{"role":"user","content":[{"type":"text","text":"please look at the auth module and fix the flaky test"}]}}"#,
                 "\n",

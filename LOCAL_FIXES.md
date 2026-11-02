@@ -6,3 +6,4 @@ docs/superpowers/plans/2026-11-02-review-fixes-05-fad-fork.md.
 
 | Task | Commit | Drop when upstream… |
 |---|---|---|
+| F1 | (this commit) | reads aiTitle for ai-title records |

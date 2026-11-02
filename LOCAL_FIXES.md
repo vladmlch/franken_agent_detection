@@ -8,3 +8,4 @@ docs/superpowers/plans/2026-11-02-review-fixes-05-fad-fork.md.
 |---|---|---|
 | F1 | (this commit) | reads aiTitle for ai-title records |
 | F2 | (this commit) | keeps thinking blocks as searchable content |
+| F3 | (this commit) | keeps planner tool_calls; GENERIC results are not tools |

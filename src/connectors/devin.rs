@@ -60,6 +60,9 @@ use crate::types::{NormalizedInvocation, NormalizedMessage};
 // Local fix (cass review 2026-11-02, F4).
 #[cfg(feature = "devin")]
 mod batched_chain;
+// Local fix (cass review 2026-11-02, F5).
+#[cfg(feature = "devin")]
+mod checked_scan;
 
 /// Override for the Devin data location. Accepts the `sessions.db` file, the
 /// `cli` directory holding it, or the `devin` data root above that.
@@ -588,23 +591,11 @@ impl Connector for DevinConnector {
 
     #[cfg(feature = "devin")]
     fn scan(&self, ctx: &super::scan::ScanContext) -> anyhow::Result<Vec<NormalizedConversation>> {
-        let mut conversations = Vec::new();
-        for (_, db) in Self::database_candidates(ctx) {
-            match Self::extract_from_sqlite(&db, ctx.since_ts) {
-                Ok(found) => {
-                    tracing::debug!(
-                        "devin sqlite: found {} sessions in {}",
-                        found.len(),
-                        db.display()
-                    );
-                    conversations.extend(found);
-                }
-                Err(err) => {
-                    tracing::debug!("devin sqlite: failed to read {}: {err:#}", db.display());
-                }
-            }
-        }
-        Ok(conversations)
+        // Local fix (cass review 2026-11-02, F5): failures reach the host.
+        checked_scan::collect_databases_checked(
+            Self::database_candidates(ctx).into_iter().map(|(_, db)| db),
+            |db| Self::extract_from_sqlite(db, ctx.since_ts),
+        )
     }
 
     /// Without the `devin` feature the connector is detection-only.
@@ -1093,6 +1084,20 @@ mod tests {
         );
         assert!(connector.scan(&empty).unwrap().is_empty());
         assert!(connector.discover_source_files(&empty).unwrap().is_empty());
+    }
+
+    // cass review 2026-11-02 F5
+    #[test]
+    fn scan_reports_an_unreadable_database() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+        let ctx = crate::connectors::scan::ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![crate::connectors::scan::ScanRoot::local(db_path.clone())],
+            None,
+        );
+        assert!(DevinConnector::new().scan(&ctx).is_err());
     }
 
     #[test]

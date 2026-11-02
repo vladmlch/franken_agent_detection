@@ -592,6 +592,12 @@ fn extract_content_part(item: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Local fix (cass review 2026-11-02, F2): lets a connector add its own block
+/// types while reusing the shared per-block projection unchanged.
+pub(crate) fn projection_content_part(item: &serde_json::Value) -> Option<String> {
+    extract_content_part(item)
+}
+
 /// Extract structured invocations from a Claude API-style content block array.
 ///
 /// Emits every `tool_use` block as `kind: "tool"`. Connector-specific

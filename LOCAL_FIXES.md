@@ -11,3 +11,4 @@ docs/superpowers/plans/2026-11-02-review-fixes-05-fad-fork.md.
 | F3 | (this commit) | keeps planner tool_calls; GENERIC results are not tools |
 | F4 | (this commit) | loads main-chain payloads in batches of 256 |
 | F5 | (this commit) | an unreadable database fails the scan instead of hiding |
+| F6 | (this commit) | sums distinct-request token_count events, skips repeats |

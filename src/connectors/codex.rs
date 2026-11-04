@@ -1,4 +1,5 @@
 mod reader;
+mod token_usage_accumulation;
 mod user_prompts;
 
 pub use reader::{
@@ -466,6 +467,25 @@ impl CodexConnector {
             );
         }
     }
+
+    /// Local fix (cass review 2026-11-02, F6): like
+    /// `attach_token_usage_to_latest_assistant`, but sums onto existing usage.
+    fn accumulate_token_usage_on_latest_assistant(
+        messages: &mut [NormalizedMessage],
+        token_usage: Value,
+        source_path: &Path,
+        line_number: usize,
+    ) {
+        let existing = messages
+            .iter()
+            .rev()
+            .find(|m| Self::is_token_usage_target_message(m))
+            .and_then(|m| m.extra.pointer("/cass/token_usage"))
+            .cloned();
+        let merged =
+            token_usage_accumulation::accumulate_token_usage(existing.as_ref(), token_usage);
+        Self::attach_token_usage_to_latest_assistant(messages, merged, source_path, line_number);
+    }
 }
 
 fn update_time_bounds(started_at: &mut Option<i64>, ended_at: &mut Option<i64>, ts: Option<i64>) {
@@ -631,6 +651,7 @@ fn scan_codex_with_hooks(
             // Pair individual records, not all occurrences of prompt text.
             // Capture stream/turn identity before large-message extra compaction.
             let mut user_prompts = user_prompts::UserPrompts::default();
+            let mut token_count_tracker = token_usage_accumulation::TokenCountTracker::default();
 
             if matches!(
                 format,
@@ -903,12 +924,19 @@ fn scan_codex_with_hooks(
                                         if let Some(token_usage) =
                                             CodexConnector::token_usage_from_payload(payload)
                                         {
-                                            CodexConnector::attach_token_usage_to_latest_assistant(
-                                                &mut messages,
-                                                token_usage,
-                                                &source_path,
-                                                line_idx + 1,
-                                            );
+                                            match token_count_tracker.classify(payload) {
+                                                token_usage_accumulation::TokenCountKind::Repeat => {}
+                                                token_usage_accumulation::TokenCountKind::NewRequest => {
+                                                    CodexConnector::accumulate_token_usage_on_latest_assistant(
+                                                        &mut messages, token_usage, &source_path, line_idx + 1,
+                                                    );
+                                                }
+                                                token_usage_accumulation::TokenCountKind::Legacy => {
+                                                    CodexConnector::attach_token_usage_to_latest_assistant(
+                                                        &mut messages, token_usage, &source_path, line_idx + 1,
+                                                    );
+                                                }
+                                            }
                                         } else {
                                             tracing::debug!(
                                                 path = %source_path.display(),
@@ -1281,7 +1309,12 @@ mod tests {
             r#"{"type":"response_item","timestamp":"2026-06-14T02:45:00.000Z","payload":{"role":"assistant","content":"Working on it."}}"#,
             usage_line,
             r#"{"type":"response_item","timestamp":"2026-06-14T02:47:00.000Z","payload":{"role":"assistant","content":"Done."}}"#,
-            usage_line.replace("\"input_tokens\":42187", "\"input_tokens\":500")
+            // Local fix (cass review 2026-11-02, F6): a distinct request always
+            // carries a larger cumulative `total_tokens`; an identical total is
+            // a re-notification that the scan now skips.
+            usage_line
+                .replace("\"input_tokens\":42187", "\"input_tokens\":500")
+                .replace("\"total_tokens\":42920", "\"total_tokens\":43420")
         );
         fs::write(sessions.join("rollout-tokens.jsonl"), content).unwrap();
 
@@ -2004,6 +2037,31 @@ not valid json at all
                 .and_then(Value::as_i64),
             Some(14)
         );
+    }
+
+    // cass review 2026-11-02 F6: tool-loop requests without assistant text in between.
+    #[test]
+    fn scan_sums_distinct_request_token_counts_and_skips_repeats() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"Question"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"assistant","content":"Answer"}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5,"output_tokens":10},"total_token_usage":{"total_tokens":15}}}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:03Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5,"output_tokens":10},"total_token_usage":{"total_tokens":15}}}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:04Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"output_tokens":14},"total_token_usage":{"total_tokens":36}}}}
+"#;
+        fs::write(sessions.join("rollout-token-sum.jsonl"), content).unwrap();
+        let convs = CodexConnector::new()
+            .scan(&ScanContext::local_default(codex_dir.clone(), None))
+            .unwrap();
+        let usage = convs[0].messages[1]
+            .extra
+            .pointer("/cass/token_usage")
+            .unwrap();
+        assert_eq!(usage["input_tokens"].as_i64(), Some(12));
+        assert_eq!(usage["output_tokens"].as_i64(), Some(24));
     }
 
     // =====================================================

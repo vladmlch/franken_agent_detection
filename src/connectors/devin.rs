@@ -61,6 +61,13 @@ use super::utils::{env_path_nonempty, path_is_excluded, unwrap_skill_invocations
 #[cfg(feature = "devin")]
 use crate::types::{NormalizedInvocation, NormalizedMessage};
 
+// Local fix (cass review 2026-11-02, F4).
+#[cfg(feature = "devin")]
+mod batched_chain;
+// Local fix (cass review 2026-11-02, F5).
+#[cfg(feature = "devin")]
+mod checked_scan;
+
 /// Override for the Devin data location. Accepts the `sessions.db` file, the
 /// `cli` directory holding it, or the `devin` data root above that.
 pub const DEVIN_DATA_ROOT_ENV: &str = "CASS_DEVIN_DATA_ROOT";
@@ -214,7 +221,7 @@ impl DevinConnector {
             let Some(main_chain_id) = session.main_chain_id else {
                 continue;
             };
-            let chain = Self::load_main_chain(&conn, &session.id, main_chain_id)?;
+            let chain = batched_chain::load_main_chain_batched(&conn, &session.id, main_chain_id)?;
             let mut messages = Vec::new();
             for node in &chain.nodes {
                 if let Some(message) = message_from_chat_message(
@@ -316,6 +323,7 @@ impl DevinConnector {
     /// Walk `parent_node_id` from the chain tip to its root and return the
     /// chain in reading (root-to-tip) order, plus how many rows of the
     /// session's forest were left out.
+    #[cfg(test)]
     fn load_main_chain(conn: &Connection, session_id: &str, tip: i64) -> Result<DevinChain> {
         let edges: Vec<(i64, Option<i64>)> = conn
             .query_map_collect(
@@ -633,6 +641,8 @@ impl Connector for DevinConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let sources = Self::discover_sources(ctx)?;
+        // Local fix (cass review 2026-11-02, F5): failures reach the host.
+        let mut failures = checked_scan::ScanFailures::new();
         for source in sources {
             if !hooks.should_scan(&source) {
                 continue;
@@ -659,15 +669,10 @@ impl Connector for DevinConnector {
                         })?;
                     }
                 }
-                Err(err) => {
-                    tracing::debug!(
-                        "devin sqlite: failed to read {}: {err:#}",
-                        source.source_path.display()
-                    );
-                }
+                Err(error) => failures.record(&source.source_path, &error),
             }
         }
-        Ok(())
+        failures.finish()
     }
 
     #[cfg(feature = "devin")]
@@ -946,6 +951,49 @@ mod tests {
         assert_eq!(conv.messages[3].content, "The check passes now.");
     }
 
+    // cass review 2026-11-02 F4: batched loader == reference loader.
+    #[test]
+    fn batched_main_chain_matches_reference_for_long_chains_with_branches() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let conn = open_test_connection(&db_path);
+        create_schema(&conn);
+        insert_session(&conn, "long", "Long", "/tmp/p", 1, 2, Some(600), 0);
+        for id in 1..=600_i64 {
+            let parent = if id == 1 { None } else { Some(id - 1) };
+            insert_node(
+                &conn,
+                id,
+                "long",
+                parent,
+                &json!({"message_id": format!("m{id}"), "role": "user", "content": format!("turn {id}"), "metadata": {}}),
+                1_786_000_000 + id,
+            );
+        }
+        for id in 601..=800_i64 {
+            insert_node(
+                &conn,
+                id,
+                "long",
+                Some(10),
+                &json!({"message_id": format!("b{id}"), "role": "user", "content": "branch", "metadata": {}}),
+                1_786_000_000 + id,
+            );
+        }
+        let reference = DevinConnector::load_main_chain(&conn, "long", 600).unwrap();
+        let batched = batched_chain::load_main_chain_batched(&conn, "long", 600).unwrap();
+        assert_eq!(batched.off_chain_nodes, reference.off_chain_nodes);
+        assert_eq!(batched.off_chain_nodes, 200);
+        let pairs = |c: &DevinChain| {
+            c.nodes
+                .iter()
+                .map(|n| (n.chat_message.clone(), n.created_at))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pairs(&batched), pairs(&reference));
+        assert_eq!(batched.nodes.len(), 600);
+    }
+
     #[test]
     fn extract_honors_since_ts_on_last_activity() {
         let dir = TempDir::new().unwrap();
@@ -1133,6 +1181,20 @@ mod tests {
         );
         assert!(connector.scan(&empty).unwrap().is_empty());
         assert!(connector.discover_source_files(&empty).unwrap().is_empty());
+    }
+
+    // cass review 2026-11-02 F5
+    #[test]
+    fn scan_reports_an_unreadable_database() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+        let ctx = crate::connectors::scan::ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![crate::connectors::scan::ScanRoot::local(db_path.clone())],
+            None,
+        );
+        assert!(DevinConnector::new().scan(&ctx).is_err());
     }
 
     #[test]

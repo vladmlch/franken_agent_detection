@@ -88,6 +88,9 @@ use crate::types::{
     reindex_messages,
 };
 
+// Local fix (cass review 2026-11-02, F3): planner tool calls.
+mod planner_calls;
+
 /// Normalized agent slug emitted for every Antigravity conversation.
 const AGENT_SLUG: &str = "antigravity";
 
@@ -587,20 +590,33 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
             Some(message("user", None, created, body, extra, Vec::new()))
         }
         "PLANNER_RESPONSE" => {
-            if content.trim().is_empty() && thinking.is_none() {
+            // Local fix (cass review 2026-11-02, F3).
+            let invocations = planner_calls::explicit_planner_invocations(rec.get("tool_calls"));
+            if content.trim().is_empty() && thinking.is_none() && invocations.is_empty() {
                 return None;
             }
+            let body = if content.trim().is_empty() && thinking.is_none() {
+                planner_calls::tool_call_body(&invocations)
+            } else {
+                content
+            };
             let mut extra = Map::new();
             if let Some(t) = thinking {
                 extra.insert("thinking".to_string(), Value::String(t));
+            }
+            if !invocations.is_empty() {
+                extra.insert(
+                    "cass".to_string(),
+                    planner_calls::invocations_extra(&invocations),
+                );
             }
             Some(message(
                 "assistant",
                 None,
                 created,
-                content,
+                body,
                 extra,
-                Vec::new(),
+                invocations,
             ))
         }
         "CONVERSATION_HISTORY" => None,
@@ -628,7 +644,15 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
             // A MODEL step that is not a planner response is a tool action/result
             // (VIEW_FILE, EDIT_FILE, RUN_COMMAND, …, or an unknown future kind).
             if source == "MODEL" {
-                let invocations = parse_tool_calls(tool_calls, step_type);
+                // Local fix (cass review 2026-11-02, F3): a GENERIC record without
+                // calls is the planner call's result, not a tool named "generic".
+                let invocations = if tool_calls.is_none()
+                    && planner_calls::RESULT_STEP_TYPES.contains(&step_type)
+                {
+                    Vec::new()
+                } else {
+                    parse_tool_calls(tool_calls, step_type)
+                };
                 if content.trim().is_empty() && thinking.is_none() && invocations.is_empty() {
                     return None;
                 }
@@ -1221,6 +1245,58 @@ mod tests {
                 .unwrap()
                 .contains("Planning the steps")
         );
+    }
+
+    // cass review 2026-11-02 F3: real producer shape.
+    #[test]
+    fn planner_tool_calls_only_record_is_kept_with_calls() {
+        let rec = serde_json::json!({
+            "step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "status": "DONE", "created_at": "2026-06-11T20:14:43Z",
+            "tool_calls": [{"name": "view_file", "args": {"AbsolutePath": "/a.rs"}}]
+        });
+        let msg = record_to_message(&rec).expect("tool-call-only planner record is kept");
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.content, "[Tool: view_file]");
+        assert_eq!(msg.invocations.len(), 1);
+        assert_eq!(msg.invocations[0].name, "view_file");
+        assert_eq!(
+            msg.extra["cass"]["invocations"][0]["arguments"]["AbsolutePath"],
+            "/a.rs"
+        );
+    }
+
+    #[test]
+    fn planner_text_thinking_and_calls_keep_all_three() {
+        let rec = serde_json::json!({
+            "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": "2026-06-11T20:14:43Z",
+            "content": "reading it", "thinking": "plan",
+            "tool_calls": [{"name": "view_file", "args": {}}]
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.content, "reading it");
+        assert_eq!(msg.extra["thinking"], "plan");
+        assert_eq!(msg.invocations[0].name, "view_file");
+    }
+
+    #[test]
+    fn generic_result_does_not_invent_a_generic_tool() {
+        let rec = serde_json::json!({
+            "source": "MODEL", "type": "GENERIC", "created_at": "2026-06-11T20:14:44Z",
+            "content": "file contents"
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.role, "tool");
+        assert!(
+            msg.invocations.is_empty(),
+            "GENERIC is a result, not a tool call"
+        );
+    }
+
+    #[test]
+    fn empty_planner_without_calls_is_still_dropped() {
+        let rec = serde_json::json!({"source": "MODEL", "type": "PLANNER_RESPONSE", "content": ""});
+        assert!(record_to_message(&rec).is_none());
     }
 
     #[test]

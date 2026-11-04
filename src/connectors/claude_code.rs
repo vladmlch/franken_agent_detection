@@ -21,8 +21,10 @@ use super::{
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
+mod generated_title;
 #[cfg(test)]
 mod read_failures;
+mod retained_content;
 
 /// Claude Code session ingestion.
 ///
@@ -760,13 +762,8 @@ fn scan_claude_with_readers<R: BufRead>(
                     // truncation; the entry is otherwise skipped as a
                     // non-conversation sidecar type.
                     if entry_type == Some("ai-title") {
-                        if let Some(title) = val
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|t| !t.is_empty())
-                        {
-                            json_title = Some(title.to_string());
+                        if let Some(title) = generated_title::generated_title(&val) {
+                            json_title = Some(title);
                         }
                         continue;
                     }
@@ -810,7 +807,9 @@ fn scan_claude_with_readers<R: BufRead>(
                         .get("message")
                         .and_then(|m| m.get("content"))
                         .or_else(|| val.get("content"));
-                    let content_str = content_val.map(flatten_content).unwrap_or_default();
+                    let content_str = content_val
+                        .map(retained_content::flatten_claude_content)
+                        .unwrap_or_default();
 
                     // Tool results ride in user entries as
                     // content:[{type:"tool_result", tool_use_id, content}].
@@ -969,7 +968,9 @@ fn scan_claude_with_readers<R: BufRead>(
                         };
 
                         let content_val = item.get("content").or_else(|| item.get("text"));
-                        let content_str = content_val.map(flatten_content).unwrap_or_default();
+                        let content_str = content_val
+                            .map(retained_content::flatten_claude_content)
+                            .unwrap_or_default();
 
                         if content_str.trim().is_empty() {
                             continue;
@@ -1227,6 +1228,70 @@ mod tests {
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].title.as_deref(), Some("Fix the flaky auth test"));
+    }
+
+    // cass review 2026-11-02 F1
+    #[test]
+    fn scan_prefers_real_ai_title_field() {
+        let base = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(base.path());
+        let session_dir = claude_dir
+            .join("projects")
+            .join("-data-projects-demo")
+            .join("aaaa-bbbb");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("cccc-dddd.jsonl"),
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"Fix the flaky auth test","sessionId":"cccc-dddd"}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"cccc-dddd","message":{"role":"user","content":[{"type":"text","text":"please look at the auth module and fix the flaky test"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Fix the flaky auth test"));
+    }
+
+    // cass review 2026-11-02 F2
+    #[test]
+    fn scan_keeps_thinking_only_assistant_records() {
+        let base = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(base.path());
+        let session_dir = claude_dir.join("projects").join("-data-projects-demo");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("eeee-ffff.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"eeee-ffff","message":{"role":"user","content":"why?"}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"eeee-ffff","requestId":"r1","message":{"id":"m1","role":"assistant","model":"claude-x","content":[{"type":"thinking","thinking":"migration order matters"}],"usage":{"input_tokens":10,"output_tokens":7}}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"eeee-ffff","requestId":"r1","message":{"id":"m1","role":"assistant","model":"claude-x","content":[{"type":"text","text":"answer"}],"usage":{"input_tokens":10,"output_tokens":7}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let convs = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1);
+        let contents: Vec<&str> = convs[0]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            ["why?", "[Thinking]\nmigration order matters", "answer"]
+        );
+        assert_eq!(convs[0].messages[1].extra["requestId"], "r1");
     }
 
     #[test]

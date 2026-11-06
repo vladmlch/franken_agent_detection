@@ -13,3 +13,4 @@ docs/superpowers/plans/2026-11-02-review-fixes-05-fad-fork.md.
 | F5 | (this commit) | an unreadable database fails the scan instead of hiding |
 | F6 | (this commit) | sums distinct-request token_count events, skips repeats |
 | F7 | (this commit) | ticks progress per row and composer inside Cursor's extract_from_db |
+| F8 | (this commit) | Cursor key-range queries seek the key index (no residual predicate), or frankensqlite plans a range plus a residual predicate as an index seek |

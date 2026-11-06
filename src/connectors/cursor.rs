@@ -58,6 +58,14 @@ mod bubble_type {
 /// Keys are bubble IDs for O(1) lookup within a composer.
 type BubbleDataMap = HashMap<String, Value>;
 
+/// One key-prefix range of `cursorDiskKV` (`?1` inclusive, `?2` exclusive).
+/// It must stay a bare key range: frankensqlite plans any residual predicate
+/// (such as `value IS NOT NULL`) as a full table scan, and a real
+/// multi-gigabyte `state.vscdb` then reads the whole table once per composer
+/// (cass F8). Callers skip NULL values in the row mapper instead.
+const CURSOR_DISK_KV_RANGE_SQL: &str =
+    "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?";
+
 pub struct CursorConnector;
 
 impl Default for CursorConnector {
@@ -354,22 +362,26 @@ impl CursorConnector {
 
         let prefix_len = prefix.len();
 
-        // Filter out NULL-value rows (same rationale as the composerData
-        // query in extract_from_db): Cursor inserts internal markers with
-        // no chat payload, and `row.get_typed(1)?` on NULL aborts the whole
+        // Skip NULL-value rows (same rationale as the composerData query in
+        // extract_from_db): Cursor inserts internal markers with no chat
+        // payload, and `row.get_typed::<String>(1)?` on NULL aborts the whole
         // query_map_collect — silently emptying this conversation's bubble
-        // map so the entire chat is dropped as message-less.
+        // map so the entire chat is dropped as message-less. They are skipped
+        // here rather than in SQL (see `CURSOR_DISK_KV_RANGE_SQL`).
         match conn.query_map_collect(
-            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
+            CURSOR_DISK_KV_RANGE_SQL,
             params![prefix.as_str(), limit.as_str()],
             |row| {
                 let key: String = row.get_typed(0)?;
-                let value: String = row.get_typed(1)?;
+                let value: Option<String> = row.get_typed(1)?;
                 Ok((key, value))
             },
         ) {
             Ok(rows) => {
                 for (key, value) in rows {
+                    let Some(value) = value else {
+                        continue;
+                    };
                     // Key format: bubbleId:{composerId}:{bubbleId}
                     // Extract just the bubbleId part
                     if key.len() > prefix_len {
@@ -504,20 +516,24 @@ impl CursorConnector {
         // Surface query errors at warn level: a corrupted page or missing
         // table must not be indistinguishable from a legitimately empty DB.
         match conn.query_map_collect(
-            // Filter out NULL-value rows: Cursor inserts internal markers with no
-            // chat payload, and `row.get_typed(1)?` on NULL aborts the whole
-            // query_map_collect — silently turning every row into zero conversations.
-            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
+            // Skip NULL-value rows: Cursor inserts internal markers with no
+            // chat payload, and `row.get_typed::<String>(1)?` on NULL aborts the
+            // whole query_map_collect — silently turning every row into zero
+            // conversations. Not in SQL (see `CURSOR_DISK_KV_RANGE_SQL`).
+            CURSOR_DISK_KV_RANGE_SQL,
             params![composer_prefix, composer_limit.as_str()],
             |row| {
                 tick();
                 let key: String = row.get_typed(0)?;
-                let value: String = row.get_typed(1)?;
+                let value: Option<String> = row.get_typed(1)?;
                 Ok((key, value))
             },
         ) {
             Ok(rows) => {
                 for (key, value) in rows {
+                    let Some(value) = value else {
+                        continue;
+                    };
                     // Each composer runs its own bubble range query.
                     tick();
                     if let Some(conv) = Self::parse_composer_data(
@@ -2293,6 +2309,32 @@ mod tests {
             convs[0].source_path.starts_with(&db_path),
             "Cursor conversation source path should be derived from consumed db {}",
             db_path.display()
+        );
+    }
+
+    /// Cursor declares `key TEXT UNIQUE`, so the key range is served by the
+    /// `sqlite_autoindex_cursorDiskKV_1` index. A residual predicate in this
+    /// SQL (it once carried `value IS NOT NULL`) makes frankensqlite plan a
+    /// full table scan, which on a real 2.9 GB store read the whole table for
+    /// each of 1,488 composers: about 0.8 s each, 20+ minutes per scan.
+    #[test]
+    fn cursor_disk_kv_range_query_seeks_the_key_index() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.vscdb");
+        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+        conn.execute("CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)")
+            .unwrap();
+        let plan = conn
+            .query_map_collect(
+                &format!("EXPLAIN QUERY PLAN {CURSOR_DISK_KV_RANGE_SQL}"),
+                params!["bubbleId:a:", "bubbleId:a;"],
+                |row| row.get_typed::<String>(3),
+            )
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("USING INDEX sqlite_autoindex_cursorDiskKV_1"),
+            "the key-range query must seek the key index, got:\n{plan}"
         );
     }
 

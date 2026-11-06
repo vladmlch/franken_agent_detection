@@ -474,10 +474,16 @@ impl CursorConnector {
         None
     }
 
-    /// Extract chat sessions from a SQLite database
+    /// Extract chat sessions from a SQLite database.
+    ///
+    /// `tick` is called for every row the queries read and before every
+    /// composer is parsed. A large `state.vscdb` takes many minutes here
+    /// before the first conversation is yielded, and the host's stall
+    /// watchdog must see that work as progress (cass#373).
     fn extract_from_db(
         db_path: &Path,
         since_ts: Option<i64>,
+        tick: &dyn Fn(),
     ) -> Result<Vec<NormalizedConversation>> {
         let conn = open_with_flags(
             db_path.to_string_lossy().as_ref(),
@@ -504,6 +510,7 @@ impl CursorConnector {
             "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
             params![composer_prefix, composer_limit.as_str()],
             |row| {
+                tick();
                 let key: String = row.get_typed(0)?;
                 let value: String = row.get_typed(1)?;
                 Ok((key, value))
@@ -511,6 +518,8 @@ impl CursorConnector {
         ) {
             Ok(rows) => {
                 for (key, value) in rows {
+                    // Each composer runs its own bubble range query.
+                    tick();
                     if let Some(conv) = Self::parse_composer_data(
                         &key,
                         &value,
@@ -533,6 +542,7 @@ impl CursorConnector {
             "SELECT key, value FROM ItemTable WHERE (key LIKE '%aichat%chatdata%' OR key LIKE '%composer%') AND value IS NOT NULL",
             params![],
             |row| {
+                tick();
                 let key: String = row.get_typed(0)?;
                 let value: String = row.get_typed(1)?;
                 Ok((key, value))
@@ -1349,6 +1359,11 @@ impl Connector for CursorConnector {
         // external_id pass through: dropping them would trade a duplicate bug
         // for a loss bug. Mirrors the opencode connector's spanning dedupe.
         let mut seen_db_session_ids: HashSet<String> = HashSet::new();
+        let tick = || {
+            if let Some(tick) = &ctx.progress_tick {
+                tick();
+            }
+        };
 
         // Composer (`state.vscdb` -> `composerData:*`) — unchanged behavior.
         let roots: Vec<PathBuf> = Self::source_roots(ctx)
@@ -1369,7 +1384,7 @@ impl Connector for CursorConnector {
                     continue;
                 }
 
-                match Self::extract_from_db(&db_path, ctx.since_ts) {
+                match Self::extract_from_db(&db_path, ctx.since_ts, &tick) {
                     Ok(convs) => {
                         let mut kept = 0;
                         for conv in convs {
@@ -2085,7 +2100,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        let convs = CursorConnector::extract_from_db(&db_path, None, &|| {}).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.contains("Database test"));
     }
@@ -2112,7 +2127,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        let convs = CursorConnector::extract_from_db(&db_path, None, &|| {}).unwrap();
         assert_eq!(convs.len(), 1);
     }
 
@@ -2123,7 +2138,7 @@ mod tests {
 
         let _conn = create_test_db(&db_path);
 
-        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        let convs = CursorConnector::extract_from_db(&db_path, None, &|| {}).unwrap();
         assert!(convs.is_empty());
     }
 
@@ -2132,7 +2147,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("nonexistent.vscdb");
 
-        let result = CursorConnector::extract_from_db(&db_path, None);
+        let result = CursorConnector::extract_from_db(&db_path, None, &|| {});
         assert!(result.is_err());
     }
 
@@ -2162,7 +2177,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        let convs = CursorConnector::extract_from_db(&db_path, None, &|| {}).unwrap();
         assert_eq!(
             convs.len(),
             1,
@@ -2196,7 +2211,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        let convs = CursorConnector::extract_from_db(&db_path, None, &|| {}).unwrap();
         assert_eq!(convs.len(), 1);
     }
 
@@ -2278,6 +2293,60 @@ mod tests {
             convs[0].source_path.starts_with(&db_path),
             "Cursor conversation source path should be derived from consumed db {}",
             db_path.display()
+        );
+    }
+
+    /// A large `state.vscdb` keeps `extract_from_db` busy for many minutes
+    /// before the first conversation exists. The host's stall watchdog only
+    /// sees that work through the progress tick, so every row read and every
+    /// composer parsed must tick (cass#373).
+    #[test]
+    fn scan_ticks_progress_for_every_row_and_composer() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let cursor_dir = dir.path().join("Cursor");
+        let global_dir = cursor_dir.join("globalStorage");
+        fs::create_dir_all(&global_dir).unwrap();
+        let db_path = global_dir.join("state.vscdb");
+        let conn = create_test_db(&db_path);
+        for id in ["tick-a", "tick-b", "tick-c"] {
+            let value = json!({ "text": format!("composer {id}") }).to_string();
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![format!("composerData:{id}").as_str(), value.as_str()],
+            )
+            .unwrap();
+        }
+        let legacy =
+            json!({ "tabs": [{ "bubbles": [{ "text": "legacy", "type": "user" }] }] }).to_string();
+        conn.execute_compat(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            params![
+                "workbench.panel.aichat.view.aichat.chatdata",
+                legacy.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let ctx =
+            ScanContext::local_default(cursor_dir, None).with_progress_tick(Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }));
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 4, "three composers and one legacy chat");
+        // One tick per composerData row read, one per composer parsed, and
+        // one per ItemTable row read.
+        let expected_min = 3 + 3 + 1;
+        assert!(
+            ticks.load(Ordering::Relaxed) >= expected_min,
+            "the scan ticked only {} times",
+            ticks.load(Ordering::Relaxed)
         );
     }
 
@@ -2688,7 +2757,7 @@ mod tests {
         let db_path = dir.path().join("corrupted.vscdb");
         fs::write(&db_path, "not a sqlite database at all").unwrap();
 
-        let result = CursorConnector::extract_from_db(&db_path, None);
+        let result = CursorConnector::extract_from_db(&db_path, None, &|| {});
         // SQLite engines may open the file lazily; query failures are caught with if-let-Ok
         // The important thing is that it doesn't panic
         if let Ok(convs) = result {
@@ -2710,7 +2779,7 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let result = CursorConnector::extract_from_db(&db_path, None);
+        let result = CursorConnector::extract_from_db(&db_path, None, &|| {});
         // Should not error even without expected tables
         assert!(result.is_ok(), "missing tables should not cause an error");
         assert!(result.unwrap().is_empty());
@@ -2737,7 +2806,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        let convs = CursorConnector::extract_from_db(&db_path, None, &|| {}).unwrap();
         // Should not crash; no messages means no conversation
         assert!(
             convs.is_empty(),
@@ -2822,7 +2891,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        let convs = CursorConnector::extract_from_db(&db_path, None, &|| {}).unwrap();
         assert_eq!(
             convs.len(),
             2,

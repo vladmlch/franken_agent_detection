@@ -44,14 +44,14 @@ use std::path::Path;
 #[cfg(feature = "devin")]
 use anyhow::{Context, Result};
 #[cfg(feature = "devin")]
-use frankensqlite::compat::{OpenFlags, RowExt};
+use frankensqlite::compat::RowExt;
 #[cfg(feature = "devin")]
 use frankensqlite::params;
 
 #[cfg(feature = "devin")]
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 #[cfg(feature = "devin")]
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
 #[cfg(feature = "devin")]
 use super::utils::env_path_nonempty;
 #[cfg(feature = "devin")]
@@ -182,11 +182,8 @@ impl DevinConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Devin db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open Devin db: {}", db_path.display()))?;
         conn.execute("PRAGMA busy_timeout = 5000;")
             .context("failed to set busy_timeout on Devin db")?;
 

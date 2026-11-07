@@ -39,7 +39,8 @@
 //! ## transcript.jsonl record shape
 //!
 //! Each line is one JSON object: `{ step_index, source, type, status,
-//! created_at, content?, thinking?, tool_calls? }`.
+//! created_at, content?, thinking?, tool_calls?, error?, media?,
+//! truncated_fields? }`.
 //!
 //! - `step_index` (i64) — timeline order. Indices may have gaps; we sort by it.
 //! - `source` — `USER_EXPLICIT` | `MODEL` | `SYSTEM`.
@@ -58,12 +59,28 @@
 //!   - `EPHEMERAL_MESSAGE` / `SYSTEM_MESSAGE` (`SYSTEM`) → `role: "system"`
 //!     (preserved faithfully; tagged in `extra` so consumers can down-rank the
 //!     repetitive ephemeral reminders).
-//!   - `CONVERSATION_HISTORY` (`SYSTEM`) — a null-content marker; no message.
+//!   - `ERROR_MESSAGE` (`SYSTEM`) → `role: "system"`. Records with `content` keep
+//!     it; error-only records (no `content`) are emitted with the `error` text
+//!     as their content instead of being dropped whole (cass F10).
+//!   - `CONVERSATION_HISTORY` (`SYSTEM`) — a marker record. It emits no message
+//!     when content-less, but when it carries `content` that text is emitted as
+//!     a `role: "system"` message instead of vanishing with the record (cass F10).
 //! - `created_at` — RFC3339 UTC (`2026-06-11T20:14:42Z`), read by [`parse_timestamp`].
 //!
 //! Unknown future `type`s are never dropped or crashed on: they are emitted as a
 //! best-effort message keyed off `source`, with the raw `type` kept in
 //! `extra.agy_type`. (See the agy version-compatibility guard work.)
+//!
+//! ## Source-field passthrough (cass F10)
+//!
+//! Every emitted message also carries, under their source names and only when
+//! the record has them, the fields the canonical mapping above used to drop:
+//! `truncated_fields` (the source-side truncation markers — the only signal
+//! that distinguishes truncated sessions from clean ones), `status` (the
+//! record's lifecycle state), `error` (the failure text) and `media`
+//! (attachment references, `{mime_type, uri}`). They land in the message
+//! `extra` without touching content, roles or order of anything already
+//! emitted.
 
 use std::path::{Path, PathBuf};
 
@@ -479,6 +496,30 @@ fn parse_tool_calls(tool_calls: Option<&Value>, step_type: &str) -> Vec<Normaliz
         .collect()
 }
 
+/// Source fields passed through into message extras verbatim (cass F10).
+///
+/// The canonical mapping below extracts the text-bearing fields and used to
+/// drop every other field on the floor; these four carry signals cass needs
+/// to tell truncated sessions from clean ones and to verify tool exit/error:
+///
+/// - `truncated_fields` — the source-side truncation markers (which fields
+///   were cut before persistence; the only signal separating truncated
+///   sessions from clean ones),
+/// - `status` — the record's lifecycle state (`DONE`/`RUNNING`/`ERROR`/
+///   `INVALID`),
+/// - `error` — the failure text (`ERROR_MESSAGE` and `GENERIC` records),
+/// - `media` — attachment references (`{mime_type, uri}`).
+///
+/// They ride along under their source names, only when the source record
+/// actually carries them (absent or `null` fields add no key).
+fn insert_passthrough_extras(rec: &Value, extra: &mut Map<String, Value>) {
+    for key in ["truncated_fields", "status", "error", "media"] {
+        if let Some(value) = rec.get(key).filter(|v| !v.is_null()) {
+            extra.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
 /// Build a [`NormalizedMessage`] (idx assigned later by `reindex_messages`).
 fn message(
     role: &str,
@@ -533,6 +574,7 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
             if let Some(m) = metadata {
                 extra.insert("additional_metadata".to_string(), Value::String(m));
             }
+            insert_passthrough_extras(rec, &mut extra);
             Some(message("user", None, created, body, extra, Vec::new()))
         }
         "PLANNER_RESPONSE" => {
@@ -556,6 +598,7 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
                     planner_calls::invocations_extra(&invocations),
                 );
             }
+            insert_passthrough_extras(rec, &mut extra);
             Some(message(
                 "assistant",
                 None,
@@ -565,7 +608,43 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
                 invocations,
             ))
         }
-        "CONVERSATION_HISTORY" => None,
+        // cass F10 (item 5): a marker record — but when it carries content,
+        // that text must reach the packet instead of vanishing with the
+        // record. The content-less marker form still emits no message.
+        "CONVERSATION_HISTORY" => {
+            if content.trim().is_empty() {
+                return None;
+            }
+            let mut extra = Map::new();
+            extra.insert("agy_type".to_string(), Value::String(step_type.to_string()));
+            if !source.is_empty() {
+                extra.insert("agy_source".to_string(), Value::String(source.to_string()));
+            }
+            insert_passthrough_extras(rec, &mut extra);
+            Some(message("system", None, created, content, extra, Vec::new()))
+        }
+        // cass F10 (item 2): ERROR_MESSAGE records with no `content` carry
+        // the failure text in `error` and were dropped whole; emit that text
+        // as the message content so the record stops vanishing. Content-
+        // bearing records keep their content byte-for-byte (the envelope
+        // shape they already had via the fall-through below).
+        "ERROR_MESSAGE" => {
+            let body = if content.trim().is_empty() {
+                rec.get("error")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())?
+                    .to_string()
+            } else {
+                content
+            };
+            let mut extra = Map::new();
+            extra.insert("agy_type".to_string(), Value::String(step_type.to_string()));
+            if !source.is_empty() {
+                extra.insert("agy_source".to_string(), Value::String(source.to_string()));
+            }
+            insert_passthrough_extras(rec, &mut extra);
+            Some(message("system", None, created, body, extra, Vec::new()))
+        }
         "EPHEMERAL_MESSAGE" | "SYSTEM_MESSAGE" => {
             if content.trim().is_empty() {
                 return None;
@@ -577,6 +656,7 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
             } else {
                 "system"
             };
+            insert_passthrough_extras(rec, &mut extra);
             Some(message(
                 "system",
                 Some(author),
@@ -608,6 +688,7 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
                     extra.insert("thinking".to_string(), Value::String(t));
                 }
                 let author = step_type.to_ascii_lowercase();
+                insert_passthrough_extras(rec, &mut extra);
                 Some(message(
                     "tool",
                     Some(author.as_str()),
@@ -627,6 +708,7 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
                 if !source.is_empty() {
                     extra.insert("agy_source".to_string(), Value::String(source.to_string()));
                 }
+                insert_passthrough_extras(rec, &mut extra);
                 Some(message("system", None, created, content, extra, Vec::new()))
             }
         }
@@ -1260,6 +1342,263 @@ mod tests {
         assert_eq!(unknown.role, "tool");
         assert!(unknown.content.contains("preview"));
         assert_eq!(unknown.invocations[0].name, "browser_preview");
+    }
+
+    // ---------------------------------------------------------------------
+    // cass F10: source passthrough. The canonical mapping below extracts the
+    // text-bearing fields and used to drop four source signals cass needs
+    // (truncated_fields markers, the lifecycle `status`, the `error` text,
+    // `media` attachment refs) plus two whole record shapes (error-only
+    // ERROR_MESSAGE, text-bearing CONVERSATION_HISTORY). All fixtures here
+    // are synthetic — made-up text, real key/type structure only.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn truncated_fields_pass_through_to_extra() {
+        // Real shape: `truncated_fields` is a list of the source field names
+        // that were truncated before persistence (cass F10 item 1).
+        let rec = serde_json::json!({
+            "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": "2026-06-11T20:14:42Z",
+            "content": "<USER_REQUEST>\ninspect the widget rack\n</USER_REQUEST>",
+            "truncated_fields": ["content"]
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(
+            msg.extra["truncated_fields"],
+            serde_json::json!(["content"])
+        );
+
+        // PLANNER_RESPONSE markers (thinking/tool_calls truncations are the
+        // real combinations) ride along without touching the content.
+        let rec = serde_json::json!({
+            "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "status": "DONE", "created_at": "2026-06-11T20:14:43Z",
+            "content": "partial narration about the rack",
+            "truncated_fields": ["thinking", "tool_calls"]
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.content, "partial narration about the rack");
+        assert_eq!(
+            msg.extra["truncated_fields"],
+            serde_json::json!(["thinking", "tool_calls"])
+        );
+
+        // No marker in the source → no key in extra.
+        let rec = serde_json::json!({
+            "source": "MODEL", "type": "GENERIC",
+            "created_at": "2026-06-11T20:14:44Z", "content": "result text"
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert!(msg.extra.get("truncated_fields").is_none());
+    }
+
+    #[test]
+    fn error_only_error_message_is_emitted_with_error_text() {
+        // Real shape: ERROR_MESSAGE records with no `content`, the failure
+        // text only in `error` — dropped whole before cass F10 item 2.
+        let rec = serde_json::json!({
+            "step_index": 7, "source": "SYSTEM", "type": "ERROR_MESSAGE",
+            "status": "DONE", "created_at": "2026-06-11T20:14:47Z",
+            "error": "the widget pipeline collapsed"
+        });
+        let msg = record_to_message(&rec).expect("error-only ERROR_MESSAGE must not vanish");
+        assert_eq!(msg.role, "system");
+        assert_eq!(msg.content, "the widget pipeline collapsed");
+        assert_eq!(msg.extra["agy_type"], "ERROR_MESSAGE");
+        assert_eq!(msg.extra["agy_source"], "SYSTEM");
+        assert_eq!(msg.extra["error"], "the widget pipeline collapsed");
+
+        // Content-bearing ERROR_MESSAGE keeps its content byte-for-byte and
+        // now also exposes the `error` field (cass F10 item 3).
+        let rec = serde_json::json!({
+            "step_index": 8, "source": "SYSTEM", "type": "ERROR_MESSAGE",
+            "status": "DONE", "created_at": "2026-06-11T20:14:48Z",
+            "content": "the widget failed to load",
+            "error": "widget_error_code_9"
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.role, "system");
+        assert_eq!(msg.content, "the widget failed to load");
+        assert_eq!(msg.extra["error"], "widget_error_code_9");
+
+        // Neither content nor error → still no message (nothing to emit).
+        let rec = serde_json::json!({
+            "source": "SYSTEM", "type": "ERROR_MESSAGE",
+            "status": "DONE", "created_at": "2026-06-11T20:14:49Z"
+        });
+        assert!(record_to_message(&rec).is_none());
+    }
+
+    #[test]
+    fn generic_error_field_is_kept_in_extras() {
+        // Real shape: GENERIC result records carry an `error` field next to
+        // their text; FAD dropped the field from every record before F10.
+        let rec = serde_json::json!({
+            "step_index": 5, "source": "MODEL", "type": "GENERIC",
+            "status": "ERROR", "created_at": "2026-06-11T20:14:45Z",
+            "content": "the rack probe returned nothing",
+            "error": "exit status 1 from the widget builder"
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.role, "tool");
+        assert_eq!(msg.content, "the rack probe returned nothing");
+        assert_eq!(msg.extra["error"], "exit status 1 from the widget builder");
+        assert_eq!(msg.extra["status"], "ERROR");
+    }
+
+    #[test]
+    fn media_references_are_kept_in_extras() {
+        // Real shape: `media` is a list of {mime_type, uri} attachment refs.
+        let rec = serde_json::json!({
+            "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": "2026-06-11T20:14:42Z",
+            "content": "<USER_REQUEST>\nlook at the attached doodle\n</USER_REQUEST>",
+            "media": [
+                {"mime_type": "image/png", "uri": "file:///tmp/synthetic-doodle.png"},
+                {"mime_type": "text/plain", "uri": "file:///tmp/synthetic-notes.txt"}
+            ]
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "look at the attached doodle");
+        assert_eq!(
+            msg.extra["media"],
+            serde_json::json!([
+                {"mime_type": "image/png", "uri": "file:///tmp/synthetic-doodle.png"},
+                {"mime_type": "text/plain", "uri": "file:///tmp/synthetic-notes.txt"}
+            ])
+        );
+
+        // GENERIC-carried media refs survive too (a real occurrence).
+        let rec = serde_json::json!({
+            "source": "MODEL", "type": "GENERIC",
+            "created_at": "2026-06-11T20:14:46Z", "content": "rendered the attachment",
+            "media": [{"mime_type": "image/png", "uri": "file:///tmp/synthetic-render.png"}]
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.extra["media"][0]["mime_type"], "image/png");
+        assert_eq!(
+            msg.extra["media"][0]["uri"],
+            "file:///tmp/synthetic-render.png"
+        );
+    }
+
+    #[test]
+    fn conversation_history_content_is_emitted() {
+        // Real shape: CONVERSATION_HISTORY is a marker record, but one real
+        // record carries text — that text must reach the packet (F10 item 5).
+        let rec = serde_json::json!({
+            "step_index": 1, "source": "SYSTEM", "type": "CONVERSATION_HISTORY",
+            "status": "DONE", "created_at": "2026-06-11T20:14:42Z",
+            "content": "earlier turns were folded into this synthetic history note"
+        });
+        let msg = record_to_message(&rec).expect("CONVERSATION_HISTORY text must not vanish");
+        assert_eq!(msg.role, "system");
+        assert_eq!(
+            msg.content,
+            "earlier turns were folded into this synthetic history note"
+        );
+        assert_eq!(msg.extra["agy_type"], "CONVERSATION_HISTORY");
+
+        // The marker form (no content) is still no message.
+        let rec = serde_json::json!({
+            "step_index": 2, "source": "SYSTEM", "type": "CONVERSATION_HISTORY",
+            "status": "DONE", "created_at": "2026-06-11T20:14:43Z"
+        });
+        assert!(record_to_message(&rec).is_none());
+    }
+
+    #[test]
+    fn lifecycle_status_passes_into_extras() {
+        // Real shape: every record carries a lifecycle `status`
+        // (DONE/RUNNING/ERROR/INVALID; F10 item 6).
+        for status in ["DONE", "RUNNING", "ERROR", "INVALID"] {
+            let rec = serde_json::json!({
+                "source": "MODEL", "type": "VIEW_FILE",
+                "created_at": "2026-06-11T20:14:44Z",
+                "content": "file listing", "status": status
+            });
+            let msg = record_to_message(&rec).unwrap();
+            assert_eq!(
+                msg.extra["status"], status,
+                "lifecycle status must ride along"
+            );
+        }
+
+        // A record without `status` (defensive future shape) gets no key.
+        let rec = serde_json::json!({
+            "source": "MODEL", "type": "VIEW_FILE",
+            "created_at": "2026-06-11T20:14:44Z", "content": "file listing"
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert!(msg.extra.get("status").is_none());
+    }
+
+    #[test]
+    fn scan_emits_f10_records_in_source_order_and_keeps_existing_ones() {
+        // End to end: a synthetic transcript mixing already-emitted shapes
+        // with the F10 shapes. Existing records keep their content/roles;
+        // the new records land at their natural source positions.
+        let dir = TempDir::new().unwrap();
+        let logs = dir.path().join(".system_generated").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("transcript.jsonl"),
+            concat!(
+                "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:42Z\",\"content\":\"<USER_REQUEST>\\nclean the widget rack\\n</USER_REQUEST>\",\"media\":[{\"mime_type\":\"image/png\",\"uri\":\"file:///tmp/synthetic-a.png\"}]}\n",
+                "{\"step_index\":1,\"source\":\"SYSTEM\",\"type\":\"CONVERSATION_HISTORY\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:42Z\",\"content\":\"synthetic folded history note\"}\n",
+                "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:43Z\",\"content\":\"planning the rack cleanup\",\"truncated_fields\":[\"thinking\"]}\n",
+                "{\"step_index\":3,\"source\":\"MODEL\",\"type\":\"GENERIC\",\"status\":\"ERROR\",\"created_at\":\"2026-06-11T20:14:44Z\",\"content\":\"the rack probe returned nothing\",\"error\":\"synthetic probe failure\"}\n",
+                "{\"step_index\":4,\"source\":\"SYSTEM\",\"type\":\"ERROR_MESSAGE\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:45Z\",\"error\":\"synthetic pipeline failure\"}\n",
+            ),
+        )
+        .unwrap();
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        );
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let msgs = &convs[0].messages;
+        assert_eq!(msgs.len(), 5);
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "system", "assistant", "tool", "system"]);
+
+        // Already-emitted records keep their content untouched.
+        assert_eq!(msgs[0].content, "clean the widget rack");
+        assert_eq!(msgs[2].content, "planning the rack cleanup");
+        assert_eq!(msgs[3].content, "the rack probe returned nothing");
+        // The newly emitted records carry their source text.
+        assert_eq!(msgs[1].content, "synthetic folded history note");
+        assert_eq!(msgs[4].content, "synthetic pipeline failure");
+
+        // Passthrough fields are visible per message, exactly as recorded.
+        assert_eq!(msgs[0].extra["media"][0]["mime_type"], "image/png");
+        assert_eq!(msgs[0].extra["status"], "DONE");
+        assert_eq!(
+            msgs[2].extra["truncated_fields"],
+            serde_json::json!(["thinking"])
+        );
+        assert_eq!(msgs[3].extra["error"], "synthetic probe failure");
+        assert_eq!(msgs[3].extra["status"], "ERROR");
+        assert_eq!(msgs[4].extra["error"], "synthetic pipeline failure");
+    }
+
+    #[test]
+    fn fixture_messages_gain_only_the_status_passthrough_key() {
+        // The checked-in fixture records carry `status: "DONE"` and no
+        // error/media/truncated_fields, so after F10 every fixture message
+        // gains exactly one new extra key — content/roles unchanged.
+        let conv = only_conversation();
+        for m in &conv.messages {
+            assert_eq!(m.extra["status"], "DONE");
+            assert!(m.extra.get("error").is_none());
+            assert!(m.extra.get("media").is_none());
+            assert!(m.extra.get("truncated_fields").is_none());
+        }
     }
 
     #[test]

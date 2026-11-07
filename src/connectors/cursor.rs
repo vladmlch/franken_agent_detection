@@ -31,10 +31,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, RowExt};
+use frankensqlite::compat::RowExt;
 use frankensqlite::params;
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
@@ -242,7 +242,10 @@ impl CursorConnector {
         // 4. Check standard layout: workspaceStorage/{workspace-id}/state.vscdb
         // We only need this specific file pattern, so avoid recursive walking
         // over all workspace files (which can be large and noisy).
-        let workspace_storage = if base.file_name().is_some_and(|name| name == "workspaceStorage") {
+        let workspace_storage = if base
+            .file_name()
+            .is_some_and(|name| name == "workspaceStorage")
+        {
             base.to_path_buf()
         } else {
             base.join("workspaceStorage")
@@ -497,11 +500,8 @@ impl CursorConnector {
         since_ts: Option<i64>,
         tick: &dyn Fn(),
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Cursor db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open Cursor db: {}", db_path.display()))?;
 
         // Set busy timeout to 5 seconds to avoid locking errors when Cursor is running
         conn.execute("PRAGMA busy_timeout = 5000;")
@@ -1385,50 +1385,29 @@ impl Connector for CursorConnector {
         let roots: Vec<PathBuf> = Self::source_roots(ctx)
             .into_iter()
             .map(|root| root.path)
+            .filter(|path| path.exists())
+            .collect();
+        let db_paths: Vec<PathBuf> = roots
+            .iter()
+            .flat_map(|root| Self::find_db_files(root))
+            // Skip files not modified since last scan
+            .filter(|db_path| file_modified_since(db_path, ctx.since_ts))
             .collect();
 
-        for root in roots {
-            if !root.exists() {
-                continue;
-            }
-
-            let db_files = Self::find_db_files(&root);
-
-            for db_path in db_files {
-                // Skip files not modified since last scan
-                if !file_modified_since(&db_path, ctx.since_ts) {
-                    continue;
-                }
-
-                match Self::extract_from_db(&db_path, ctx.since_ts, &tick) {
-                    Ok(convs) => {
-                        let mut kept = 0;
-                        for conv in convs {
-                            match conv.external_id.as_ref() {
-                                Some(id) if !seen_db_session_ids.insert(id.clone()) => {
-                                    continue;
-                                }
-                                _ => {}
-                            }
-                            kept += 1;
-                            all_convs.push(conv);
-                        }
-                        tracing::debug!(
-                            path = %db_path.display(),
-                            count = kept,
-                            "cursor extracted conversations"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %db_path.display(),
-                            error = %e,
-                            "cursor failed to extract from db"
-                        );
-                    }
-                }
-            }
-        }
+        // Local fix (cass review 2026-11-07, F9): a store that cannot be
+        // read fails the scan instead of hiding behind a warn (F5
+        // semantics) — a BusyRecovery-class store is read through the
+        // snapshot fallback in `open_read_only_with_snapshot_fallback`,
+        // and every other open failure reaches the host.
+        let composer_convs =
+            super::checked_scan::collect_databases_checked("Cursor", db_paths, |db_path| {
+                Self::extract_from_db(db_path, ctx.since_ts, &tick)
+            })?;
+        all_convs.extend(composer_convs.into_iter().filter(|conv| {
+            conv.external_id
+                .as_ref()
+                .is_none_or(|id| seen_db_session_ids.insert(id.clone()))
+        }));
 
         // Cursor Agent transcripts (gh #306) — additive second source.
         Self::scan_agent_transcripts(ctx, &mut all_convs);
@@ -1448,6 +1427,7 @@ mod tests {
     use crate::connectors::sqlite_sync::ConnectionExt;
     use frankensqlite::params;
     use serde_json::json;
+    use serial_test::serial;
     use std::collections::HashSet;
     use std::fs;
     use tempfile::TempDir;
@@ -2264,6 +2244,171 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    /// Path of a SQLite sidecar file (`<db>-wal`, `<db>-shm`).
+    fn sqlite_sidecar(db: &Path, suffix: &str) -> PathBuf {
+        let mut raw = db.as_os_str().to_owned();
+        raw.push(suffix);
+        PathBuf::from(raw)
+    }
+
+    /// `(bytes, mtime)` of one store file, for never-modify assertions.
+    fn file_state(path: &Path) -> (Option<Vec<u8>>, Option<std::time::SystemTime>) {
+        (
+            fs::read(path).ok(),
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok(),
+        )
+    }
+
+    /// A `state.vscdb` in WAL mode with one composer row, closed the way a
+    /// hard-killed Cursor leaves it: the writer is gone, and a checkpointed
+    /// `-wal` (0 bytes) plus its `-shm` wal-index remain next to the db.
+    fn create_wal_mode_state_vscdb(dir: &Path) -> PathBuf {
+        let db_path = dir.join("globalStorage").join("state.vscdb");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = create_test_db(&db_path);
+        let mode: String = conn
+            .query_row_map("PRAGMA journal_mode=wal;", &[], |row| {
+                row.get_typed::<String>(0)
+            })
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                "composerData:wal-fallback",
+                r#"{"text":"Read after a crash"}"#
+            ],
+        )
+        .unwrap();
+
+        // The incident shape: every frame checkpointed into the db, so the
+        // `-wal` remains on disk at 0 bytes after the writer exits.
+        conn.query_row_map::<(i64, i64, i64), _>("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+            Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+        })
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            sqlite_sidecar(&db_path, "-wal").is_file(),
+            "the writer must leave a `-wal` file behind"
+        );
+        assert!(
+            sqlite_sidecar(&db_path, "-shm").is_file(),
+            "the writer must leave a `-shm` wal-index behind"
+        );
+        db_path
+    }
+
+    /// Leave the `-shm` wal-index in one of the states a crashed writer can:
+    /// `garbage` bytes, a `torn` header checksum (one flipped bit), `absent`,
+    /// `zeroed`, or `empty`. A store in any of these states must still be
+    /// read, and the user's db and `-wal` files must never change.
+    fn damage_wal_index(db: &Path, state: &str) {
+        let shm = sqlite_sidecar(db, "-shm");
+        match state {
+            "garbage" => fs::write(&shm, vec![0xA5_u8; 32_768]).unwrap(),
+            "torn" => {
+                let mut bytes = fs::read(&shm).unwrap();
+                assert!(bytes.len() > 24, "the fixture `-shm` must have a header");
+                // One flipped bit inside the wal-index header's checksum word:
+                // a sidecar torn mid-write.
+                bytes[16] ^= 0x01;
+                fs::write(&shm, bytes).unwrap();
+            }
+            "absent" => fs::remove_file(&shm).unwrap(),
+            "zeroed" => fs::write(&shm, vec![0_u8; 32_768]).unwrap(),
+            "empty" => fs::write(&shm, []).unwrap(),
+            other => unreachable!("unknown wal-index state: {other}"),
+        }
+    }
+
+    /// A `state.vscdb` left with an unusable wal-index (the crash shape from
+    /// the 2026-11-07 OpenCode zero-index incident, on Cursor's store) must
+    /// still be read, without modifying the user's files. The db and `-wal`
+    /// are never written by any read-only open; the `-shm` is never written
+    /// whenever the snapshot fallback engages, and `garbage`/`torn`
+    /// wal-indexes refuse the strict open on every frankensqlite build, so the
+    /// fallback always engages for them.
+    #[serial]
+    #[test]
+    fn scan_reads_a_state_vscdb_left_with_an_unusable_wal_index() {
+        for state in ["garbage", "torn", "absent", "zeroed", "empty"] {
+            let tmp = TempDir::new().unwrap();
+            let db_path = create_wal_mode_state_vscdb(tmp.path());
+            damage_wal_index(&db_path, state);
+            let before_db = file_state(&db_path);
+            let before_wal = file_state(&sqlite_sidecar(&db_path, "-wal"));
+            let before_shm = file_state(&sqlite_sidecar(&db_path, "-shm"));
+
+            let ctx = ScanContext::with_roots(
+                tmp.path().to_path_buf(),
+                vec![ScanRoot::local(tmp.path().to_path_buf())],
+                None,
+            );
+            let convs = CursorConnector::new()
+                .scan(&ctx)
+                .unwrap_or_else(|error| panic!("{state}: scan failed: {error:#}"));
+
+            assert_eq!(
+                convs.len(),
+                1,
+                "{state}: the crashed store must still be read"
+            );
+            assert!(
+                convs[0]
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("Read after a crash")),
+                "{state}: the composer transcript must be readable"
+            );
+
+            assert_eq!(
+                file_state(&db_path),
+                before_db,
+                "{state}: reading must never modify the db"
+            );
+            assert_eq!(
+                file_state(&sqlite_sidecar(&db_path, "-wal")),
+                before_wal,
+                "{state}: reading must never modify the `-wal`"
+            );
+            if matches!(state, "garbage" | "torn") {
+                assert_eq!(
+                    file_state(&sqlite_sidecar(&db_path, "-shm")),
+                    before_shm,
+                    "{state}: the snapshot fallback must leave the `-shm` untouched"
+                );
+            }
+        }
+    }
+
+    /// A store that fails to open for any other reason must surface as a
+    /// scan error (cass F5 semantics), not a swallowed warn plus an
+    /// Ok(0 conversations) scan.
+    #[test]
+    fn scan_reports_an_unreadable_state_vscdb_as_a_scan_error() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("globalStorage").join("state.vscdb");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            None,
+        );
+        let error = CursorConnector::new().scan(&ctx).unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("state.vscdb"),
+            "the scan error must name the failing store: {chain}"
+        );
     }
 
     #[test]

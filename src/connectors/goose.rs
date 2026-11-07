@@ -22,10 +22,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, RowExt};
+use frankensqlite::compat::RowExt;
 use frankensqlite::{Row, SqliteValue, params};
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -362,11 +362,8 @@ impl GooseConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Goose db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open Goose db: {}", db_path.display()))?;
 
         conn.execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
@@ -641,24 +638,17 @@ impl Connector for GooseConnector {
             db_paths.retain(|p| seen.insert(p.clone()));
         }
 
-        for db in db_paths {
-            if !db.exists() {
-                continue;
-            }
-            match Self::extract_from_sqlite(&db, ctx.since_ts) {
-                Ok(sqlite_convs) => {
-                    tracing::debug!(
-                        "goose sqlite: found {} sessions in {}",
-                        sqlite_convs.len(),
-                        db.display()
-                    );
-                    convs.extend(sqlite_convs);
-                }
-                Err(e) => {
-                    tracing::debug!("goose sqlite: failed to read {}: {e}", db.display());
-                }
-            }
-        }
+        // Local fix (cass review 2026-11-07, F9): a store that cannot be
+        // read fails the scan instead of hiding behind a debug log (F5
+        // semantics) — a BusyRecovery-class store is read through the
+        // snapshot fallback in `open_read_only_with_snapshot_fallback`,
+        // and every other open failure reaches the host.
+        let sqlite_convs = super::checked_scan::collect_databases_checked(
+            "Goose",
+            db_paths.into_iter().filter(|db| db.exists()),
+            |db| Self::extract_from_sqlite(db, ctx.since_ts),
+        )?;
+        convs.extend(sqlite_convs);
 
         // Collect seen IDs from SQLite results to avoid duplicates with JSONL
         let mut seen_ids: HashSet<String> =

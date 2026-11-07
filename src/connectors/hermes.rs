@@ -23,10 +23,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, RowExt};
+use frankensqlite::compat::RowExt;
 use frankensqlite::params;
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::env_path_nonempty;
@@ -139,11 +139,8 @@ impl HermesConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Hermes db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open Hermes db: {}", db_path.display()))?;
 
         conn.execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
@@ -399,26 +396,14 @@ impl Connector for HermesConnector {
             db_paths.retain(|p| seen.insert(p.clone()));
         }
 
-        let mut convs = Vec::new();
-
-        for db in db_paths {
-            if !db.exists() {
-                continue;
-            }
-            match Self::extract_from_sqlite(&db, ctx.since_ts) {
-                Ok(db_convs) => {
-                    tracing::debug!(
-                        "hermes sqlite: found {} sessions in {}",
-                        db_convs.len(),
-                        db.display()
-                    );
-                    convs.extend(db_convs);
-                }
-                Err(e) => {
-                    tracing::debug!("hermes sqlite: failed to read {}: {e}", db.display());
-                }
-            }
-        }
+        // Local fix (cass review 2026-11-07, F9): a store that cannot be
+        // read fails the scan instead of hiding behind a debug log (F5
+        // semantics).
+        let convs = super::checked_scan::collect_databases_checked(
+            "Hermes",
+            db_paths.into_iter().filter(|db| db.exists()),
+            |db| Self::extract_from_sqlite(db, ctx.since_ts),
+        )?;
 
         Ok(convs)
     }

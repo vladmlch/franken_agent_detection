@@ -32,10 +32,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
+use frankensqlite::compat::{ParamValue, RowExt};
 use frankensqlite::{Row, SqliteValue, params};
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
 use super::utils::read_capped;
 
 /// Max ids bound into a single `... IN (?, ?, …)` chunk. Kept well under
@@ -477,11 +477,8 @@ impl OpenCodeConnector {
         since_ts: Option<i64>,
         progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open OpenCode db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open OpenCode db: {}", db_path.display()))?;
 
         conn.execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
@@ -1143,42 +1140,31 @@ impl Connector for OpenCodeConnector {
         // candidate priority order (explicit/data_dir before defaults).
         let mut seen_db_session_ids: HashSet<String> = HashSet::new();
 
-        for db in db_candidates {
-            if !db.is_file() {
-                continue;
-            }
-            // Canonicalize if possible so two routes to the same file are
-            // still deduplicated (e.g. via symlink or `./`-prefixed path).
-            let canonical = std::fs::canonicalize(&db).unwrap_or_else(|_| db.clone());
-            if !scanned_dbs.insert(canonical) {
-                continue;
-            }
-            match Self::extract_from_sqlite(&db, ctx.since_ts, ctx.progress_tick.as_deref()) {
-                Ok(sqlite_convs) => {
-                    let fresh_count = sqlite_convs.len();
-                    convs.extend(sqlite_convs.into_iter().filter(|conv| {
-                        conv.external_id
-                            .as_ref()
-                            .is_none_or(|id| seen_db_session_ids.insert(id.clone()))
-                    }));
-                    tracing::debug!(
-                        "opencode sqlite: found {fresh_count} sessions in {}",
-                        db.display()
-                    );
-                }
-                Err(e) => {
-                    // The whole chain: the outer context alone ("failed to
-                    // query OpenCode sessions from session") hid the engine
-                    // error behind exports failing under a live writer (cass
-                    // GH #519).
-                    tracing::warn!(
-                        db = %db.display(),
-                        error = %format_args!("{e:#}"),
-                        "opencode sqlite: failed to read store; conversations from it may be missing"
-                    );
-                }
-            }
-        }
+        // Local fix (cass review 2026-11-07, F9): a store that cannot be
+        // read fails the scan instead of hiding behind a warn (F5
+        // semantics) — a BusyRecovery-class store is read through the
+        // snapshot fallback in `open_read_only_with_snapshot_fallback`,
+        // and every other open failure reaches the host.
+        let readable_dbs: Vec<PathBuf> = db_candidates
+            .into_iter()
+            .filter(|db| db.is_file())
+            .filter(|db| {
+                // Canonicalize if possible so two routes to the same file
+                // are still deduplicated (e.g. via symlink or `./`-prefixed
+                // path).
+                let canonical = std::fs::canonicalize(db).unwrap_or_else(|_| db.clone());
+                scanned_dbs.insert(canonical)
+            })
+            .collect();
+        let sqlite_convs =
+            super::checked_scan::collect_databases_checked("OpenCode", readable_dbs, |db| {
+                Self::extract_from_sqlite(db, ctx.since_ts, ctx.progress_tick.as_deref())
+            })?;
+        convs.extend(sqlite_convs.into_iter().filter(|conv| {
+            conv.external_id
+                .as_ref()
+                .is_none_or(|id| seen_db_session_ids.insert(id.clone()))
+        }));
 
         // Collect seen IDs from SQLite results to avoid duplicates with JSON
         let mut seen_ids: HashSet<String> =
@@ -1799,6 +1785,7 @@ fn assemble_content_from_parts(parts: &[PartInfo]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -2233,7 +2220,7 @@ mod tests {
         write_part(&storage, "msg-001", &part);
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -2250,8 +2237,6 @@ mod tests {
 
     #[test]
     fn scan_with_opencode_root_scan_root() {
-        use crate::connectors::scan::ScanRoot;
-
         let dir = TempDir::new().unwrap();
         let storage = create_opencode_storage(&dir);
 
@@ -2287,11 +2272,7 @@ mod tests {
         write_part(&storage, "msg-001", &part);
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::with_roots(
-            PathBuf::new(),
-            vec![ScanRoot::local(dir.path().join("opencode"))],
-            None,
-        );
+        let ctx = remote_scan_context(Path::new(""), &dir.path().join("opencode"));
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -2349,7 +2330,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -2365,7 +2346,7 @@ mod tests {
         let storage = create_opencode_storage(&dir);
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -2385,7 +2366,7 @@ mod tests {
         // Don't create any messages
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -2422,7 +2403,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].title, Some("This is the first line".to_string()));
@@ -2453,7 +2434,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].agent_slug, "opencode");
@@ -2484,7 +2465,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].metadata["session_id"], "sess-meta");
@@ -2530,7 +2511,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].messages.len(), 2);
@@ -2571,7 +2552,7 @@ mod tests {
         }
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].messages[0].idx, 0);
@@ -2600,7 +2581,7 @@ mod tests {
         // Don't create any parts
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         // Session should be skipped because message has no content
@@ -2635,7 +2616,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         // Should only have one conversation (deduplicated)
@@ -2667,7 +2648,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         // Default role should be "assistant"
@@ -2711,7 +2692,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         let content = &convs[0].messages[0].content;
@@ -2749,7 +2730,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].started_at, Some(1_733_000_000_000));
@@ -2782,7 +2763,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(
@@ -2802,7 +2783,7 @@ mod tests {
         fs::write(session_dir.join("invalid.json"), "not valid json").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -2825,7 +2806,7 @@ mod tests {
         fs::write(msg_dir.join("bad.json"), "not valid json").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         // Should skip the session because no valid messages
@@ -2886,7 +2867,7 @@ mod tests {
         fs::write(session_dir.join("sess-empty.json"), "").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -2900,7 +2881,7 @@ mod tests {
         fs::write(session_dir.join("sess-ws.json"), "   \n\t  ").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -2918,7 +2899,7 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -2936,7 +2917,7 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -2953,7 +2934,7 @@ mod tests {
         std::fs::write(session_dir.join("sess-bom.json"), &data).unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         // BOM may cause parse failure; connector should skip gracefully
         let convs = connector.scan(&ctx).unwrap();
         assert!(convs.len() <= 1);
@@ -2969,7 +2950,7 @@ mod tests {
         fs::write(session_dir.join("sess-bad.json"), r#"{"id": 12345}"#).unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         // Should skip since id is not a string (serde will fail)
         assert_eq!(convs.len(), 0);
@@ -3008,7 +2989,7 @@ mod tests {
         fs::write(part_dir.join("p-deep.json"), &nested).unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         // Should not stack overflow
         let result = connector.scan(&ctx);
         assert!(result.is_ok());
@@ -3038,7 +3019,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.len() >= 1_000_000);
@@ -3067,7 +3048,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.contains("hello"));
@@ -3097,7 +3078,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         // Message with only whitespace content should be skipped
         assert_eq!(convs.len(), 0);
@@ -3132,7 +3113,7 @@ mod tests {
         fs::write(msg_dir.join("msg-corrupt.json"), "{{{{not json").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         // Valid message should still be parsed; corrupted one skipped
         assert_eq!(convs.len(), 1);
@@ -3158,7 +3139,7 @@ mod tests {
         // Don't create part directory at all (not even the part/msg-nopartdir/ dir)
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         // Message without parts should be skipped (empty content)
         assert_eq!(convs.len(), 0);
@@ -3188,7 +3169,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         // Part without type is ignored, message has no content, so session skipped
         assert_eq!(convs.len(), 0);
@@ -3228,7 +3209,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         let content = &convs[0].messages[0].content;
@@ -3277,7 +3258,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -3313,7 +3294,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -3344,7 +3325,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         // Timestamps should be None
@@ -4069,9 +4050,11 @@ mod tests {
         )
         .unwrap();
 
-        // Pass the parent directory (not the .db file itself).
+        // Pass the parent directory (not the .db file itself). The scan root
+        // is remote so `allow_local_default_dbs` stays false: a local root
+        // would drag this machine's real opencode store into the result.
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+        let ctx = remote_scan_context(dir.path(), dir.path());
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-parent"));
@@ -4083,8 +4066,6 @@ mod tests {
     /// ctx.data_dir-as-parent candidate if one is present.
     #[test]
     fn scan_finds_sqlite_db_via_data_dir_even_with_explicit_scan_roots() {
-        use crate::connectors::scan::ScanRoot;
-
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
@@ -4119,11 +4100,7 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::with_roots(
-            dir.path().to_path_buf(),
-            vec![ScanRoot::local(dir.path().to_path_buf())],
-            None,
-        );
+        let ctx = remote_scan_context(dir.path(), dir.path());
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(
             convs.len(),
@@ -4135,8 +4112,6 @@ mod tests {
 
     #[test]
     fn scan_finds_sqlite_db_with_explicit_config_root() {
-        use crate::connectors::scan::ScanRoot;
-
         let dir = TempDir::new().unwrap();
         let config_root = dir.path().join(".config");
         let opencode_dir = config_root.join("opencode");
@@ -4175,11 +4150,7 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::with_roots(
-            dir.path().to_path_buf(),
-            vec![ScanRoot::local(config_root)],
-            None,
-        );
+        let ctx = remote_scan_context(dir.path(), &config_root);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-config"));
@@ -4226,8 +4197,9 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        // Pass the db file itself as data_dir.
-        let ctx = ScanContext::local_default(db_path.clone(), None);
+        // Pass the db file itself as data_dir; the remote root keeps the
+        // machine's real store out of the scan.
+        let ctx = remote_scan_context(&db_path, dir.path());
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-direct"));
@@ -4244,13 +4216,7 @@ mod tests {
         // No file on disk at `missing`.
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::with_roots(
-            missing,
-            vec![crate::connectors::scan::ScanRoot::local(
-                dir.path().to_path_buf(),
-            )],
-            None,
-        );
+        let ctx = remote_scan_context(&missing, dir.path());
         let convs = connector.scan(&ctx).unwrap();
         assert!(
             convs.is_empty(),
@@ -4790,5 +4756,224 @@ mod tests {
         );
         assert_eq!(render("location-switched", json!({"location": {}})), None);
         assert_eq!(render("idle", json!({"outcome": "succeeded"})), None);
+    }
+
+    // =====================================================
+    // Unusable WAL-index fallback (cass F9)
+    // =====================================================
+
+    /// Path of a SQLite sidecar file (`<db>-wal`, `<db>-shm`).
+    fn sqlite_sidecar(db: &Path, suffix: &str) -> PathBuf {
+        let mut raw = db.as_os_str().to_owned();
+        raw.push(suffix);
+        PathBuf::from(raw)
+    }
+
+    /// `(bytes, mtime)` of one store file, for never-modify assertions.
+    fn file_state(path: &Path) -> (Option<Vec<u8>>, Option<std::time::SystemTime>) {
+        (
+            fs::read(path).ok(),
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok(),
+        )
+    }
+
+    /// An OpenCode SQLite store in WAL mode with one committed session, closed
+    /// the way a hard-killed OpenCode leaves it: the writer is gone, and a
+    /// checkpointed `-wal` (0 bytes) plus its `-shm` wal-index remain next to
+    /// the db.
+    fn create_wal_mode_sqlite_db(dir: &Path) -> PathBuf {
+        let db_path = dir.join("opencode.db");
+        let conn = open_test_connection(&db_path);
+        let mode: String = conn
+            .query_row_map("PRAGMA journal_mode=wal;", &[], |row| {
+                row.get_typed::<String>(0)
+            })
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT,
+                title TEXT,
+                directory TEXT,
+                time_created TEXT DEFAULT CURRENT_TIMESTAMP,
+                time_updated TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                time_created TEXT DEFAULT CURRENT_TIMESTAMP,
+                time_updated TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                time_created TEXT DEFAULT CURRENT_TIMESTAMP,
+                time_updated TEXT DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+
+        conn.execute_compat(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            params!["sess-1", "proj-1", "Crashed Store", "/home/user/project"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params![
+                "msg-1",
+                "sess-1",
+                r#"{"role":"user","time":{"created":1700000000000}}"#
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part-1",
+                "msg-1",
+                "sess-1",
+                r#"{"type":"text","text":"Hello world"}"#
+            ],
+        )
+        .unwrap();
+
+        // The incident shape: every frame checkpointed into the db, so the
+        // `-wal` remains on disk at 0 bytes after the writer exits.
+        conn.query_row_map::<(i64, i64, i64), _>("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+            Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+        })
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            sqlite_sidecar(&db_path, "-wal").is_file(),
+            "the writer must leave a `-wal` file behind"
+        );
+        assert!(
+            sqlite_sidecar(&db_path, "-shm").is_file(),
+            "the writer must leave a `-shm` wal-index behind"
+        );
+        db_path
+    }
+
+    /// Leave the `-shm` wal-index in one of the states a crashed writer can:
+    /// `garbage` bytes, a `torn` header checksum (one flipped bit), `absent`,
+    /// `zeroed`, or `empty`. A store in any of these states must still be
+    /// read, and the user's db and `-wal` files must never change.
+    fn damage_wal_index(db: &Path, state: &str) {
+        let shm = sqlite_sidecar(db, "-shm");
+        match state {
+            "garbage" => fs::write(&shm, vec![0xA5_u8; 32_768]).unwrap(),
+            "torn" => {
+                let mut bytes = fs::read(&shm).unwrap();
+                assert!(bytes.len() > 24, "the fixture `-shm` must have a header");
+                // One flipped bit inside the wal-index header's checksum word:
+                // a sidecar torn mid-write.
+                bytes[16] ^= 0x01;
+                fs::write(&shm, bytes).unwrap();
+            }
+            "absent" => fs::remove_file(&shm).unwrap(),
+            "zeroed" => fs::write(&shm, vec![0_u8; 32_768]).unwrap(),
+            "empty" => fs::write(&shm, []).unwrap(),
+            other => unreachable!("unknown wal-index state: {other}"),
+        }
+    }
+
+    /// A scan context whose single scan root is remote, so
+    /// `allow_local_default_dbs` is false and this machine's real
+    /// `~/.local/share/opencode` store is never probed: the fixture store is
+    /// the only candidate.
+    fn remote_scan_context(data_dir: &Path, root: &Path) -> crate::connectors::scan::ScanContext {
+        let origin = crate::types::Origin::remote_with_host("testhost", "u@testhost");
+        let scan_root = crate::connectors::scan::ScanRoot::remote(root.to_path_buf(), origin, None);
+        crate::connectors::scan::ScanContext::with_roots(
+            data_dir.to_path_buf(),
+            vec![scan_root],
+            None,
+        )
+    }
+
+    /// A store left with an unusable wal-index (the OpenCode crash shape from
+    /// the 2026-11-07 zero-index incident) must still be read, without
+    /// modifying the user's files. The db and `-wal` are never written by any
+    /// read-only open; the `-shm` is never written whenever the snapshot
+    /// fallback engages, and `garbage`/`torn` wal-indexes refuse the strict
+    /// open on every frankensqlite build, so the fallback always engages for
+    /// them.
+    #[serial]
+    #[test]
+    fn sqlite_scan_reads_a_store_left_with_an_unusable_wal_index() {
+        for state in ["garbage", "torn", "absent", "zeroed", "empty"] {
+            let dir = TempDir::new().unwrap();
+            let db_path = create_wal_mode_sqlite_db(dir.path());
+            damage_wal_index(&db_path, state);
+            let before_db = file_state(&db_path);
+            let before_wal = file_state(&sqlite_sidecar(&db_path, "-wal"));
+            let before_shm = file_state(&sqlite_sidecar(&db_path, "-shm"));
+
+            let ctx = remote_scan_context(dir.path(), dir.path());
+            let convs = OpenCodeConnector::new()
+                .scan(&ctx)
+                .unwrap_or_else(|error| panic!("{state}: scan failed: {error:#}"));
+
+            assert_eq!(
+                convs.len(),
+                1,
+                "{state}: the crashed store must still be read"
+            );
+            assert_eq!(convs[0].external_id.as_deref(), Some("sess-1"), "{state}");
+            assert_eq!(
+                convs[0].messages[0].content, "Hello world",
+                "{state}: the session transcript must be readable"
+            );
+
+            assert_eq!(
+                file_state(&db_path),
+                before_db,
+                "{state}: reading must never modify the db"
+            );
+            assert_eq!(
+                file_state(&sqlite_sidecar(&db_path, "-wal")),
+                before_wal,
+                "{state}: reading must never modify the `-wal`"
+            );
+            if matches!(state, "garbage" | "torn") {
+                assert_eq!(
+                    file_state(&sqlite_sidecar(&db_path, "-shm")),
+                    before_shm,
+                    "{state}: the snapshot fallback must leave the `-shm` untouched"
+                );
+            }
+        }
+    }
+
+    /// A store that fails to open for any other reason must surface as a
+    /// scan error (cass F5 semantics), not a swallowed warn plus an
+    /// Ok(0 conversations) scan.
+    #[serial]
+    #[test]
+    fn sqlite_scan_reports_an_unreadable_store_as_a_scan_error() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("opencode.db"),
+            b"this is not a sqlite database",
+        )
+        .unwrap();
+
+        let ctx = remote_scan_context(dir.path(), dir.path());
+        let error = OpenCodeConnector::new().scan(&ctx).unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("opencode.db"),
+            "the scan error must name the failing store: {chain}"
+        );
     }
 }

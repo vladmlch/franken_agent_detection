@@ -17,9 +17,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
+use frankensqlite::compat::{ParamValue, RowExt};
 
-use super::sqlite_sync::{ConnectionExt, open_with_flags};
+use super::sqlite_sync::{ConnectionExt, open_read_only_with_snapshot_fallback};
 use serde::Deserialize;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
@@ -73,11 +73,8 @@ impl CrushConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Crush db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open Crush db: {}", db_path.display()))?;
 
         conn.execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
@@ -194,39 +191,22 @@ impl Connector for CrushConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut convs = Vec::new();
-
         let db_paths: Vec<PathBuf> = Self::source_roots(ctx)
             .into_iter()
             .map(|root| root.path)
+            .filter(|path| path.exists())
             .collect();
+
+        // Local fix (cass review 2026-11-07, F9): a store that cannot be
+        // read fails the scan instead of hiding behind a debug log (F5
+        // semantics).
+        let mut convs = super::checked_scan::collect_databases_checked("Crush", db_paths, |db| {
+            Self::extract_from_sqlite(db, ctx.since_ts)
+        })?;
 
         // Track seen session IDs to dedup across global + per-project databases.
         let mut seen_ids: HashSet<String> = HashSet::new();
-
-        for db in &db_paths {
-            if !db.exists() {
-                continue;
-            }
-            match Self::extract_from_sqlite(db, ctx.since_ts) {
-                Ok(db_convs) => {
-                    tracing::debug!(
-                        "crush sqlite: found {} sessions in {}",
-                        db_convs.len(),
-                        db.display()
-                    );
-                    for conv in db_convs {
-                        let id = conv.external_id.clone().unwrap_or_default();
-                        if seen_ids.insert(id) {
-                            convs.push(conv);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("crush sqlite: failed to read {}: {e}", db.display());
-                }
-            }
-        }
+        convs.retain(|conv| seen_ids.insert(conv.external_id.clone().unwrap_or_default()));
 
         Ok(convs)
     }

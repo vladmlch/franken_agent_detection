@@ -14,3 +14,4 @@ docs/superpowers/plans/2026-11-02-review-fixes-05-fad-fork.md.
 | F6 | (this commit) | sums distinct-request token_count events, skips repeats |
 | F7 | (this commit) | ticks progress per row and composer inside Cursor's extract_from_db |
 | F8 | (this commit) | Cursor key-range queries seek the key index (no residual predicate), or frankensqlite plans a range plus a residual predicate as an index seek |
+| F9 | (this commit) | reads external SQLite stores through a private snapshot copy when the wal-index is unusable (never writes the user's db/`-wal`/`-shm`), and every FAD SQLite open site plus OpenCode/Cursor/Crush/Hermes/Goose scans surface open failures as scan errors (F5 semantics) |

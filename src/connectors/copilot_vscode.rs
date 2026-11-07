@@ -1122,15 +1122,12 @@ pub fn session_to_conversation(
 /// in-memory map shape defensively.
 #[cfg(feature = "copilot-vscdb")]
 fn sessions_from_state_db(db_path: &Path) -> Vec<Value> {
-    use frankensqlite::compat::{OpenFlags, RowExt};
+    use frankensqlite::compat::RowExt;
     use frankensqlite::params;
 
-    use super::sqlite_sync::{ConnectionExt, open_with_flags};
+    use super::sqlite_sync::{ConnectionExt, open_read_only_with_snapshot_fallback};
 
-    let conn = match open_with_flags(
-        db_path.to_string_lossy().as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) {
+    let conn = match open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref()) {
         Ok(conn) => conn,
         Err(err) => {
             tracing::debug!(

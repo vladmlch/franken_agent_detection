@@ -1191,15 +1191,12 @@ fn sqlite_wal(db: &Path) -> PathBuf {
 /// snapshot that includes a live WAL, with nothing recovered or written.
 #[cfg(feature = "pi-sqlite")]
 fn read_sqlite_records(path: &Path) -> Result<Vec<String>> {
-    use super::sqlite_sync::{ConnectionExt, open_with_flags};
+    use super::sqlite_sync::{ConnectionExt, open_read_only_with_snapshot_fallback};
     use anyhow::{Context as _, bail};
-    use frankensqlite::compat::{OpenFlags, RowExt};
+    use frankensqlite::compat::RowExt;
 
-    let conn = open_with_flags(
-        path.to_string_lossy().as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .with_context(|| format!("failed to open read-only: {}", path.display()))?;
+    let conn = open_read_only_with_snapshot_fallback(path.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to open read-only: {}", path.display()))?;
     conn.execute("PRAGMA busy_timeout = 2000;")
         .with_context(|| "failed to set busy_timeout")?;
     for pragma in ["PRAGMA query_only = ON;", "PRAGMA trusted_schema = OFF;"] {

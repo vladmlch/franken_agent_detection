@@ -4976,4 +4976,67 @@ mod tests {
             "the scan error must name the failing store: {chain}"
         );
     }
+
+    /// cass follow-up to F9 (2026-11-07): a store that is a *valid but empty*
+    /// database is not a failure. SQLite's own semantics make a 0-byte file an
+    /// empty database, and a fresh install commonly creates the store file
+    /// before its first write; a readable schema with no tables at all holds
+    /// no sessions either way. Both must scan to `Ok` with 0 conversations
+    /// (logged at debug), not a scan error on every index run.
+    #[test]
+    fn sqlite_scan_treats_a_provably_empty_store_as_no_sessions() {
+        for state in ["zero-byte", "no-tables"] {
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("opencode.db");
+            match state {
+                // A fresh install before its first write: the store file
+                // exists but holds nothing.
+                "zero-byte" => fs::write(&db_path, []).unwrap(),
+                // A real database file (valid header, nonzero size) whose
+                // schema holds no tables at all.
+                "no-tables" => {
+                    let conn = open_test_connection(&db_path);
+                    conn.execute("CREATE TABLE schema_marker (x INTEGER);")
+                        .unwrap();
+                    conn.execute("DROP TABLE schema_marker;").unwrap();
+                    drop(conn);
+                    assert!(
+                        fs::metadata(&db_path).unwrap().len() > 0,
+                        "{state}: the fixture must be a real database file, not 0 bytes"
+                    );
+                }
+                other => unreachable!("unknown empty-store state: {other}"),
+            }
+
+            let ctx = remote_scan_context(dir.path(), dir.path());
+            let convs = OpenCodeConnector::new().scan(&ctx).unwrap_or_else(|error| {
+                panic!("{state}: an empty store must not be a scan error: {error:#}")
+            });
+            assert!(
+                convs.is_empty(),
+                "{state}: an empty store holds no conversations"
+            );
+        }
+    }
+
+    /// Schema drift is not emptiness: a database that has *some* tables but
+    /// none of OpenCode's is an app migration or corruption, and must still
+    /// surface as a scan error naming the store (F5 semantics, unchanged).
+    #[test]
+    fn sqlite_scan_reports_schema_drift_as_a_scan_error() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = open_test_connection(&db_path);
+        conn.execute("CREATE TABLE unrelated_table (x INTEGER);")
+            .unwrap();
+        drop(conn);
+
+        let ctx = remote_scan_context(dir.path(), dir.path());
+        let error = OpenCodeConnector::new().scan(&ctx).unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("opencode.db"),
+            "schema drift must name the failing store: {chain}"
+        );
+    }
 }

@@ -349,7 +349,12 @@ impl Connector for VibeConnector {
 
         for mut source in roots {
             if source.root.path.is_file() {
-                let parent = source.root.path.parent().unwrap_or(&source.root.path).to_path_buf();
+                let parent = source
+                    .root
+                    .path
+                    .parent()
+                    .unwrap_or(&source.root.path)
+                    .to_path_buf();
                 source.root = source.root.with_path(parent);
             }
 

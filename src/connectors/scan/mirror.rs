@@ -7,9 +7,7 @@ use std::path::{Component, Path, PathBuf};
 pub(super) fn resolve(container: &Path, source: &str, store: &[&str]) -> Option<PathBuf> {
     if store.is_empty()
         || store.iter().any(|part| {
-            part.is_empty()
-                || matches!(*part, "." | ".." | "~")
-                || part.contains(['/', '\\', ':'])
+            part.is_empty() || matches!(*part, "." | ".." | "~") || part.contains(['/', '\\', ':'])
         })
         || source.chars().any(char::is_control)
     {
@@ -39,8 +37,11 @@ pub(super) fn resolve(container: &Path, source: &str, store: &[&str]) -> Option<
                 store,
                 [".factory", "sessions"] | [".prime", "agent", "sessions"]
             );
-            (strict_layout && components.windows(store.len()).any(|window| window == store))
-                .then_some(store.len())
+            (strict_layout
+                && components
+                    .windows(store.len())
+                    .any(|window| window == store))
+            .then_some(store.len())
         })?;
     let leaf = container.join(components.last()?);
     let mut candidate = if leaf.is_dir() {
@@ -102,7 +103,10 @@ mod tests {
     #[test]
     fn qualified_subtrees_remain_narrow_for_strict_layout_providers() {
         for (source, store) in [
-            ("~/.factory/sessions/project-a", &[".factory", "sessions"][..]),
+            (
+                "~/.factory/sessions/project-a",
+                &[".factory", "sessions"][..],
+            ),
             (
                 "~/.prime/agent/sessions/project-a",
                 &[".prime", "agent", "sessions"][..],

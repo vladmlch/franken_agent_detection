@@ -420,7 +420,15 @@ mod tests {
             Connector, factory::FactoryConnector, gemini::GeminiConnector,
             prime_agent::PrimeAgentConnector, vibe::VibeConnector,
         };
-        let cases: Vec<(&str, &str, &str, &str, Box<dyn Connector>)> = vec![
+        // (slug, store dir, session file layout, session JSON, connector)
+        type RemoteMirrorCase = (
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+            Box<dyn Connector>,
+        );
+        let cases: Vec<RemoteMirrorCase> = vec![
             (
                 "factory",
                 ".factory/sessions",

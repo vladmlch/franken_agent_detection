@@ -4,40 +4,24 @@
 
 use std::path::Path;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 use crate::types::NormalizedConversation;
 
 pub(super) fn collect_databases_checked<P: AsRef<Path>>(
     paths: impl IntoIterator<Item = P>,
-    mut load: impl FnMut(&Path) -> Result<Vec<NormalizedConversation>>,
+    load: impl FnMut(&Path) -> Result<Vec<NormalizedConversation>>,
 ) -> Result<Vec<NormalizedConversation>> {
-    let mut conversations = Vec::new();
-    let mut failures = Vec::new();
-    for path in paths {
-        let path = path.as_ref();
-        match load(path) {
-            Ok(found) => conversations.extend(found),
-            Err(error) => {
-                tracing::warn!("devin sqlite: failed to read {}: {error:#}", path.display());
-                failures.push(format!("{}: {error:#}", path.display()));
-            }
-        }
-    }
-    if failures.is_empty() {
-        Ok(conversations)
-    } else {
-        Err(anyhow!(
-            "Devin scan incomplete: {} database(s) failed: {}",
-            failures.len(),
-            failures.join("; ")
-        ))
-    }
+    // Local fix (cass review 2026-11-07, F9): the collector is shared with
+    // the other store-style SQLite connectors; Devin's exact F5 error
+    // contract is preserved.
+    super::super::checked_scan::collect_databases_checked("Devin", paths, load)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn healthy_databases_pass_and_any_failure_fails_the_scan() {

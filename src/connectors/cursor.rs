@@ -2411,6 +2411,47 @@ mod tests {
         );
     }
 
+    /// cass follow-up to F9 (2026-11-07): the same rule on Cursor's store — a
+    /// `state.vscdb` that is a *valid but empty* database (a 0-byte file, or a
+    /// schema with no tables at all) must scan to `Ok` with 0 conversations,
+    /// not a scan error on every index run.
+    #[test]
+    fn scan_treats_a_provably_empty_state_vscdb_as_no_sessions() {
+        for state in ["zero-byte", "no-tables"] {
+            let tmp = TempDir::new().unwrap();
+            let db_path = tmp.path().join("globalStorage").join("state.vscdb");
+            fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            match state {
+                "zero-byte" => fs::write(&db_path, []).unwrap(),
+                "no-tables" => {
+                    let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+                    conn.execute("CREATE TABLE schema_marker (x INTEGER);")
+                        .unwrap();
+                    conn.execute("DROP TABLE schema_marker;").unwrap();
+                    drop(conn);
+                    assert!(
+                        fs::metadata(&db_path).unwrap().len() > 0,
+                        "{state}: the fixture must be a real database file, not 0 bytes"
+                    );
+                }
+                other => unreachable!("unknown empty-store state: {other}"),
+            }
+
+            let ctx = ScanContext::with_roots(
+                tmp.path().to_path_buf(),
+                vec![ScanRoot::local(tmp.path().to_path_buf())],
+                None,
+            );
+            let convs = CursorConnector::new().scan(&ctx).unwrap_or_else(|error| {
+                panic!("{state}: an empty store must not be a scan error: {error:#}")
+            });
+            assert!(
+                convs.is_empty(),
+                "{state}: an empty store holds no conversations"
+            );
+        }
+    }
+
     #[test]
     fn scan_processes_global_storage() {
         let dir = TempDir::new().unwrap();

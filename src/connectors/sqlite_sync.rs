@@ -241,6 +241,71 @@ pub fn open_read_only_with_snapshot_fallback(path: &str) -> Result<Connection, F
     }
 }
 
+/// The SQLite database file magic: bytes 0..16 of a database header
+/// (`SQLite format 3\0`). A file without it is not a database, however an
+/// engine build might otherwise treat it.
+const SQLITE_HEADER_MAGIC: [u8; 16] = *b"SQLite format 3\0";
+
+/// cass follow-up to F9 (2026-11-07): whether a store database is
+/// *provably empty* —
+///
+/// * a 0-byte main file with no `-wal` content: SQLite's own semantics make
+///   a 0-byte file an empty database, and a fresh install commonly creates
+///   the store file before its first write, or
+/// * a database file (header magic checked, so a large all-zeros file never
+///   passes) that opens read-only and whose schema holds no tables at all.
+///
+/// Both hold no sessions for any connector, so a scan reports them as
+/// "nothing to read" instead of a scan error on every index run.
+///
+/// Returns `false` for everything uncertain, so the caller falls through to
+/// its own read and surfaces its error exactly as before: garbage bytes and
+/// wrong header magic (including a large all-zeros file), a non-empty file
+/// too small for a header, a schema with *some* tables (schema drift, e.g.
+/// an app migration — the connector's own read must name it), and any open
+/// failure. A store whose wal-index is unusable (`BusyRecovery`) is
+/// deliberately not classified here: proving its emptiness would cost a
+/// snapshot copy of the store, so it falls through to the connector's
+/// [`open_read_only_with_snapshot_fallback`] read instead.
+#[must_use]
+pub fn store_is_provably_empty(db_path: &Path) -> bool {
+    use std::io::Read as _;
+
+    // Case 1: a 0-byte main file. Any bytes at all in the `-wal` could hold
+    // committed frames, so only an absent or 0-byte `-wal` proves emptiness.
+    let main_is_zero_bytes =
+        std::fs::metadata(db_path).is_ok_and(|meta| meta.is_file() && meta.len() == 0);
+    if main_is_zero_bytes {
+        let wal_has_content =
+            std::fs::metadata(sidecar_path(db_path, "-wal")).is_ok_and(|meta| meta.len() > 0);
+        return !wal_has_content;
+    }
+
+    // Case 2: a real database file whose schema holds no tables at all.
+    let mut magic = [0_u8; 16];
+    let header_is_sqlite = std::fs::File::open(db_path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok()
+        && magic == SQLITE_HEADER_MAGIC;
+    if !header_is_sqlite {
+        return false;
+    }
+    // A strict read-only open only (see above for why no snapshot fallback).
+    let Ok(connection) = open_with_flags(
+        db_path.to_string_lossy().as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return false;
+    };
+    connection
+        .query_map_collect(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1",
+            &[],
+            |_row| Ok(()),
+        )
+        .is_ok_and(|tables| tables.is_empty())
+}
+
 /// Synchronous wrapper over [`frankensqlite::Connection`].
 ///
 /// Exposes the subset of the engine surface the connectors use, with the
@@ -873,5 +938,116 @@ mod tests {
                 assert_eq!(restored.capabilities(), parent.capabilities());
             }
         });
+    }
+
+    // cass follow-up to F9 (2026-11-07): the provably-empty classifier.
+
+    /// A real database file whose schema holds no tables at all.
+    fn zero_table_store(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let db = dir.join(name);
+        let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute("CREATE TABLE schema_marker (x INTEGER);")
+            .unwrap();
+        conn.execute("DROP TABLE schema_marker;").unwrap();
+        drop(conn);
+        assert!(
+            std::fs::metadata(&db).unwrap().len() > 0,
+            "the fixture must be a real database file, not 0 bytes"
+        );
+        db
+    }
+
+    #[test]
+    fn a_zero_byte_store_with_no_wal_content_is_provably_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        std::fs::write(&db, []).unwrap();
+        assert!(store_is_provably_empty(&db));
+
+        // A 0-byte `-wal` still proves emptiness.
+        std::fs::write(sidecar(&db, "-wal"), []).unwrap();
+        assert!(store_is_provably_empty(&db));
+    }
+
+    #[test]
+    fn a_zero_byte_store_with_wal_content_is_not_provably_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        std::fs::write(&db, []).unwrap();
+        std::fs::write(sidecar(&db, "-wal"), b"frames").unwrap();
+        assert!(!store_is_provably_empty(&db));
+    }
+
+    #[test]
+    fn a_database_with_no_tables_is_provably_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = zero_table_store(dir.path(), "store.db");
+        assert!(store_is_provably_empty(&db));
+    }
+
+    #[test]
+    fn a_wal_mode_database_with_no_tables_is_provably_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = zero_table_store(dir.path(), "store.db");
+        {
+            let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+            let mode: String = conn
+                .query_row_map("PRAGMA journal_mode=wal;", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "wal");
+            conn.query_row_map::<(i64, i64, i64), _>(
+                "PRAGMA wal_checkpoint(TRUNCATE);",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .unwrap();
+        }
+        assert!(sidecar(&db, "-wal").is_file());
+        assert!(store_is_provably_empty(&db));
+    }
+
+    #[test]
+    fn a_database_with_only_an_unrelated_table_is_not_provably_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute("CREATE TABLE unrelated_table (x INTEGER);")
+            .unwrap();
+        drop(conn);
+        assert!(!store_is_provably_empty(&db));
+    }
+
+    #[test]
+    fn garbage_bytes_are_not_provably_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        std::fs::write(&db, b"this is not a sqlite database").unwrap();
+        assert!(!store_is_provably_empty(&db));
+    }
+
+    #[test]
+    fn an_all_zeros_file_is_not_provably_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        std::fs::write(&db, vec![0_u8; 32_768]).unwrap();
+        assert!(
+            !store_is_provably_empty(&db),
+            "wrong header magic is never emptiness, whatever the size"
+        );
+    }
+
+    #[test]
+    fn a_nonempty_file_too_small_for_a_header_is_not_provably_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        std::fs::write(&db, b"tiny").unwrap();
+        assert!(!store_is_provably_empty(&db));
+    }
+
+    #[test]
+    fn a_missing_file_is_not_provably_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("absent.db");
+        assert!(!store_is_provably_empty(&db));
     }
 }

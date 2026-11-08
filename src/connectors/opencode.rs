@@ -13,9 +13,10 @@
 //! (v2 `content` items, 1.x `part` rows/files) archives the raw part JSONs in
 //! `extra["parts"]` in delivery order, so the host can prove the part
 //! inventory verbatim. A failed run's `state.error` text renders inline as
-//! `[Tool Error]` (it is source text), and a tool part that renders no text
-//! still keeps its message alive with empty content rather than dropping the
-//! part's identity and state with it.
+//! `[Tool Error]` (it is source text) — a plain string or an object carrying
+//! the text under `message` (the measured real shape is `{message, type}`) —
+//! and a tool part that renders no text still keeps its message alive with
+//! empty content rather than dropping the part's identity and state with it.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -1137,10 +1138,40 @@ struct PartInfo {
 struct ToolState {
     #[serde(default)]
     output: Option<String>,
-    // Error text a failed tool run carries in its state (`state.error`) —
-    // source text the v1 render dropped.
+    // A failed tool run's error record in `state.error` — source text the
+    // v1 render dropped (F14).
     #[serde(default)]
-    error: Option<String>,
+    error: Option<ToolStateError>,
+}
+
+/// A failed tool run's error record. OpenCode writes either a plain string
+/// or an object carrying the failure text under `message` (the measured
+/// real shape is `{message, type}`); any other shape is still kept so the
+/// part never loses its identity over the error's shape (F14).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ToolStateError {
+    Text(String),
+    Object {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    // Any other shape: kept unread (the raw record is archived verbatim in
+    // the message extras anyway) so a part never loses its identity over
+    // the error's shape.
+    Other(#[allow(dead_code)] serde_json::Value),
+}
+
+impl ToolStateError {
+    /// The renderable failure text: the string form, or the object's
+    /// `message`.
+    fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Object { message } => message.as_deref(),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 impl Connector for OpenCodeConnector {
@@ -1502,11 +1533,10 @@ fn assemble_v2_assistant_content(data: &serde_json::Value) -> String {
                     pieces.push(format!("[Tool Output]\n{output}"));
                 }
                 // A failed run's `state.error` is source text — render it
-                // instead of dropping it (F14).
-                let error = item
-                    .pointer("/state/error")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
+                // instead of dropping it (F14): a plain string, or an
+                // object carrying the text under `message` (the measured
+                // real shape is `{message, type}`).
+                let error = error_text_of(item.pointer("/state/error")).unwrap_or("");
                 if !error.trim().is_empty() {
                     pieces.push(format!("[Tool Error]\n{error}"));
                 }
@@ -1515,6 +1545,18 @@ fn assemble_v2_assistant_content(data: &serde_json::Value) -> String {
         }
     }
     pieces.join("\n\n")
+}
+
+/// The renderable failure text of a raw `state.error` record: the string
+/// form, or the object's `message` string (F14).
+fn error_text_of(error: Option<&serde_json::Value>) -> Option<&str> {
+    match error? {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        serde_json::Value::Object(record) => {
+            record.get("message").and_then(serde_json::Value::as_str)
+        }
+        _ => None,
+    }
 }
 
 fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
@@ -1866,7 +1908,7 @@ fn assemble_content_from_parts(parts: &[PartInfo]) -> String {
                     {
                         content_pieces.push(format!("[Tool Output]\n{}", output));
                     }
-                    if let Some(error) = &state.error
+                    if let Some(error) = state.error.as_ref().and_then(|e| e.text())
                         && !error.trim().is_empty()
                     {
                         content_pieces.push(format!("[Tool Error]\n{}", error));
@@ -4983,6 +5025,44 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_v2_error_object_message_renders_and_archives() {
+        // The real failed-run shape: `state.error` is an OBJECT carrying the
+        // failure text under `message` (measured shape: `{message, type}`,
+        // status `error`), not a plain string. The render must deliver that
+        // text and the archive must keep the object verbatim.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        insert_v2_session(&conn, "ses_err", "Error session", 1_700_000_100_000);
+        insert_v2_message(&conn, "ses_err", 0, "user", r#"{"text":"run it"}"#);
+        insert_v2_message(
+            &conn,
+            "ses_err",
+            1,
+            "assistant",
+            r#"{"agent":"build","model":{"id":"gpt-5","providerID":"openai"},"time":{"created":1700000002000},
+                "content":[
+                  {"type":"text","text":"trying now"},
+                  {"type":"tool","executed":false,"id":"prt_err","name":"shell","time":{},
+                   "state":{"status":"error","input":{"command":"make check"},
+                     "error":{"message":"boom: denied","type":"tool_error"}}}]}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        let row = &convs[0].messages[1];
+        assert_eq!(row.content, "trying now\n\n[Tool Error]\nboom: denied");
+        let parts = row.extra["parts"].as_array().unwrap();
+        assert_eq!(parts[1]["id"], "prt_err");
+        assert_eq!(parts[1]["state"]["status"], "error");
+        assert_eq!(parts[1]["state"]["error"]["message"], "boom: denied");
+        assert_eq!(parts[1]["state"]["error"]["type"], "tool_error");
+    }
+
+    #[test]
     fn sqlite_legacy_tool_part_state_archived_verbatim() {
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
@@ -5049,6 +5129,121 @@ mod tests {
         assert_eq!(parts[1]["state"]["title"], "Bash");
         assert_eq!(parts[2]["state"]["error"], "boom: denied");
         assert_eq!(parts[2]["state"]["input"]["path"], "c.rs");
+    }
+
+    #[test]
+    fn sqlite_legacy_error_object_part_kept_and_rendered() {
+        // Same failed-run shape on a 1.x part row: the error record is an
+        // object with the text under `message`. The typed view must not drop
+        // the whole part (identity) over the error's shape, and the text
+        // must render.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-eo", "Error object"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["msg-eo", "sess-eo", r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-eo-1",
+                "msg-eo",
+                "sess-eo",
+                r#"{"id":"p-eo-1","messageID":"msg-eo","order":0,"type":"text","text":"checking"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-eo-2",
+                "msg-eo",
+                "sess-eo",
+                r#"{"id":"p-eo-2","messageID":"msg-eo","order":1,"type":"tool",
+                    "state":{"id":"toolu_e1","status":"error","input":{"command":"make"},
+                    "error":{"message":"boom: denied","type":"tool_error"},"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1, "the tool part must survive");
+        let message = &convs[0].messages[0];
+        assert_eq!(message.content, "checking\n\n[Tool Error]\nboom: denied");
+        let parts = message.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "both parts are archived");
+        assert_eq!(parts[1]["state"]["id"], "toolu_e1");
+        assert_eq!(parts[1]["state"]["error"]["message"], "boom: denied");
+        assert_eq!(parts[1]["state"]["error"]["type"], "tool_error");
+    }
+
+    #[test]
+    fn sqlite_legacy_unreadable_error_shape_keeps_identity() {
+        // An error record with no renderable text — an object without a
+        // `message`, or a non-string non-object shape — keeps the part (and
+        // its identity/state) alive; nothing is guessed or dropped.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-odd", "Odd errors"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["msg-odd", "sess-odd", r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-od-1",
+                "msg-odd",
+                "sess-odd",
+                r#"{"id":"p-od-1","messageID":"msg-odd","order":0,"type":"tool",
+                    "state":{"id":"toolu_o1","status":"error","input":{"command":"ls"},
+                    "error":{"type":"no_message"},"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-od-2",
+                "msg-odd",
+                "sess-odd",
+                r#"{"id":"p-od-2","messageID":"msg-odd","order":1,"type":"tool",
+                    "state":{"id":"toolu_o2","status":"error","input":{"command":"pwd"},
+                    "error":42,"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].messages.len(),
+            1,
+            "both identity-bearing tool parts must survive"
+        );
+        let message = &convs[0].messages[0];
+        assert_eq!(message.content, "", "no text to render, row still kept");
+        assert!(!message.content.contains("[Tool Error]"));
+        let parts = message.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["state"]["error"]["type"], "no_message");
+        assert_eq!(parts[1]["state"]["error"], 42);
     }
 
     #[test]
@@ -5166,7 +5361,7 @@ mod tests {
             text: None,
             state: Some(ToolState {
                 output: Some("partial out".into()),
-                error: Some("boom: denied".into()),
+                error: Some(ToolStateError::Text("boom: denied".into())),
             }),
         }];
         let content = assemble_content_from_parts(&parts);
@@ -5174,6 +5369,37 @@ mod tests {
             content,
             "[Tool Output]\npartial out\n\n[Tool Error]\nboom: denied"
         );
+        // The object error shape renders its `message` text; a shape with
+        // no renderable text renders nothing without losing the part.
+        let parts = vec![PartInfo {
+            id: Some("p-err-obj".into()),
+            index: Some(0),
+            message_id: None,
+            part_type: Some("tool".into()),
+            text: None,
+            state: Some(ToolState {
+                output: None,
+                error: Some(ToolStateError::Object {
+                    message: Some("denied again".into()),
+                }),
+            }),
+        }];
+        assert_eq!(
+            assemble_content_from_parts(&parts),
+            "[Tool Error]\ndenied again"
+        );
+        let parts = vec![PartInfo {
+            id: Some("p-err-odd".into()),
+            index: Some(0),
+            message_id: None,
+            part_type: Some("tool".into()),
+            text: None,
+            state: Some(ToolState {
+                output: None,
+                error: Some(ToolStateError::Other(serde_json::json!({"type": "x"}))),
+            }),
+        }];
+        assert_eq!(assemble_content_from_parts(&parts), "");
     }
 
     // =====================================================

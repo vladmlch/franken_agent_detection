@@ -18,7 +18,9 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const SESSION_ID: &str = "47c09e1e-9b87-401c-bdeb-6c357ab925f9";
-const COMPACT_THRESHOLD: u64 = 32 * 1024 * 1024;
+/// The size at which the removed compaction layer used to kick in; sessions
+/// at and above it are the regression guard for "extras stay full".
+const LARGE_SESSION_BYTES: u64 = 32 * 1024 * 1024;
 
 fn record(uuid: &str, parent: Option<&str>, kind: &str, parts: &[Value]) -> Value {
     json!({
@@ -735,11 +737,11 @@ fn with_invalid_tool_counts(mut records: Vec<Value>) -> Vec<Value> {
 }
 
 #[test]
-fn native_metadata_compacts_at_32_mib_without_losing_content_identity_or_usage() {
+fn large_sessions_keep_full_native_metadata_content_identity_and_usage() {
     for size in [
-        COMPACT_THRESHOLD - 1,
-        COMPACT_THRESHOLD,
-        COMPACT_THRESHOLD + 1,
+        LARGE_SESSION_BYTES - 1,
+        LARGE_SESSION_BYTES,
+        LARGE_SESSION_BYTES + 1,
     ] {
         let mut assistant = record(
             "assistant",
@@ -754,12 +756,12 @@ fn native_metadata_compacts_at_32_mib_without_losing_content_identity_or_usage()
         assistant["usageMetadata"] = json!({
             "promptTokenCount": 10, "candidatesTokenCount": 5, "cachedContentTokenCount": 1,
             "thoughtsTokenCount": 2, "toolUsePromptTokenCount": 0, "totalTokenCount": 15,
-            "unbounded_details": "must not survive compact metadata",
+            "unbounded_details": "large sessions must keep this metadata",
         });
-        assistant["unknown_large_metadata"] = "raw metadata remains only below the boundary".into();
+        assistant["unknown_large_metadata"] = "raw metadata survives at every size".into();
         let fixture = Fixture::new(&with_invalid_tool_counts(vec![
             text_record("user", None, "user", "Read it"),
-            assistant,
+            assistant.clone(),
         ]));
         pad_to_size(&fixture.path, size);
         let before = fs::metadata(&fixture.path).unwrap().modified().unwrap();
@@ -780,22 +782,13 @@ fn native_metadata_compacts_at_32_mib_without_losing_content_identity_or_usage()
             message.invocations[0].arguments.as_ref().unwrap()["path"],
             "/repo/file"
         );
-        if size < COMPACT_THRESHOLD {
-            assert!(message.extra.get("cass").is_none());
-            assert_eq!(message.extra["usageMetadata"]["totalTokenCount"], 15);
-            assert!(message.extra.get("message").is_some());
-        } else {
-            assert_eq!(message.extra["cass"]["message_id"], "assistant");
-            assert_eq!(message.extra["cass"]["parent_uuid"], "user");
-            assert_eq!(message.extra["cass"]["session_id"], SESSION_ID);
-            assert_eq!(message.extra["cass"]["model"], "qwen3-coder-plus");
-            assert_eq!(message.extra["cass"]["usage"]["totalTokenCount"], 15);
-            assert_eq!(message.extra["cass"]["tool_call_count"], 1);
-            assert!(message.extra.get("message").is_none());
-            assert!(!message.extra.to_string().contains("unbounded_details"));
-            assert!(!message.extra.to_string().contains("unknown_large_metadata"));
-            assert!(message.extra.to_string().len() < 1024);
-        }
+        // Full extras at any size: the raw record — uuid links, native
+        // usageMetadata with its unbounded extension, and arbitrary unknown
+        // metadata — survives verbatim, never a `{cass:{…}}` skeleton.
+        assert!(message.extra.get("cass").is_none());
+        assert_eq!(&message.extra, &assistant);
+        assert_eq!(message.extra["usageMetadata"]["totalTokenCount"], 15);
+        assert!(message.extra.get("message").is_some());
         let usage =
             extract_tokens_for_agent("qwen", &message.extra, &message.content, &message.role);
         assert_eq!(usage.data_source, TokenDataSource::Api);
@@ -805,22 +798,22 @@ fn native_metadata_compacts_at_32_mib_without_losing_content_identity_or_usage()
             "Responses candidates already include reasoning"
         );
         assert_eq!(usage.tool_call_count, 1);
-        for invalid in &conversations[0].messages[2..] {
+        for (invalid, raw) in conversations[0].messages[2..]
+            .iter()
+            .zip(with_invalid_tool_counts(Vec::new()))
+        {
             let usage =
                 extract_tokens_for_agent("qwen", &invalid.extra, &invalid.content, &invalid.role);
             assert_eq!(usage.data_source, TokenDataSource::Api);
             assert_eq!(
                 usage.total_tokens(),
                 Some(11),
-                "invalid tool counts must not become inferred zeroes after compaction"
+                "invalid tool counts must not become inferred zeroes"
             );
-            if size >= COMPACT_THRESHOLD {
-                assert_eq!(
-                    invalid.extra.pointer("/cass/usage/toolUsePromptTokenCount"),
-                    Some(&Value::Null)
-                );
-                assert!(invalid.extra.to_string().len() < 1024);
-            }
+            // The invalid raw values stay archived untouched — extraction
+            // ignores them instead of rewriting them to inferred zeroes.
+            assert_eq!(&invalid.extra, &raw);
+            assert!(invalid.extra.get("cass").is_none());
         }
         assert_eq!(fs::metadata(&fixture.path).unwrap().len(), size);
         assert_eq!(

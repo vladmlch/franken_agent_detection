@@ -34,7 +34,6 @@ use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
 };
 
-const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SUBAGENT_METADATA_BYTES: u64 = 1024 * 1024;
 const QWEN_USAGE_KEYS: [&str; 6] = [
     "promptTokenCount",
@@ -584,11 +583,7 @@ fn read_qwen_jsonl(reader: impl BufRead, subagent_path: Option<&Path>) -> Result
     Ok(history)
 }
 
-fn parse_qwen_jsonl(
-    reader: impl BufRead,
-    path: &Path,
-    compact: bool,
-) -> Result<Option<NormalizedConversation>> {
+fn parse_qwen_jsonl(reader: impl BufRead, path: &Path) -> Result<Option<NormalizedConversation>> {
     let QwenHistory {
         records,
         leaf,
@@ -620,7 +615,7 @@ fn parse_qwen_jsonl(
     });
     let mut messages: Vec<_> = chain
         .into_iter()
-        .filter_map(|record| normalize_qwen_record(record, compact))
+        .filter_map(normalize_qwen_record)
         .collect();
     if messages.is_empty() {
         return Ok(None);
@@ -833,7 +828,7 @@ fn qwen_user_display(record: &Value) -> (Option<&str>, &[Value]) {
     (display_text, parts)
 }
 
-fn normalize_qwen_record(record: Value, compact: bool) -> Option<NormalizedMessage> {
+fn normalize_qwen_record(record: Value) -> Option<NormalizedMessage> {
     let role = match record["type"].as_str()? {
         "user" => "user",
         "assistant" => "assistant",
@@ -900,11 +895,9 @@ fn normalize_qwen_record(record: Value, compact: bool) -> Option<NormalizedMessa
         return None;
     }
     let created_at = record.get("timestamp").and_then(parse_timestamp);
-    let extra = if compact {
-        compact_qwen_record(&record, invocations.len())
-    } else {
-        record
-    };
+    // The raw record is carried verbatim; large sessions keep the full native
+    // metadata (identity, usage, subagent rounds) intact.
+    let extra = record;
     Some(NormalizedMessage {
         idx: 0,
         role: role.into(),
@@ -917,51 +910,6 @@ fn normalize_qwen_record(record: Value, compact: bool) -> Option<NormalizedMessa
     })
 }
 
-fn compact_qwen_record(record: &Value, tool_call_count: usize) -> Value {
-    let mut cass = serde_json::Map::new();
-    for (native, compact) in [
-        ("uuid", "message_id"),
-        ("parentUuid", "parent_uuid"),
-        ("sessionId", "session_id"),
-        ("model", "model"),
-        ("subtype", "subtype"),
-        ("agentId", "agent_id"),
-        ("agentName", "agent_name"),
-        ("agentRunId", "agent_run_id"),
-    ] {
-        if let Some(value) = record.get(native).filter(|value| value.is_string()) {
-            cass.insert(compact.into(), value.clone());
-        }
-    }
-    if let Some(value) = record.get("isSidechain").filter(|value| value.is_boolean()) {
-        cass.insert("is_sidechain".into(), value.clone());
-    }
-    if let Some(value) = record
-        .get("agentRound")
-        .filter(|value| value.as_u64().is_some())
-    {
-        cass.insert("agent_round".into(), value.clone());
-    }
-    let mut usage = serde_json::Map::new();
-    for key in QWEN_USAGE_KEYS {
-        if let Some(value) = record.get("usageMetadata").and_then(|usage| usage.get(key)) {
-            if value.as_i64().is_some() {
-                usage.insert(key.into(), value.clone());
-            } else if key == "toolUsePromptTokenCount" {
-                // Missing tool usage means zero when reconciling a complete
-                // total; present-but-invalid usage makes that inference
-                // unsafe. Retain its presence without cloning the payload.
-                usage.insert(key.into(), Value::Null);
-            }
-        }
-    }
-    if !usage.is_empty() {
-        cass.insert("usage".into(), Value::Object(usage));
-    }
-    cass.insert("tool_call_count".into(), tool_call_count.into());
-    serde_json::json!({ "cass": cass })
-}
-
 /// Parse a Qwen session file into a `NormalizedConversation`.
 fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
     if path
@@ -969,8 +917,7 @@ fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
         .is_some_and(|extension| extension == "jsonl")
     {
         let file = fs::File::open(path)?;
-        let compact = file.metadata()?.len() >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES;
-        return parse_qwen_jsonl(BufReader::new(file), path, compact);
+        return parse_qwen_jsonl(BufReader::new(file), path);
     }
     // Whole-session JSON loads into a full DOM; enforce the project's
     // 100MB scan cap (chatgpt policy).
@@ -1164,7 +1111,6 @@ mod tests {
                     kind,
                 },
                 Path::new("/fixture/chats/session.jsonl"),
-                false,
             );
             let error = result.unwrap_err();
             let io_error = error.downcast_ref::<io::Error>().unwrap();

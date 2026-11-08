@@ -33,8 +33,6 @@ mod retained_content;
 /// Collecting scans remain all-or-error; callback errors stop immediately.
 pub struct ClaudeCodeConnector;
 
-const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
-
 impl Default for ClaudeCodeConnector {
     fn default() -> Self {
         Self::new()
@@ -160,10 +158,6 @@ impl ClaudeCodeConnector {
                 ancestor.file_name().and_then(|name| name.to_str()) == Some("projects")
             })
             .map(Path::to_path_buf)
-    }
-
-    fn should_compact_large_message_extra(file_size_bytes: Option<u64>) -> bool {
-        file_size_bytes.is_some_and(|size| size >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES)
     }
 
     fn path_is_desktop_sidecar(path: &Path) -> bool {
@@ -323,108 +317,6 @@ impl ClaudeCodeConnector {
         out
     }
 
-    fn compact_message_extra(raw: &Value) -> Value {
-        let mut cass = serde_json::Map::new();
-
-        if let Some(model) = raw
-            .pointer("/message/model")
-            .or_else(|| raw.get("model"))
-            .and_then(|v| v.as_str())
-            .filter(|value| !value.trim().is_empty())
-        {
-            cass.insert("model".to_string(), Value::String(model.to_string()));
-        }
-
-        // One reply can span multiple JSONL content-block records, each repeating
-        // its full usage. Keep only the identity strings hosts need to dedupe
-        // by (message_id, request_id), without retaining the message body.
-        for (key, pointer) in [("message_id", "/message/id"), ("request_id", "/requestId")] {
-            if let Some(value) = raw.pointer(pointer).and_then(Value::as_str) {
-                cass.insert(key.to_string(), Value::String(value.to_string()));
-            }
-        }
-
-        let usage = raw.pointer("/message/usage");
-        let mut token_usage = serde_json::Map::new();
-        if let Some(input_tokens) = usage
-            .and_then(|value| value.get("input_tokens"))
-            .and_then(Value::as_i64)
-        {
-            token_usage.insert("input_tokens".to_string(), Value::from(input_tokens));
-        }
-        if let Some(output_tokens) = usage
-            .and_then(|value| value.get("output_tokens"))
-            .and_then(Value::as_i64)
-        {
-            token_usage.insert("output_tokens".to_string(), Value::from(output_tokens));
-        }
-        if let Some(cache_read_tokens) = usage
-            .and_then(|value| value.get("cache_read_input_tokens"))
-            .and_then(Value::as_i64)
-        {
-            token_usage.insert(
-                "cache_read_tokens".to_string(),
-                Value::from(cache_read_tokens),
-            );
-        }
-        if let Some(cache_creation_tokens) = usage
-            .and_then(|value| value.get("cache_creation_input_tokens"))
-            .and_then(Value::as_i64)
-        {
-            token_usage.insert(
-                "cache_creation_tokens".to_string(),
-                Value::from(cache_creation_tokens),
-            );
-        }
-        if let Some(service_tier) = usage
-            .and_then(|value| value.get("service_tier"))
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty())
-        {
-            token_usage.insert(
-                "service_tier".to_string(),
-                Value::String(service_tier.to_string()),
-            );
-        }
-        if !token_usage.is_empty() {
-            token_usage.insert("data_source".to_string(), Value::String("api".to_string()));
-            cass.insert("token_usage".to_string(), Value::Object(token_usage));
-        }
-
-        let tool_call_count = raw
-            .pointer("/message/content")
-            .and_then(|value| value.as_array())
-            .map_or(0, |items| {
-                items
-                    .iter()
-                    .filter(|item| {
-                        item.get("type").and_then(|kind| kind.as_str()) == Some("tool_use")
-                    })
-                    .count()
-            });
-        if tool_call_count > 0 {
-            cass.insert("tool_call_count".to_string(), Value::from(tool_call_count));
-        }
-
-        if let Some(attachments) = raw
-            .get("attachment_refs")
-            .or_else(|| raw.get("attachments"))
-            .or_else(|| raw.pointer("/message/attachment_refs"))
-            .or_else(|| raw.pointer("/message/attachments"))
-            .cloned()
-        {
-            cass.insert("attachments".to_string(), attachments);
-        }
-
-        if cass.is_empty() {
-            Value::Object(serde_json::Map::new())
-        } else {
-            let mut out = serde_json::Map::new();
-            out.insert("cass".to_string(), Value::Object(cass));
-            Value::Object(out)
-        }
-    }
-
     /// A prompt the user typed while the agent was mid-turn is recorded as
     /// `{"type":"attachment","attachment":{"type":"queued_command",
     /// "commandMode":"prompt","prompt":..,"origin":{"kind":"human"}}}` rather
@@ -439,7 +331,7 @@ impl ClaudeCodeConnector {
     /// `queue-operation` records are not indexed either: they repeat the text
     /// of every queued item, including ones later saved as normal user
     /// entries, so indexing them would double turns.
-    fn queued_command_message(raw: &Value, compact_extra: bool) -> Option<NormalizedMessage> {
+    fn queued_command_message(raw: &Value) -> Option<NormalizedMessage> {
         let attachment = raw.get("attachment")?;
         if attachment.get("type").and_then(Value::as_str) != Some("queued_command")
             || attachment.get("commandMode").and_then(Value::as_str) != Some("prompt")
@@ -489,11 +381,7 @@ impl ClaudeCodeConnector {
             );
         }
 
-        let mut extra = if compact_extra {
-            Self::compact_message_extra(raw)
-        } else {
-            raw.clone()
-        };
+        let mut extra = raw.clone();
         if let Some(obj) = extra.as_object_mut() {
             let cass = obj
                 .entry("cass".to_string())
@@ -660,16 +548,6 @@ fn scan_claude_with_readers<R: BufRead>(
                 );
                 continue;
             }
-            let file_size_bytes = fs::metadata(&path).ok().map(|metadata| metadata.len());
-            let compact_message_extra =
-                ClaudeCodeConnector::should_compact_large_message_extra(file_size_bytes);
-            if compact_message_extra {
-                tracing::debug!(
-                    path = %path.display(),
-                    size_bytes = file_size_bytes.unwrap_or_default(),
-                    "claude_code compacting per-message extra payloads for large session"
-                );
-            }
             file_count += 1;
             if file_count <= 3 {
                 tracing::debug!(path = %path.display(), "claude_code found file");
@@ -760,9 +638,7 @@ fn scan_claude_with_readers<R: BufRead>(
                         continue;
                     }
                     if entry_type == Some("attachment") {
-                        if let Some(message) =
-                            ClaudeCodeConnector::queued_command_message(&val, compact_message_extra)
-                        {
+                        if let Some(message) = ClaudeCodeConnector::queued_command_message(&val) {
                             widen_time_bounds(&mut started_at, &mut ended_at, message.created_at);
                             messages.push(message);
                         }
@@ -874,11 +750,7 @@ fn scan_claude_with_readers<R: BufRead>(
                         author,
                         created_at: created,
                         content: content_str,
-                        extra: if compact_message_extra {
-                            ClaudeCodeConnector::compact_message_extra(&val)
-                        } else {
-                            val
-                        },
+                        extra: val,
                         invocations,
                         snippets: Vec::new(),
                     });
@@ -973,11 +845,7 @@ fn scan_claude_with_readers<R: BufRead>(
                             author: None,
                             created_at: created,
                             content: content_str,
-                            extra: if compact_message_extra {
-                                ClaudeCodeConnector::compact_message_extra(item)
-                            } else {
-                                item.clone()
-                            },
+                            extra: item.clone(),
                             invocations: content_val
                                 .map_or_else(Vec::new, extract_invocations_from_content_blocks),
                             snippets: Vec::new(),
@@ -1638,129 +1506,15 @@ mod tests {
     }
 
     #[test]
-    fn compact_message_extra_keeps_only_compact_cass_metadata() {
-        let raw = json!({
-            "requestId": "req_1",
-            "message": {
-                "id": "msg_1",
-                "model": "claude-opus-4-6",
-                "usage": {
-                    "input_tokens": 100,
-                    "output_tokens": 50,
-                    "cache_read_input_tokens": 20,
-                    "cache_creation_input_tokens": 5,
-                    "service_tier": "standard"
-                },
-                "content": [
-                    {"type": "tool_use", "name": "Read"},
-                    {"type": "tool_use", "name": "Edit"},
-                    {"type": "text", "text": "large duplicated content".repeat(4096)}
-                ]
-            },
-            "attachments": [{"path": "/tmp/log.txt"}],
-            "summary": "this should be dropped"
-        });
-
-        let compact = ClaudeCodeConnector::compact_message_extra(&raw);
-        assert_eq!(compact["cass"]["model"], "claude-opus-4-6");
-        assert_eq!(compact["cass"]["message_id"], "msg_1");
-        assert_eq!(compact["cass"]["request_id"], "req_1");
-        assert_eq!(compact.as_object().unwrap().len(), 1);
-        assert!(compact.get("message").is_none());
-        assert!(compact.get("requestId").is_none());
-        assert_eq!(compact["cass"]["token_usage"]["input_tokens"], 100);
-        assert_eq!(compact["cass"]["token_usage"]["output_tokens"], 50);
-        assert_eq!(compact["cass"]["token_usage"]["cache_read_tokens"], 20);
-        assert_eq!(compact["cass"]["token_usage"]["cache_creation_tokens"], 5);
-        assert_eq!(compact["cass"]["token_usage"]["service_tier"], "standard");
-        assert_eq!(compact["cass"]["tool_call_count"], 2);
-        assert_eq!(compact["cass"]["attachments"][0]["path"], "/tmp/log.txt");
-        assert!(compact.get("summary").is_none());
-        assert!(serde_json::to_vec(&compact).unwrap().len() < 1024);
-    }
-
-    #[test]
-    fn compact_message_extra_preserves_optional_identifiers_without_usage() {
-        for message_id in [None, Some(""), Some(" msg_\u{65e5}\u{672c}\u{8a9e} ")] {
-            for request_id in [None, Some(""), Some(" req_\u{3b1} ")] {
-                let mut raw = json!({"uuid": "record-id", "message": {}});
-                let mut expected = Map::new();
-                if let Some(id) = message_id {
-                    raw["message"]["id"] = json!(id);
-                    expected.insert("message_id".to_string(), json!(id));
-                }
-                if let Some(id) = request_id {
-                    raw["requestId"] = json!(id);
-                    expected.insert("request_id".to_string(), json!(id));
-                }
-
-                let compact = ClaudeCodeConnector::compact_message_extra(&raw);
-                let expected = if expected.is_empty() {
-                    json!({})
-                } else {
-                    json!({"cass": expected})
-                };
-                assert_eq!(compact, expected);
-            }
-        }
-    }
-
-    #[test]
-    fn compact_message_extra_omits_non_string_identifiers_independently() {
-        for invalid in [json!(null), json!(false), json!(42), json!([]), json!({})] {
-            let raw = json!({
-                "uuid": "record-id",
-                "id": "unrelated-id",
-                "requestId": invalid,
-                "message": {"id": invalid}
-            });
-            assert_eq!(ClaudeCodeConnector::compact_message_extra(&raw), json!({}));
-
-            let mut message_only = raw.clone();
-            message_only["message"]["id"] = json!("msg_1");
-            assert_eq!(
-                ClaudeCodeConnector::compact_message_extra(&message_only),
-                json!({"cass": {"message_id": "msg_1"}})
-            );
-
-            let mut request_only = raw;
-            request_only["requestId"] = json!("req_1");
-            assert_eq!(
-                ClaudeCodeConnector::compact_message_extra(&request_only),
-                json!({"cass": {"request_id": "req_1"}})
-            );
-        }
-    }
-
-    #[test]
-    fn compact_message_extra_preserves_only_string_identifiers() {
-        for raw in [
-            json!({}),
-            json!({"message": {"id": null}, "requestId": 42}),
-            json!({"message": {"id": {"body": "do not retain"}}, "requestId": []}),
-        ] {
-            let compact = ClaudeCodeConnector::compact_message_extra(&raw);
-            assert!(compact.pointer("/cass/message_id").is_none());
-            assert!(compact.pointer("/cass/request_id").is_none());
-        }
-        for raw in [
-            json!({"message": {"id": "msg_only"}}),
-            json!({"requestId": "req_only"}),
-        ] {
-            let compact = ClaudeCodeConnector::compact_message_extra(&raw);
-            assert_eq!(
-                compact.pointer("/cass/message_id"),
-                raw.pointer("/message/id")
-            );
-            assert_eq!(compact.pointer("/cass/request_id"), raw.get("requestId"));
-        }
-    }
-
-    #[test]
-    fn scan_preserves_reply_identity_and_usage_across_compaction_boundary() {
+    fn large_sessions_keep_full_extras_preserving_reply_identity_and_usage() {
         use crate::connectors::token_extraction::extract_tokens_for_agent;
         use std::collections::HashSet;
         use std::io::{Read, Write};
+
+        // The size at which the removed compaction layer used to kick in;
+        // sessions at and above it are the regression guard for "extras
+        // stay full".
+        const LARGE_SESSION_BYTES: u64 = 32 * 1024 * 1024;
 
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
@@ -1769,6 +1523,7 @@ mod tests {
         // First two records are different content blocks of the same reply.
         // Both components of the identity matter; unidentified records must
         // remain separate rather than collapsing onto a shared missing key.
+        let mut records = Vec::new();
         for (message_id, request_id, text) in [
             (Some("msg_1"), Some("req_1"), "first block"),
             (Some("msg_1"), Some("req_1"), "second block"),
@@ -1793,14 +1548,15 @@ mod tests {
                 raw["requestId"] = json!(id);
             }
             writeln!(file, "{raw}").unwrap();
+            records.push(raw);
         }
         let record_bytes = file.metadata().unwrap().len();
         let ctx = ScanContext::local_default(claude_dir, None);
         let mut previous_size = record_bytes;
         for size in [
-            LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES - 1,
-            LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES,
-            LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES + 1,
+            LARGE_SESSION_BYTES - 1,
+            LARGE_SESSION_BYTES,
+            LARGE_SESSION_BYTES + 1,
         ] {
             // A blank whitespace line grows the source without introducing
             // extra messages or a giant duplicated message body in the test.
@@ -1821,22 +1577,16 @@ mod tests {
             let mut seen = HashSet::new();
             let mut total = 0;
             let mut undeduplicated_total = 0;
-            for message in &conversation.messages {
-                let compact = size >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES;
+            for (message, raw) in conversation.messages.iter().zip(&records) {
                 let extra = &message.extra;
-                let (message_pointer, request_pointer) = if compact {
-                    assert_eq!(extra.as_object().unwrap().len(), 1);
-                    assert!(extra.get("message").is_none());
-                    assert!(extra.to_string().len() < 512);
-                    ("/cass/message_id", "/cass/request_id")
-                } else {
-                    assert!(extra.pointer("/message/content").is_some());
-                    ("/message/id", "/requestId")
-                };
+                // Full extras at any size: every `extra` IS the raw source
+                // record — envelope, content blocks and identity included.
+                assert_eq!(extra, raw);
+                assert!(extra.pointer("/message/content").is_some());
                 let identity = extra
-                    .pointer(message_pointer)
+                    .pointer("/message/id")
                     .and_then(Value::as_str)
-                    .zip(extra.pointer(request_pointer).and_then(Value::as_str));
+                    .zip(extra.pointer("/requestId").and_then(Value::as_str));
                 let usage = extract_tokens_for_agent(
                     &conversation.agent_slug,
                     extra,
@@ -1859,22 +1609,6 @@ mod tests {
             assert_eq!(undeduplicated_total, 1050);
             assert_eq!(total, 875);
         }
-    }
-
-    #[test]
-    fn should_compact_large_message_extra_respects_threshold() {
-        assert!(!ClaudeCodeConnector::should_compact_large_message_extra(
-            Some(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES - 1,)
-        ));
-        assert!(ClaudeCodeConnector::should_compact_large_message_extra(
-            Some(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES,)
-        ));
-        assert!(ClaudeCodeConnector::should_compact_large_message_extra(
-            Some(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES + 1,)
-        ));
-        assert!(!ClaudeCodeConnector::should_compact_large_message_extra(
-            None
-        ));
     }
 
     #[test]
@@ -2120,7 +1854,7 @@ mod tests {
         assert_eq!(q1.extra["cass"]["queued_command"]["authorship"], "human");
         assert_eq!(q1.extra["cass"]["queued_command"]["source_uuid"], "src1");
         assert_eq!(q1.extra["cass"]["queued_command"]["command_mode"], "prompt");
-        // The raw record is still carried for non-compacted sessions.
+        // The raw record is carried verbatim.
         assert_eq!(q1.extra["attachment"]["origin"]["kind"], "human");
 
         let q2 = &conv.messages[3];
@@ -2147,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_command_compact_extra_keeps_provenance() {
+    fn queued_command_extra_keeps_raw_record_and_provenance() {
         let raw = json!({
             "type": "attachment",
             "timestamp": "2026-09-24T10:00:12.000Z",
@@ -2159,10 +1893,14 @@ mod tests {
                 "origin": {"kind": "human"}
             }
         });
-        let msg = ClaudeCodeConnector::queued_command_message(&raw, true).unwrap();
+        let msg = ClaudeCodeConnector::queued_command_message(&raw).unwrap();
         assert_eq!(msg.role, "user");
         assert_eq!(msg.content, "large session queued prompt");
-        assert!(msg.extra.get("attachment").is_none());
+        // The raw attachment record survives verbatim — the queued-command
+        // provenance rides inside it under `cass`, never replacing it.
+        for (key, value) in raw.as_object().unwrap() {
+            assert_eq!(msg.extra.get(key), Some(value));
+        }
         assert_eq!(msg.extra["cass"]["queued_command"]["authorship"], "human");
         assert_eq!(msg.extra["cass"]["queued_command"]["source_uuid"], "src9");
 
@@ -2176,7 +1914,7 @@ mod tests {
                 "timestamp": "2026-09-24T10:00:12.000Z"
             }
         });
-        let msg = ClaudeCodeConnector::queued_command_message(&nested_only, false).unwrap();
+        let msg = ClaudeCodeConnector::queued_command_message(&nested_only).unwrap();
         assert_eq!(
             msg.created_at,
             parse_timestamp(&json!("2026-09-24T10:00:12.000Z"))

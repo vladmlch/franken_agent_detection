@@ -17,7 +17,9 @@ use franken_agent_detection::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-const COMPACT_THRESHOLD: u64 = 32 * 1024 * 1024;
+/// The size at which the removed compaction layer used to kick in; sessions at
+/// and above it are the regression guard for "extras stay full".
+const LARGE_SESSION_BYTES: u64 = 32 * 1024 * 1024;
 
 const fn padding() -> [u8; 8192] {
     let mut bytes = [b' '; 8192];
@@ -369,7 +371,7 @@ fn replay_counts_final_usage_once_and_keeps_distinct_identical_replies() {
 }
 
 #[test]
-fn real_compaction_boundary_preserves_usage_and_only_scalar_token_metadata() {
+fn large_sessions_keep_full_extras_and_preserve_usage() {
     let mut complete = native_tokens();
     complete["unknown_large_field"] = json!({"payload": "x".repeat(64 * 1024)});
     let counts = [
@@ -392,9 +394,9 @@ fn real_compaction_boundary_preserves_usage_and_only_scalar_token_metadata() {
         .map(|tokens| snapshot(&extract(tokens.clone())))
         .collect();
     for size in [
-        COMPACT_THRESHOLD - 1,
-        COMPACT_THRESHOLD,
-        COMPACT_THRESHOLD + 1,
+        LARGE_SESSION_BYTES - 1,
+        LARGE_SESSION_BYTES,
+        LARGE_SESSION_BYTES + 1,
     ] {
         let fixture = Fixture::new(&records, false, Some(size));
         let conversation = fixture.scan();
@@ -402,26 +404,13 @@ fn real_compaction_boundary_preserves_usage_and_only_scalar_token_metadata() {
         assert_eq!(extracted_messages(&conversation), expected);
         for (normalized, raw) in conversation.messages.iter().zip(&records) {
             assert_eq!(normalized.content, "Answer text.");
-            if size < COMPACT_THRESHOLD {
-                assert_eq!(&normalized.extra, raw);
-            } else {
-                let compact = normalized.extra.as_object().unwrap();
-                assert!(compact.keys().all(|key| key == "model" || key == "tokens"));
-                if let Some(tokens) = compact.get("tokens") {
-                    for (key, count) in tokens.as_object().unwrap() {
-                        assert!(
-                            ["input", "output", "cached", "thoughts", "tool", "total"]
-                                .contains(&key.as_str())
-                        );
-                        assert!(count.as_i64().is_some_and(|count| count >= 0));
-                    }
-                }
-                assert!(serde_json::to_vec(compact).unwrap().len() < 256);
-            }
+            // Full extras at any size: the raw record — including the bulky
+            // `unknown_large_field` inside `tokens` — survives verbatim,
+            // never reduced to a model/tokens-only skeleton.
+            assert_eq!(&normalized.extra, raw);
         }
-        if size >= COMPACT_THRESHOLD {
-            assert_eq!(conversation.messages[0].extra["tokens"], native_tokens());
-            assert!(conversation.messages[7].extra.get("tokens").is_none());
-        }
+        // The bulky `unknown_large_field` survives verbatim at every size,
+        // including sessions past the former 32 MiB compaction cutoff.
+        assert_eq!(conversation.messages[0].extra["tokens"], counts[0]);
     }
 }

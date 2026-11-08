@@ -30,13 +30,13 @@ fn assistant(text: &str) -> Value {
     json!({"type": "response_item", "payload": {"role": "assistant", "content": text}})
 }
 
-fn write_rollout(path: &Path, records: &[Value], compact: bool) -> io::Result<()> {
+fn write_rollout(path: &Path, records: &[Value], large: bool) -> io::Result<()> {
     let mut file = fs::File::create(path)?;
     for record in records {
         writeln!(file, "{record}")?;
     }
-    if compact {
-        // Trigger FAD's 32 MiB raw-extra compaction without huge JSON fixtures.
+    if large {
+        // Grow the source past 32 MiB without huge JSON fixtures.
         // A whitespace-only physical line adds no messages or parsed objects.
         io::copy(&mut io::repeat(b' ').take(32 * 1024 * 1024), &mut file)?;
         file.write_all(b"\n")?;
@@ -234,9 +234,9 @@ fn same_stream_repetitions_and_both_pair_orders_keep_their_multiplicity() {
 }
 
 #[test]
-fn compaction_does_not_remove_the_stream_or_turn_identity_needed_for_pairing() {
+fn large_sessions_keep_full_extras_and_the_stream_or_turn_identity_needed_for_pairing() {
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("rollout-compacted-prompts.jsonl");
+    let path = temp.path().join("rollout-large-prompts.jsonl");
     let records = [
         event("continue", None, Some("one")),
         response("continue", None, Some("two")),
@@ -246,6 +246,7 @@ fn compaction_does_not_remove_the_stream_or_turn_identity_needed_for_pairing() {
     ];
     write_rollout(&path, &records, true).unwrap();
     let size_before = fs::metadata(&path).unwrap().len();
+    assert!(size_before > 32 * 1024 * 1024);
     let ctx = ScanContext::with_roots(
         temp.path().join("cass"),
         vec![ScanRoot::local(path.clone())],
@@ -253,11 +254,17 @@ fn compaction_does_not_remove_the_stream_or_turn_identity_needed_for_pairing() {
     );
     let conversations = CodexConnector::new().scan(&ctx).unwrap();
     assert_prompt_history(&conversations, &["continue", "continue", "日本語"]);
-    assert!(
-        conversations[0]
-            .messages
-            .iter()
-            .all(|message| message.extra.get("payload").is_none())
-    );
+    // A session above the removed 32 MiB cutoff keeps every raw envelope:
+    // each surviving message's `extra` IS its source record, payload
+    // included — never the `{cass:{…}}` skeleton or `{}` the compaction
+    // layer used to leave behind.
+    for message in &conversations[0].messages {
+        assert!(message.extra.get("payload").is_some());
+        assert!(
+            records.contains(&message.extra),
+            "extra must be a verbatim source record: {}",
+            message.extra
+        );
+    }
     assert_eq!(fs::metadata(path).unwrap().len(), size_before);
 }

@@ -727,9 +727,23 @@ fn scan_codex_with_hooks(
                                     // stdout / patch summary. Emit as a
                                     // first-class `tool` timeline entry; the
                                     // linking `call_id` is preserved in `extra`.
+                                    // F13: a textless output WITH identity
+                                    // (`call_id`/`id` — image-only results whose
+                                    // `output` is a list of `image_url` parts) is
+                                    // local evidence too: emit it as a `tool`
+                                    // message with EMPTY content and the raw
+                                    // record as `extra`, so call/result linking
+                                    // can pair it — never a fabricated result
+                                    // text. Identity-less textless records stay
+                                    // dropped: there is nothing to link them to.
                                     Some("function_call_output" | "custom_tool_call_output") => {
                                         let output_text = tool_output_text(payload);
-                                        if output_text.trim().is_empty() {
+                                        let has_identity = payload
+                                            .get("call_id")
+                                            .or_else(|| payload.get("id"))
+                                            .and_then(|v| v.as_str())
+                                            .is_some_and(|id| !id.trim().is_empty());
+                                        if output_text.trim().is_empty() && !has_identity {
                                             continue;
                                         }
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
@@ -1609,6 +1623,73 @@ mod tests {
             Some("2025/12/18/rollout-one")
         );
         assert_eq!(convs[0].source_path, first);
+    }
+
+    #[test]
+    fn scan_emits_textless_image_tool_output_with_identity_as_empty_tool_message() {
+        // F13: `function_call_output` records whose captured output carries
+        // no text (image-only results: `output` is a list of `image_url`
+        // parts) used to be dropped entirely, leaving their calls unpaired
+        // downstream. The record is local evidence: emit it as a `tool`
+        // message with EMPTY content and the raw record as `extra` — never
+        // a fabricated result text — so call/result linking can pair it.
+        // Records WITHOUT identity (no call_id/id) stay dropped: there is
+        // nothing to link them to.
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = concat!(
+            r#"{"type":"event_msg","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"user_message","message":"inspect the made-up screenshot"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"type":"function_call","call_id":"call_img","name":"view_image","arguments":"{\"path\":\"/made-up.png\"}","id":"resp-1"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2025-12-01T10:00:02Z","payload":{"type":"function_call_output","call_id":"call_img","id":"resp-1","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,MADEUP"}}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2025-12-01T10:00:03Z","payload":{"type":"function_call_output","output":""}}"#,
+            "\n",
+        );
+        let rollout = sessions.join("rollout-images.jsonl");
+        fs::write(&rollout, content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::with_roots(rollout.clone(), vec![ScanRoot::local(rollout)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+        // user prompt + tool call + the textless image result = 3 messages;
+        // the identity-less empty output record stays dropped.
+        assert_eq!(
+            conv.messages.len(),
+            3,
+            "textless identity-bearing outputs emit; identity-less ones drop: {:#?}",
+            conv.messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>()
+        );
+        let image_result = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool" && m.content.is_empty())
+            .expect("image-only output emitted as a textless tool message");
+        assert_eq!(
+            image_result
+                .extra
+                .pointer("/payload/call_id")
+                .and_then(|v| v.as_str()),
+            Some("call_img"),
+            "the raw record stays linkable via extra.payload.call_id"
+        );
+        assert_eq!(
+            image_result
+                .extra
+                .pointer("/payload/type")
+                .and_then(|v| v.as_str()),
+            Some("function_call_output"),
+            "the raw record is preserved verbatim as extra"
+        );
     }
 
     #[test]

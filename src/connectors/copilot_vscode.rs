@@ -780,6 +780,8 @@ fn request_text(message: &Value) -> String {
 /// part array. Markdown parts serialize *without* a `kind`
 /// (`toExport` unwraps `markdownContent` to the bare `IMarkdownString`);
 /// every other part keeps its `kind` and only the recognized ones are used.
+/// The array itself is archived verbatim by `session_to_conversation` (F14),
+/// so parts this extractor does not consume here still reach the archive.
 fn response_content(response: &Value) -> (String, Vec<NormalizedInvocation>) {
     let Some(parts) = response.as_array() else {
         return (String::new(), Vec::new());
@@ -832,7 +834,8 @@ fn response_content(response: &Value) -> (String, Vec<NormalizedInvocation>) {
                 }
             }
             // thinking, inlineReference, textEditGroup, codeblockUri, … are
-            // presentation/telemetry for our purposes.
+            // presentation/telemetry for the joined text, but the raw parts
+            // are archived verbatim by the caller (F14) — nothing is lost.
             _ => {}
         }
     }
@@ -1016,17 +1019,35 @@ pub fn session_to_conversation(
 
         let (assistant_text, invocations) =
             response_content(request.get("response").unwrap_or(&Value::Null));
+        // The full raw response part array rides along verbatim (F14): the
+        // markdown values are the delivered text, but every other part —
+        // thinking, tool invocations with their recorded results, MCP
+        // server starts — is the only record of its facts, so downstream
+        // completeness proofs read the source instead of a lossy guess.
+        // Non-empty arrays only: an empty/absent response holds nothing.
+        let response_parts = request
+            .get("response")
+            .and_then(Value::as_array)
+            .filter(|parts| !parts.is_empty())
+            .cloned();
         let mut usage = compact_response_usage(request);
         let has_usage = usage
             .as_ref()
             .is_some_and(|cass| cass.contains_key("token_usage"));
-        if !assistant_text.trim().is_empty() || !invocations.is_empty() || has_usage {
+        if !assistant_text.trim().is_empty()
+            || !invocations.is_empty()
+            || has_usage
+            || response_parts.is_some()
+        {
             let mut extra = Map::new();
             if let Some(id) = request.get("requestId").and_then(Value::as_str) {
                 extra.insert("request_id".to_string(), Value::String(id.to_string()));
             }
             if let Some(model) = request.get("modelId").and_then(Value::as_str) {
                 extra.insert("model_id".to_string(), Value::String(model.to_string()));
+            }
+            if let Some(parts) = response_parts {
+                extra.insert("copilot_response_parts".to_string(), Value::Array(parts));
             }
             if !invocations.is_empty() {
                 usage.get_or_insert_with(Map::new).insert(
@@ -1853,6 +1874,110 @@ mod tests {
             assistant.invocations[0].arguments,
             Some(json!({"filter": "unit"}))
         );
+    }
+
+    #[test]
+    fn response_parts_are_archived_verbatim_in_extra() {
+        let response = json!([
+            {"kind": "thinking", "id": "m1", "value": "made-up reasoning",
+             "generatedTitle": "made-up title",
+             "metadata": {"stopReason": "done", "vscodeReasoningDone": true}},
+            {"kind": "toolInvocationSerialized", "toolId": "madeup_fetch",
+             "toolCallId": "call-77", "isComplete": true,
+             "invocationMessage": {"value": "Running made-up fetch"},
+             "isConfirmed": {"type": 1, "reason": "made-up approval"},
+             "presentation": "inline", "source": {"label": "made-up ext", "type": 1}},
+            {"kind": "toolInvocationSerialized", "toolId": "madeup_fetch_internal",
+             "toolCallId": "call-77", "isConfirmed": {"type": 1},
+             "pastTenseMessage": {"value": "Ran made-up fetch"},
+             "resultDetails": ["made-up result", {"$mid": 1, "scheme": "https"}],
+             "source": {"label": "made-up ext", "type": 1}},
+            {"kind": "mcpServersStarting", "didStartServerIds": ["madeup-server"]},
+            {"value": "made-up answer", "isTrusted": false}
+        ]);
+        let session = json!({
+            "sessionId": "parts-1",
+            "responderUsername": "GitHub Copilot",
+            "requests": [{
+                "requestId": "request_1",
+                "message": {"text": "made-up prompt",
+                            "parts": [{"kind": "text", "text": "made-up prompt"}]},
+                "response": response,
+                "timestamp": 1_755_000_000_000_i64,
+                "modelId": "gpt-5-codex"
+            }]
+        });
+        let conv = session_to_conversation(
+            &session,
+            Path::new("/x/parts-1.json"),
+            STORE_WORKSPACE,
+            None,
+        )
+        .expect("session parses");
+        assert_eq!(conv.messages.len(), 2, "user + assistant rows");
+        let assistant = &conv.messages[1];
+        assert_eq!(assistant.role, "assistant");
+        assert_eq!(assistant.content, "made-up answer");
+        assert_eq!(
+            assistant.extra["copilot_response_parts"], response,
+            "the raw response part array is archived verbatim"
+        );
+        // The fallback invocation extraction is unchanged.
+        assert_eq!(assistant.invocations.len(), 2);
+        assert_eq!(assistant.invocations[0].name, "madeup_fetch");
+        assert_eq!(assistant.invocations[0].call_id.as_deref(), Some("call-77"));
+        assert_eq!(assistant.invocations[1].name, "madeup_fetch_internal");
+    }
+
+    #[test]
+    fn thinking_only_response_emits_assistant_row_with_parts() {
+        let response = json!([
+            {"kind": "thinking", "id": "m1", "value": "made-up reasoning only"}
+        ]);
+        let session = json!({
+            "sessionId": "think-1",
+            "responderUsername": "GitHub Copilot",
+            "requests": [{
+                "requestId": "request_1",
+                "message": {"text": "made-up prompt",
+                            "parts": [{"kind": "text", "text": "made-up prompt"}]},
+                "response": response,
+                "timestamp": 1_755_000_000_000_i64
+            }]
+        });
+        let conv = session_to_conversation(
+            &session,
+            Path::new("/x/think-1.json"),
+            STORE_WORKSPACE,
+            None,
+        )
+        .expect("thinking-only response still yields an assistant row");
+        assert_eq!(conv.messages.len(), 2, "user + assistant rows");
+        let assistant = &conv.messages[1];
+        assert_eq!(assistant.content, "");
+        assert_eq!(assistant.extra["copilot_response_parts"], response);
+
+        // No user text and no other content: the response parts alone must
+        // still keep the conversation (and its thinking) alive.
+        let textless = json!({
+            "sessionId": "think-2",
+            "responderUsername": "GitHub Copilot",
+            "requests": [{
+                "requestId": "request_1",
+                "message": {"text": "", "parts": []},
+                "response": response,
+                "timestamp": 1_755_000_000_000_i64
+            }]
+        });
+        let conv = session_to_conversation(
+            &textless,
+            Path::new("/x/think-2.json"),
+            STORE_WORKSPACE,
+            None,
+        )
+        .expect("thinking-only session is not empty");
+        assert_eq!(conv.messages.len(), 1, "assistant row only");
+        assert_eq!(conv.messages[0].role, "assistant");
     }
 
     #[test]

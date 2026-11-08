@@ -81,6 +81,21 @@
 //! (attachment references, `{mime_type, uri}`). They land in the message
 //! `extra` without touching content, roles or order of anything already
 //! emitted.
+//!
+//! ## Raw-record archive (cass F14)
+//!
+//! Every emitted message additionally carries the COMPLETE raw transcript
+//! record — the exact line the connector read, with every field verbatim —
+//! under `extra.agy_raw` (owner direction 2026-11-08: keep the raw source
+//! record rather than lossy normalization, the F12 precedent applied to the
+//! whole record). The canonical mapping above decides what the message IS;
+//! the archive lets a consumer prove what the record HELD: cass verifies its
+//! block inventory from `agy_raw` field by field (indexed text, lifted calls,
+//! structural metadata) instead of treating every canonicalized record as
+//! structurally unverifiable. The clone happens in
+//! [`insert_passthrough_extras`], so all eight record arms archive the same
+//! way; records the connector drops whole (empty-body `USER_INPUT` turns,
+//! content-less markers) still emit no message and therefore no archive.
 
 use std::path::{Path, PathBuf};
 
@@ -496,7 +511,10 @@ fn parse_tool_calls(tool_calls: Option<&Value>, step_type: &str) -> Vec<Normaliz
         .collect()
 }
 
-/// Source fields passed through into message extras verbatim (cass F10).
+/// Source fields passed through into message extras verbatim (cass F10),
+/// plus the full raw record archive (cass F14, owner direction 2026-11-08:
+/// keep the raw source record rather than lossy normalization — the F12
+/// precedent applied to the whole record).
 ///
 /// The canonical mapping below extracts the text-bearing fields and used to
 /// drop every other field on the floor; these four carry signals cass needs
@@ -512,12 +530,21 @@ fn parse_tool_calls(tool_calls: Option<&Value>, step_type: &str) -> Vec<Normaliz
 ///
 /// They ride along under their source names, only when the source record
 /// actually carries them (absent or `null` fields add no key).
+///
+/// F14 additionally archives the COMPLETE raw transcript record under
+/// `agy_raw`, verbatim, on every emitted message — so cass can verify its
+/// block inventory from the record the connector actually read instead of
+/// guessing at what normalization dropped. The archive is unconditional
+/// (even a record with no passthrough keys keeps its raw form); it is the
+/// record that produced THIS message, cloned before any extraction.
 fn insert_passthrough_extras(rec: &Value, extra: &mut Map<String, Value>) {
     for key in ["truncated_fields", "status", "error", "media"] {
         if let Some(value) = rec.get(key).filter(|v| !v.is_null()) {
             extra.insert(key.to_string(), value.clone());
         }
     }
+    // cass F14: the archived raw source record, in full.
+    extra.insert("agy_raw".to_string(), rec.clone());
 }
 
 /// Build a [`NormalizedMessage`] (idx assigned later by `reindex_messages`).
@@ -1431,6 +1458,154 @@ mod tests {
         assert!(record_to_message(&rec).is_none());
     }
 
+    // ---------------------------------------------------------------------
+    // cass F14: archive the full raw source record. Every emitted message
+    // also carries the complete raw transcript record under `extra.agy_raw`,
+    // verbatim, alongside the canonical `agy_type` envelope — so cass can
+    // PROVE its block inventory from the record itself instead of guessing
+    // what normalization dropped. Synthetic fixtures; real key/type
+    // structure only.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn record_to_message_archives_full_raw_source_record() {
+        // USER_INPUT: the archived record keeps every source field verbatim
+        // — wrappers, markers, media and token counts included.
+        let rec = serde_json::json!({
+            "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": "2026-06-11T20:14:42Z",
+            "content": "<USER_REQUEST>\ninspect the widget rack\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal noon\n</ADDITIONAL_METADATA>",
+            "input_tokens": 11, "output_tokens": 7, "cache_read_tokens": 3,
+            "media": [{"mime_type": "image/png", "uri": "file:///tmp/synthetic.png"}]
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(
+            msg.extra["agy_raw"], rec,
+            "USER_INPUT record archived verbatim"
+        );
+
+        // PLANNER_RESPONSE with thinking and structured calls.
+        let rec = serde_json::json!({
+            "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "status": "DONE", "created_at": "2026-06-11T20:14:43Z",
+            "content": "planning the rack inspection",
+            "thinking": "considering the racks first",
+            "tool_calls": [{"name": "view_file", "args": {"TargetFile": "/tmp/rack.rs"}}],
+            "truncated_fields": ["tool_calls"]
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(
+            msg.extra["agy_raw"], rec,
+            "PLANNER_RESPONSE record archived verbatim"
+        );
+
+        // MODEL-step envelope: the `agy_type` arm keeps the raw record too.
+        let rec = serde_json::json!({
+            "step_index": 2, "source": "MODEL", "type": "GENERIC",
+            "status": "ERROR", "created_at": "2026-06-11T20:14:44Z",
+            "content": "the rack probe returned nothing",
+            "error": "synthetic probe failure",
+            "exit_code": 2
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.role, "tool");
+        assert_eq!(msg.extra["agy_type"], "GENERIC");
+        assert_eq!(
+            msg.extra["agy_raw"], rec,
+            "GENERIC record archived verbatim"
+        );
+
+        // Error-only ERROR_MESSAGE: the synthesized content differs from any
+        // source `content`, but the archived record is still the raw source.
+        let rec = serde_json::json!({
+            "step_index": 3, "source": "SYSTEM", "type": "ERROR_MESSAGE",
+            "status": "DONE", "created_at": "2026-06-11T20:14:45Z",
+            "error": "synthetic pipeline failure"
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.content, "synthetic pipeline failure");
+        assert_eq!(
+            msg.extra["agy_raw"], rec,
+            "error-only record archived verbatim"
+        );
+
+        // SYSTEM_MESSAGE and text-bearing CONVERSATION_HISTORY too.
+        let rec = serde_json::json!({
+            "step_index": 4, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+            "status": "DONE", "created_at": "2026-06-11T20:14:46Z",
+            "content": "synthetic system notice text"
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(
+            msg.extra["agy_raw"], rec,
+            "SYSTEM_MESSAGE record archived verbatim"
+        );
+
+        let rec = serde_json::json!({
+            "step_index": 5, "source": "SYSTEM", "type": "CONVERSATION_HISTORY",
+            "status": "DONE", "created_at": "2026-06-11T20:14:47Z",
+            "content": "synthetic folded history note"
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(
+            msg.extra["agy_raw"], rec,
+            "CONVERSATION_HISTORY record archived verbatim"
+        );
+    }
+
+    #[test]
+    fn scan_archives_the_raw_record_for_every_emitted_message() {
+        // End to end: every message the scan emits carries the raw record it
+        // was built from, keyed to its source position (`step_index`).
+        let dir = TempDir::new().unwrap();
+        let logs = dir.path().join(".system_generated").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("transcript.jsonl"),
+            concat!(
+                "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:42Z\",\"content\":\"<USER_REQUEST>\\nclean the widget rack\\n</USER_REQUEST>\",\"media\":[{\"mime_type\":\"image/png\",\"uri\":\"file:///tmp/synthetic-a.png\"}]}\n",
+                "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:43Z\",\"content\":\"planning the rack cleanup\",\"truncated_fields\":[\"thinking\"]}\n",
+                "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"GENERIC\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:44Z\",\"content\":\"the rack probe returned nothing\"}\n",
+            ),
+        )
+        .unwrap();
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        );
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let msgs = &convs[0].messages;
+        assert_eq!(msgs.len(), 3);
+        for (i, m) in msgs.iter().enumerate() {
+            let raw = m
+                .extra
+                .get("agy_raw")
+                .expect("every emitted message archives its raw record");
+            assert_eq!(raw["step_index"], i, "message {i} keyed to its record");
+        }
+        // The archived GENERIC record is the verbatim source line.
+        assert_eq!(msgs[2].extra["agy_raw"]["type"], "GENERIC");
+        assert_eq!(msgs[2].extra["agy_raw"]["status"], "DONE");
+        assert_eq!(
+            msgs[2].extra["agy_raw"]["content"],
+            "the rack probe returned nothing"
+        );
+        // The archived USER_INPUT record keeps the wrapper text and media
+        // the canonical mapping lifted out of the message content.
+        assert_eq!(
+            msgs[0].extra["agy_raw"]["content"],
+            "<USER_REQUEST>\nclean the widget rack\n</USER_REQUEST>"
+        );
+        assert_eq!(
+            msgs[0].extra["agy_raw"]["media"][0]["mime_type"],
+            "image/png"
+        );
+    }
+
     #[test]
     fn generic_error_field_is_kept_in_extras() {
         // Real shape: GENERIC result records carry an `error` field next to
@@ -1588,16 +1763,23 @@ mod tests {
     }
 
     #[test]
-    fn fixture_messages_gain_only_the_status_passthrough_key() {
+    fn fixture_messages_carry_status_and_the_archived_raw_record() {
         // The checked-in fixture records carry `status: "DONE"` and no
         // error/media/truncated_fields, so after F10 every fixture message
-        // gains exactly one new extra key — content/roles unchanged.
+        // gains the status key and after F14 also the archived raw record
+        // — content/roles unchanged.
         let conv = only_conversation();
         for m in &conv.messages {
             assert_eq!(m.extra["status"], "DONE");
             assert!(m.extra.get("error").is_none());
             assert!(m.extra.get("media").is_none());
             assert!(m.extra.get("truncated_fields").is_none());
+            let raw = m
+                .extra
+                .get("agy_raw")
+                .expect("fixture messages archive their raw record");
+            assert_eq!(raw["status"], "DONE");
+            assert!(raw.get("type").is_some_and(|t| t.as_str().is_some()));
         }
     }
 

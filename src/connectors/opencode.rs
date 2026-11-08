@@ -8,6 +8,15 @@
 //!   - session/{projectID}/{sessionID}.json  - Session metadata
 //!   - message/{sessionID}/{messageID}.json  - Message metadata
 //!   - part/{messageID}/{partID}.json        - Actual message content
+//!
+//! **Tool part identity and state (cass F14):** every message that has parts
+//! (v2 `content` items, 1.x `part` rows/files) archives the raw part JSONs in
+//! `extra["parts"]` in delivery order, so the host can prove the part
+//! inventory verbatim. A failed run's `state.error` text renders inline as
+//! `[Tool Error]` (it is source text) — a plain string or an object carrying
+//! the text under `message` (the measured real shape is `{message, type}`) —
+//! and a tool part that renders no text still keeps its message alive with
+//! empty content rather than dropping the part's identity and state with it.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -700,7 +709,23 @@ impl OpenCodeConnector {
             let Some((role, author, content)) = v2_message_content(&row.message_type, &data) else {
                 continue;
             };
-            if content.trim().is_empty() {
+            // F14: archive the raw content items so the host can verify the
+            // part inventory (id, name, input, status, results, error) instead
+            // of inferring it from the rendered text. Tool parts are
+            // identity-bearing even when they render no text (file-only
+            // results), so such a row survives with empty content — F13's
+            // codex rule — instead of vanishing with its identity and state.
+            let content_items = data
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .filter(|items| !items.is_empty())
+                .cloned();
+            let row_has_tool_part = content_items.as_deref().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("tool")
+                })
+            });
+            if content.trim().is_empty() && !row_has_tool_part {
                 continue;
             }
             let col_ts = row
@@ -712,18 +737,22 @@ impl OpenCodeConnector {
                     .and_then(serde_json::Value::as_i64),
             )
             .or(col_ts);
+            let mut extra = serde_json::json!({
+                "message_id": row.id,
+                "session_id": row.session_id,
+                "type": row.message_type,
+                "seq": row.seq,
+            });
+            if let Some(items) = content_items {
+                extra["parts"] = serde_json::Value::Array(items);
+            }
             let message = NormalizedMessage {
                 idx: 0,
                 role: role.to_string(),
                 author,
                 created_at,
                 content,
-                extra: serde_json::json!({
-                    "message_id": row.id,
-                    "session_id": row.session_id,
-                    "type": row.message_type,
-                    "seq": row.seq,
-                }),
+                extra,
                 invocations: Vec::new(),
                 snippets: Vec::new(),
             };
@@ -819,12 +848,17 @@ impl OpenCodeConnector {
 
             let parts = parts_by_message.remove(&row.id).unwrap_or_default();
             let content_text = if !parts.is_empty() {
-                assemble_content_from_parts(&parts)
+                let infos: Vec<PartInfo> = parts.iter().map(|part| part.info.clone()).collect();
+                assemble_content_from_parts(&infos)
             } else {
                 String::new()
             };
 
-            if content_text.trim().is_empty() {
+            // F13's codex rule, applied to opencode tool parts: a tool part
+            // is identity-bearing even when it renders no text (no output,
+            // no error), so its message survives with empty content instead
+            // of vanishing with the part's identity and state.
+            if content_text.trim().is_empty() && !has_tool_part(&parts) {
                 continue;
             }
 
@@ -845,6 +879,17 @@ impl OpenCodeConnector {
 
             let message_id = row.id;
             let session_id = row.session_id;
+            // F14: archive the raw parts in delivery order so the host can
+            // verify the part inventory (identity, input, state) instead of
+            // inferring it from the rendered text.
+            let mut extra = serde_json::json!({
+                "message_id": message_id,
+                "session_id": session_id,
+            });
+            if !parts.is_empty() {
+                extra["parts"] =
+                    serde_json::Value::Array(parts.iter().map(|part| part.raw.clone()).collect());
+            }
             pending_by_session
                 .entry(session_id.clone())
                 .or_default()
@@ -857,10 +902,7 @@ impl OpenCodeConnector {
                         author,
                         created_at,
                         content: content_text,
-                        extra: serde_json::json!({
-                            "message_id": message_id,
-                            "session_id": session_id,
-                        }),
+                        extra,
                         invocations: Vec::new(),
                         snippets: Vec::new(),
                     },
@@ -888,7 +930,7 @@ impl OpenCodeConnector {
         conn: &Connection,
         message_ids: Option<&HashSet<String>>,
         progress_tick: Option<&(dyn Fn() + Send + Sync)>,
-    ) -> Result<HashMap<String, Vec<PartInfo>>> {
+    ) -> Result<HashMap<String, Vec<LoadedPart>>> {
         // No ORDER BY — parts are re-sorted per message below. On an incremental
         // scan only the kept messages' parts are read/decoded (#372: the `part`
         // table is the largest, so this is the dominant saving).
@@ -918,21 +960,34 @@ impl OpenCodeConnector {
             }
         };
 
-        let mut parts_by_message: HashMap<String, Vec<PartInfo>> = HashMap::new();
+        let mut parts_by_message: HashMap<String, Vec<LoadedPart>> = HashMap::new();
         for (row_index, (message_id, row)) in rows.into_iter().enumerate() {
             opencode_scan_tick(progress_tick, row_index);
-            match serde_json::from_str::<SqlitePartData>(&row) {
+            // Keep the raw part JSON alongside the decoded fields (F14): the
+            // tool state's identity (`state.id`), status, input, title and
+            // metadata do not fit the decoded view but must survive verbatim.
+            let raw = match serde_json::from_str::<serde_json::Value>(&row) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    tracing::debug!("opencode sqlite: failed to parse part data: {e}");
+                    continue;
+                }
+            };
+            match serde_json::from_value::<SqlitePartData>(raw.clone()) {
                 Ok(part_data) => {
                     parts_by_message
                         .entry(message_id)
                         .or_default()
-                        .push(PartInfo {
-                            id: part_data.id,
-                            index: part_data.index,
-                            message_id: None,
-                            part_type: part_data.part_type,
-                            text: part_data.text,
-                            state: part_data.state,
+                        .push(LoadedPart {
+                            info: PartInfo {
+                                id: part_data.id,
+                                index: part_data.index,
+                                message_id: None,
+                                part_type: part_data.part_type,
+                                text: part_data.text,
+                                state: part_data.state,
+                            },
+                            raw,
                         });
                 }
                 Err(e) => {
@@ -942,7 +997,7 @@ impl OpenCodeConnector {
         }
 
         for parts in parts_by_message.values_mut() {
-            sort_parts_for_message(parts);
+            sort_loaded_parts(parts);
         }
 
         Ok(parts_by_message)
@@ -1083,6 +1138,40 @@ struct PartInfo {
 struct ToolState {
     #[serde(default)]
     output: Option<String>,
+    // A failed tool run's error record in `state.error` — source text the
+    // v1 render dropped (F14).
+    #[serde(default)]
+    error: Option<ToolStateError>,
+}
+
+/// A failed tool run's error record. OpenCode writes either a plain string
+/// or an object carrying the failure text under `message` (the measured
+/// real shape is `{message, type}`); any other shape is still kept so the
+/// part never loses its identity over the error's shape (F14).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ToolStateError {
+    Text(String),
+    Object {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    // Any other shape: kept unread (the raw record is archived verbatim in
+    // the message extras anyway) so a part never loses its identity over
+    // the error's shape.
+    Other(#[allow(dead_code)] serde_json::Value),
+}
+
+impl ToolStateError {
+    /// The renderable failure text: the string form, or the object's
+    /// `message`.
+    fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Object { message } => message.as_deref(),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 impl Connector for OpenCodeConnector {
@@ -1443,11 +1532,31 @@ fn assemble_v2_assistant_content(data: &serde_json::Value) -> String {
                 if !output.trim().is_empty() {
                     pieces.push(format!("[Tool Output]\n{output}"));
                 }
+                // A failed run's `state.error` is source text — render it
+                // instead of dropping it (F14): a plain string, or an
+                // object carrying the text under `message` (the measured
+                // real shape is `{message, type}`).
+                let error = error_text_of(item.pointer("/state/error")).unwrap_or("");
+                if !error.trim().is_empty() {
+                    pieces.push(format!("[Tool Error]\n{error}"));
+                }
             }
             _ => {}
         }
     }
     pieces.join("\n\n")
+}
+
+/// The renderable failure text of a raw `state.error` record: the string
+/// form, or the object's `message` string (F14).
+fn error_text_of(error: Option<&serde_json::Value>) -> Option<&str> {
+    match error? {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        serde_json::Value::Object(record) => {
+            record.get("message").and_then(serde_json::Value::as_str)
+        }
+        _ => None,
+    }
 }
 
 fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
@@ -1629,8 +1738,9 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
             Err(_) => continue,
         };
 
-        // Load parts for this specific message
-        let mut parts = Vec::new();
+        // Load parts for this specific message, keeping the raw part JSON
+        // alongside the decoded fields (F14) so the whole record survives.
+        let mut parts: Vec<LoadedPart> = Vec::new();
         let msg_part_dir = part_dir.join(&msg_info.id);
 
         if msg_part_dir.exists() {
@@ -1648,17 +1758,25 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
                         .ok()
                         .flatten()
                         .map(|c| c.trim_start_matches('\u{feff}').to_string())
-                    && let Ok(part) = serde_json::from_str::<PartInfo>(&content)
+                    && let Ok(raw) = serde_json::from_str::<serde_json::Value>(&content)
+                    && let Ok(info) = serde_json::from_value::<PartInfo>(raw.clone())
                 {
-                    parts.push(part);
+                    parts.push(LoadedPart { info, raw });
                 }
             }
         }
-        sort_parts_for_message(&mut parts);
+        sort_loaded_parts(&mut parts);
 
         // Assemble message content from parts
-        let content_text = assemble_content_from_parts(&parts);
-        if content_text.trim().is_empty() {
+        let content_text = if parts.is_empty() {
+            String::new()
+        } else {
+            let infos: Vec<PartInfo> = parts.iter().map(|part| part.info.clone()).collect();
+            assemble_content_from_parts(&infos)
+        };
+        // A tool part is identity-bearing even when it renders no text, so
+        // its message survives with empty content (F13's codex rule).
+        if content_text.trim().is_empty() && !has_tool_part(&parts) {
             continue;
         }
 
@@ -1680,6 +1798,15 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
         };
 
         let message_id = msg_info.id.clone();
+        // F14: archive the raw parts in delivery order.
+        let mut extra = serde_json::json!({
+            "message_id": message_id,
+            "session_id": msg_info.session_id,
+        });
+        if !parts.is_empty() {
+            extra["parts"] =
+                serde_json::Value::Array(parts.iter().map(|part| part.raw.clone()).collect());
+        }
         pending.push((
             created_at,
             message_id.clone(),
@@ -1689,10 +1816,7 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
                 author,
                 created_at,
                 content: content_text,
-                extra: serde_json::json!({
-                    "message_id": message_id,
-                    "session_id": msg_info.session_id,
-                }),
+                extra,
                 invocations: Vec::new(),
                 snippets: Vec::new(),
             },
@@ -1711,30 +1835,54 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
     Ok(messages)
 }
 
-fn sort_parts_for_message(parts: &mut [PartInfo]) {
-    parts.sort_by(|a, b| {
-        let a_idx = a.index.unwrap_or(i64::MAX);
-        let b_idx = b.index.unwrap_or(i64::MAX);
-        a_idx
-            .cmp(&b_idx)
-            .then_with(|| {
-                a.id.as_deref()
-                    .unwrap_or("")
-                    .cmp(b.id.as_deref().unwrap_or(""))
-            })
-            .then_with(|| {
-                a.part_type
-                    .as_deref()
-                    .unwrap_or("")
-                    .cmp(b.part_type.as_deref().unwrap_or(""))
-            })
-            .then_with(|| {
-                a.text
-                    .as_deref()
-                    .unwrap_or("")
-                    .cmp(b.text.as_deref().unwrap_or(""))
-            })
-    });
+/// A decoded part together with its raw source JSON (F14). The raw record is
+/// archived in the message extras so the host can verify the connector
+/// delivered everything — identity, input, state — instead of inferring it
+/// from the rendered text.
+#[derive(Debug, Clone)]
+struct LoadedPart {
+    info: PartInfo,
+    raw: serde_json::Value,
+}
+
+fn part_is_tool(info: &PartInfo) -> bool {
+    info.part_type.as_deref() == Some("tool")
+}
+
+/// Whether any of a message's loaded parts is a tool part — a part that
+/// carries identity and state even when it renders no text at all.
+fn has_tool_part(parts: &[LoadedPart]) -> bool {
+    parts.iter().any(|part| part_is_tool(&part.info))
+}
+
+fn compare_part_infos(a: &PartInfo, b: &PartInfo) -> std::cmp::Ordering {
+    let a_idx = a.index.unwrap_or(i64::MAX);
+    let b_idx = b.index.unwrap_or(i64::MAX);
+    a_idx
+        .cmp(&b_idx)
+        .then_with(|| {
+            a.id.as_deref()
+                .unwrap_or("")
+                .cmp(b.id.as_deref().unwrap_or(""))
+        })
+        .then_with(|| {
+            a.part_type
+                .as_deref()
+                .unwrap_or("")
+                .cmp(b.part_type.as_deref().unwrap_or(""))
+        })
+        .then_with(|| {
+            a.text
+                .as_deref()
+                .unwrap_or("")
+                .cmp(b.text.as_deref().unwrap_or(""))
+        })
+}
+
+/// Sort raw-archived parts into the same order the content renders in, so
+/// `extra["parts"]` mirrors the delivered content piece for piece.
+fn sort_loaded_parts(parts: &mut [LoadedPart]) {
+    parts.sort_by(|a, b| compare_part_infos(&a.info, &b.info));
 }
 
 /// Assemble message content from parts
@@ -1751,12 +1899,20 @@ fn assemble_content_from_parts(parts: &[PartInfo]) -> String {
                 }
             }
             Some("tool") => {
-                // Include tool output if available
-                if let Some(state) = &part.state
-                    && let Some(output) = &state.output
-                    && !output.trim().is_empty()
-                {
-                    content_pieces.push(format!("[Tool Output]\n{}", output));
+                // Include tool output and error text if available. The error
+                // text is source text a failed run carries in `state.error` —
+                // it used to be dropped (F14).
+                if let Some(state) = &part.state {
+                    if let Some(output) = &state.output
+                        && !output.trim().is_empty()
+                    {
+                        content_pieces.push(format!("[Tool Output]\n{}", output));
+                    }
+                    if let Some(error) = state.error.as_ref().and_then(|e| e.text())
+                        && !error.trim().is_empty()
+                    {
+                        content_pieces.push(format!("[Tool Error]\n{}", error));
+                    }
                 }
             }
             Some("reasoning") => {
@@ -1980,6 +2136,7 @@ mod tests {
             text: None,
             state: Some(ToolState {
                 output: Some("Tool executed successfully".into()),
+                error: None,
             }),
         }];
         let content = assemble_content_from_parts(&parts);
@@ -2100,6 +2257,7 @@ mod tests {
                 text: None,
                 state: Some(ToolState {
                     output: Some("Result: 42".into()),
+                    error: None,
                 }),
             },
         ];
@@ -2110,29 +2268,23 @@ mod tests {
     }
 
     #[test]
-    fn sort_parts_for_message_orders_by_index_then_id() {
-        let mut parts = vec![
-            PartInfo {
-                id: Some("b".into()),
-                index: Some(2),
+    fn sort_loaded_parts_orders_by_index_then_id() {
+        let part = |id: &str, index: i64, text: &str| LoadedPart {
+            info: PartInfo {
+                id: Some(id.into()),
+                index: Some(index),
                 message_id: Some("m1".into()),
                 part_type: Some("text".into()),
-                text: Some("second".into()),
+                text: Some(text.into()),
                 state: None,
             },
-            PartInfo {
-                id: Some("a".into()),
-                index: Some(1),
-                message_id: Some("m1".into()),
-                part_type: Some("text".into()),
-                text: Some("first".into()),
-                state: None,
-            },
-        ];
+            raw: serde_json::json!({}),
+        };
+        let mut parts = vec![part("b", 2, "second"), part("a", 1, "first")];
 
-        sort_parts_for_message(&mut parts);
-        assert_eq!(parts[0].text.as_deref(), Some("first"));
-        assert_eq!(parts[1].text.as_deref(), Some("second"));
+        sort_loaded_parts(&mut parts);
+        assert_eq!(parts[0].info.text.as_deref(), Some("first"));
+        assert_eq!(parts[1].info.text.as_deref(), Some("second"));
     }
 
     // =====================================================
@@ -4756,6 +4908,498 @@ mod tests {
         );
         assert_eq!(render("location-switched", json!({"location": {}})), None);
         assert_eq!(render("idle", json!({"outcome": "succeeded"})), None);
+    }
+
+    // =====================================================
+    // Tool part identity/state kept in extras (cass F14)
+    // =====================================================
+
+    #[test]
+    fn sqlite_v2_tool_part_identity_and_state_archived_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        insert_v2_session(&conn, "ses_tool", "Tool session", 1_700_000_100_000);
+        insert_v2_message(&conn, "ses_tool", 0, "user", r#"{"text":"probe the repo"}"#);
+        insert_v2_message(
+            &conn,
+            "ses_tool",
+            1,
+            "assistant",
+            r#"{"agent":"build","model":{"id":"gpt-5","providerID":"openai"},"time":{"created":1700000002000},
+                "content":[
+                  {"type":"reasoning","text":"plan first","native":{},"time":{}},
+                  {"type":"text","text":"running it now"},
+                  {"type":"tool","executed":false,"id":"prt_1","name":"shell","time":{"created":1,"ran":2,"completed":3},
+                   "state":{"status":"completed","input":{"command":"make check"},"metadata":{"duration":3},
+                     "content":[{"type":"text","text":"ok. 3 passed"}]}},
+                  {"type":"tool","executed":false,"id":"prt_2","name":"edit","time":{"created":4,"ran":5,"completed":6},
+                   "state":{"status":"error","input":{"path":"b.rs","oldString":"x","newString":"y"},
+                     "error":"exit 1: no such file"}}]}"#,
+        );
+        // The no-tool-parts shape (the ses_ebad… blocker): the content
+        // items are still archived so the host can PROVE no tool part
+        // exists instead of treating absence as unverifiable.
+        insert_v2_message(
+            &conn,
+            "ses_tool",
+            2,
+            "assistant",
+            r#"{"agent":"build","model":{"id":"gpt-5","providerID":"openai"},"time":{"created":1700000003000},
+                "content":[
+                  {"type":"reasoning","text":"wrap up","native":{},"time":{}},
+                  {"type":"text","text":"all done"}]}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 3, "user + two assistant rows");
+        let tool_row = &convs[0].messages[1];
+        // Text results render inline; the error state's text renders too
+        // (it is source text — dropping it left the text inventory a gap).
+        assert_eq!(
+            tool_row.content,
+            "[Reasoning]\nplan first\n\nrunning it now\n\n[Tool Output]\nok. 3 passed\n\n[Tool Error]\nexit 1: no such file"
+        );
+        // The raw content items are archived verbatim in the extras.
+        let parts = tool_row.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["type"], "reasoning");
+        assert_eq!(parts[2]["id"], "prt_1");
+        assert_eq!(parts[2]["name"], "shell");
+        assert_eq!(parts[2]["executed"], false);
+        assert_eq!(parts[2]["state"]["status"], "completed");
+        assert_eq!(parts[2]["state"]["input"]["command"], "make check");
+        assert_eq!(parts[2]["state"]["content"][0]["text"], "ok. 3 passed");
+        assert_eq!(parts[3]["id"], "prt_2");
+        assert_eq!(parts[3]["state"]["status"], "error");
+        assert_eq!(parts[3]["state"]["input"]["path"], "b.rs");
+        assert_eq!(parts[3]["state"]["error"], "exit 1: no such file");
+        let plain_row = &convs[0].messages[2];
+        assert_eq!(plain_row.content, "[Reasoning]\nwrap up\n\nall done");
+        let plain_parts = plain_row.extra["parts"].as_array().unwrap();
+        assert_eq!(plain_parts.len(), 2, "no-tool rows archive their parts too");
+        assert!(plain_parts.iter().all(|p| p["type"] != "tool"));
+    }
+
+    #[test]
+    fn sqlite_v2_textless_tool_part_row_is_kept() {
+        // A tool part whose state holds no text at all (file-only results)
+        // used to vanish with its whole row, dropping its identity and
+        // state. The row is kept with empty content — F13's codex rule —
+        // so the host can still prove the part existed.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        insert_v2_session(&conn, "ses_img", "Image session", 1_700_000_100_000);
+        insert_v2_message(&conn, "ses_img", 0, "user", r#"{"text":"draw a cat"}"#);
+        insert_v2_message(
+            &conn,
+            "ses_img",
+            1,
+            "assistant",
+            r#"{"agent":"build","model":{"id":"gpt-5","providerID":"openai"},"time":{"created":1700000002000},
+                "content":[
+                  {"type":"tool","executed":false,"id":"prt_img","name":"generate","time":{},
+                   "state":{"status":"completed","input":{"prompt":"a cat"},
+                     "content":[{"type":"file","uri":"file:///out.png","mime":"image/png"}]}}]}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].messages.len(),
+            2,
+            "the textless tool row must survive"
+        );
+        let row = &convs[0].messages[1];
+        assert_eq!(row.content, "");
+        assert_eq!(row.role, "assistant");
+        let parts = row.extra["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["id"], "prt_img");
+        assert_eq!(parts[0]["state"]["content"][0]["mime"], "image/png");
+    }
+
+    #[test]
+    fn sqlite_v2_error_object_message_renders_and_archives() {
+        // The real failed-run shape: `state.error` is an OBJECT carrying the
+        // failure text under `message` (measured shape: `{message, type}`,
+        // status `error`), not a plain string. The render must deliver that
+        // text and the archive must keep the object verbatim.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        insert_v2_session(&conn, "ses_err", "Error session", 1_700_000_100_000);
+        insert_v2_message(&conn, "ses_err", 0, "user", r#"{"text":"run it"}"#);
+        insert_v2_message(
+            &conn,
+            "ses_err",
+            1,
+            "assistant",
+            r#"{"agent":"build","model":{"id":"gpt-5","providerID":"openai"},"time":{"created":1700000002000},
+                "content":[
+                  {"type":"text","text":"trying now"},
+                  {"type":"tool","executed":false,"id":"prt_err","name":"shell","time":{},
+                   "state":{"status":"error","input":{"command":"make check"},
+                     "error":{"message":"boom: denied","type":"tool_error"}}}]}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        let row = &convs[0].messages[1];
+        assert_eq!(row.content, "trying now\n\n[Tool Error]\nboom: denied");
+        let parts = row.extra["parts"].as_array().unwrap();
+        assert_eq!(parts[1]["id"], "prt_err");
+        assert_eq!(parts[1]["state"]["status"], "error");
+        assert_eq!(parts[1]["state"]["error"]["message"], "boom: denied");
+        assert_eq!(parts[1]["state"]["error"]["type"], "tool_error");
+    }
+
+    #[test]
+    fn sqlite_legacy_tool_part_state_archived_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-lt", "Legacy tools"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["msg-lt", "sess-lt", r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-lt-1",
+                "msg-lt",
+                "sess-lt",
+                r#"{"id":"p-lt-1","messageID":"msg-lt","order":0,"type":"text","text":"checking"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-lt-2",
+                "msg-lt",
+                "sess-lt",
+                r#"{"id":"p-lt-2","messageID":"msg-lt","order":1,"type":"tool",
+                    "state":{"id":"toolu_01","status":"completed","input":{"command":"make"},
+                    "output":"done","title":"Bash","metadata":{"exit":0},"time":{"start":1,"end":2}}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-lt-3",
+                "msg-lt",
+                "sess-lt",
+                r#"{"id":"p-lt-3","messageID":"msg-lt","order":2,"type":"tool",
+                    "state":{"id":"toolu_02","status":"error","input":{"path":"c.rs"},"error":"boom: denied"}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1);
+        let message = &convs[0].messages[0];
+        assert_eq!(
+            message.content,
+            "checking\n\n[Tool Output]\ndone\n\n[Tool Error]\nboom: denied"
+        );
+        let parts = message.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[1]["id"], "p-lt-2");
+        assert_eq!(parts[1]["state"]["id"], "toolu_01");
+        assert_eq!(parts[1]["state"]["status"], "completed");
+        assert_eq!(parts[1]["state"]["input"]["command"], "make");
+        assert_eq!(parts[1]["state"]["title"], "Bash");
+        assert_eq!(parts[2]["state"]["error"], "boom: denied");
+        assert_eq!(parts[2]["state"]["input"]["path"], "c.rs");
+    }
+
+    #[test]
+    fn sqlite_legacy_error_object_part_kept_and_rendered() {
+        // Same failed-run shape on a 1.x part row: the error record is an
+        // object with the text under `message`. The typed view must not drop
+        // the whole part (identity) over the error's shape, and the text
+        // must render.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-eo", "Error object"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["msg-eo", "sess-eo", r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-eo-1",
+                "msg-eo",
+                "sess-eo",
+                r#"{"id":"p-eo-1","messageID":"msg-eo","order":0,"type":"text","text":"checking"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-eo-2",
+                "msg-eo",
+                "sess-eo",
+                r#"{"id":"p-eo-2","messageID":"msg-eo","order":1,"type":"tool",
+                    "state":{"id":"toolu_e1","status":"error","input":{"command":"make"},
+                    "error":{"message":"boom: denied","type":"tool_error"},"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1, "the tool part must survive");
+        let message = &convs[0].messages[0];
+        assert_eq!(message.content, "checking\n\n[Tool Error]\nboom: denied");
+        let parts = message.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "both parts are archived");
+        assert_eq!(parts[1]["state"]["id"], "toolu_e1");
+        assert_eq!(parts[1]["state"]["error"]["message"], "boom: denied");
+        assert_eq!(parts[1]["state"]["error"]["type"], "tool_error");
+    }
+
+    #[test]
+    fn sqlite_legacy_unreadable_error_shape_keeps_identity() {
+        // An error record with no renderable text — an object without a
+        // `message`, or a non-string non-object shape — keeps the part (and
+        // its identity/state) alive; nothing is guessed or dropped.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-odd", "Odd errors"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["msg-odd", "sess-odd", r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-od-1",
+                "msg-odd",
+                "sess-odd",
+                r#"{"id":"p-od-1","messageID":"msg-odd","order":0,"type":"tool",
+                    "state":{"id":"toolu_o1","status":"error","input":{"command":"ls"},
+                    "error":{"type":"no_message"},"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-od-2",
+                "msg-odd",
+                "sess-odd",
+                r#"{"id":"p-od-2","messageID":"msg-odd","order":1,"type":"tool",
+                    "state":{"id":"toolu_o2","status":"error","input":{"command":"pwd"},
+                    "error":42,"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].messages.len(),
+            1,
+            "both identity-bearing tool parts must survive"
+        );
+        let message = &convs[0].messages[0];
+        assert_eq!(message.content, "", "no text to render, row still kept");
+        assert!(!message.content.contains("[Tool Error]"));
+        let parts = message.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["state"]["error"]["type"], "no_message");
+        assert_eq!(parts[1]["state"]["error"], 42);
+    }
+
+    #[test]
+    fn sqlite_legacy_textless_tool_part_message_is_kept() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-lq", "Legacy quiet"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["msg-lq", "sess-lq", r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-lq-1",
+                "msg-lq",
+                "sess-lq",
+                r#"{"id":"p-lq-1","messageID":"msg-lq","order":0,"type":"tool",
+                    "state":{"id":"toolu_03","status":"completed","input":{"command":"ls"},"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].messages.len(),
+            1,
+            "the textless tool message survives"
+        );
+        let message = &convs[0].messages[0];
+        assert_eq!(message.content, "");
+        let parts = message.extra["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["state"]["id"], "toolu_03");
+    }
+
+    #[test]
+    fn file_layout_tool_part_state_archived_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_opencode_storage(&dir);
+        let session = json!({"id": "sess-ft", "projectID": "proj-001"});
+        write_session(&storage, "proj-001", &session);
+        let message = json!({
+            "id": "msg-ft", "role": "assistant", "sessionID": "sess-ft",
+            "time": {"created": 1733000000}
+        });
+        write_message(&storage, "sess-ft", &message);
+        write_part(
+            &storage,
+            "msg-ft",
+            &json!({
+                "id": "p-ft-1", "messageID": "msg-ft", "order": 0, "type": "text",
+                "text": "checking files"
+            }),
+        );
+        write_part(
+            &storage,
+            "msg-ft",
+            &json!({
+                "id": "p-ft-2", "messageID": "msg-ft", "order": 1, "type": "tool",
+                "state": {"id": "toolu_04", "status": "completed",
+                    "input": {"path": "d.rs"}, "output": "42 lines", "title": "Read"}
+            }),
+        );
+        // A textless tool part keeps its message alive too.
+        write_message(
+            &storage,
+            "sess-ft",
+            &json!({
+                "id": "msg-ft-2", "role": "assistant", "sessionID": "sess-ft",
+                "time": {"created": 1733000001}
+            }),
+        );
+        write_part(
+            &storage,
+            "msg-ft-2",
+            &json!({
+                "id": "p-ft-3", "messageID": "msg-ft-2", "order": 0, "type": "tool",
+                "state": {"id": "toolu_05", "status": "completed",
+                    "input": {"command": "pwd"}, "title": "Bash"}
+            }),
+        );
+
+        let connector = OpenCodeConnector::new();
+        let ctx = remote_scan_context(&storage, &storage);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        let first = &convs[0].messages[0];
+        assert_eq!(first.content, "checking files\n\n[Tool Output]\n42 lines");
+        let parts = first.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1]["state"]["id"], "toolu_04");
+        assert_eq!(parts[1]["state"]["input"]["path"], "d.rs");
+        let quiet = &convs[0].messages[1];
+        assert_eq!(quiet.content, "");
+        let quiet_parts = quiet.extra["parts"].as_array().unwrap();
+        assert_eq!(quiet_parts[0]["state"]["id"], "toolu_05");
+    }
+
+    #[test]
+    fn assemble_content_from_parts_renders_tool_error() {
+        let parts = vec![PartInfo {
+            id: Some("p-err".into()),
+            index: Some(0),
+            message_id: None,
+            part_type: Some("tool".into()),
+            text: None,
+            state: Some(ToolState {
+                output: Some("partial out".into()),
+                error: Some(ToolStateError::Text("boom: denied".into())),
+            }),
+        }];
+        let content = assemble_content_from_parts(&parts);
+        assert_eq!(
+            content,
+            "[Tool Output]\npartial out\n\n[Tool Error]\nboom: denied"
+        );
+        // The object error shape renders its `message` text; a shape with
+        // no renderable text renders nothing without losing the part.
+        let parts = vec![PartInfo {
+            id: Some("p-err-obj".into()),
+            index: Some(0),
+            message_id: None,
+            part_type: Some("tool".into()),
+            text: None,
+            state: Some(ToolState {
+                output: None,
+                error: Some(ToolStateError::Object {
+                    message: Some("denied again".into()),
+                }),
+            }),
+        }];
+        assert_eq!(
+            assemble_content_from_parts(&parts),
+            "[Tool Error]\ndenied again"
+        );
+        let parts = vec![PartInfo {
+            id: Some("p-err-odd".into()),
+            index: Some(0),
+            message_id: None,
+            part_type: Some("tool".into()),
+            text: None,
+            state: Some(ToolState {
+                output: None,
+                error: Some(ToolStateError::Other(serde_json::json!({"type": "x"}))),
+            }),
+        }];
+        assert_eq!(assemble_content_from_parts(&parts), "");
     }
 
     // =====================================================

@@ -34,7 +34,9 @@ use anyhow::{Context, Result};
 use frankensqlite::compat::RowExt;
 use frankensqlite::params;
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
+use super::sqlite_sync::{
+    Connection, ConnectionExt, open_read_only_with_snapshot_fallback, store_is_provably_empty,
+};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
@@ -934,7 +936,7 @@ impl CursorConnector {
 }
 
 // =====================================================================
-// Cursor Agent transcripts (gh #306)
+// Cursor Agent transcripts (gh #306) + Composer fragment merge
 // =====================================================================
 //
 // Cursor's newer "Agent" surface does NOT live in the Composer `state.vscdb`
@@ -947,10 +949,35 @@ impl CursorConnector {
 //   {"role":"user","message":{"content":[{"type":"text","text":"..."}]}}
 //   {"role":"assistant","message":{"content":[{"type":"text","text":"..."},
 //                                  {"type":"tool_use","name":"Grep","input":{...}}]}}
+//   {"type":"turn_ended","status":"...","error":"..."}   (session bookkeeping)
 //
-// This block adds that source as an ADDITIVE second scan path. It is fully
-// independent of the Composer reader: the `state.vscdb` -> `composerData:*`
-// extraction above (and every other connector) is byte-for-byte unaffected.
+// This block scans those transcripts and MERGES each one with the Composer
+// conversation carrying the same session id: the two sources are two
+// fragments of one session. The Composer side (`state.vscdb`) holds user
+// prompts and final answers with timestamps, model names and workspace
+// dirs; the transcript holds the full assistant/tool/error record stream
+// with no per-message timestamps. Design:
+// .scratch/glm/2026-11-08-cursor-fragment-design §6.1–§6.5, whose rules in
+// brief: the transcript record stream is the ordering skeleton; a
+// forward-only, role-checked, one-to-one greedy matcher pairs Composer
+// messages with records over whitespace-normalized text (tiers t1 equal >
+// t2 prefix > t4 contained > t5 reverse-contained, floor MIN=1); a pair row
+// keeps the record's role and content (the Composer variant wins only on
+// t5, where the Composer side alone holds the truncated tail) and donates
+// author/created_at/extra from the Composer bubble, adding a namespaced
+// copy of the raw record for provenance; an unmatched Composer message
+// inserts directly after the record paired with the previous Composer
+// message — unless some role-ok liftable record anywhere holds a
+// prefix/containment relation with it, in which case it is suppressed (the
+// transcript is the more complete source and a same-text Composer row
+// would be noise); a `turn_ended` record with a non-blank `error` string
+// lifts as a synthetic assistant row at its record position; idx is
+// re-indexed densely over the merged sequence. Sessions with no transcript
+// keep today's Composer shape and sessions with no Composer row keep
+// today's transcript shape, byte for byte. Freshness (§6.4): a session is
+// emitted when EITHER side is fresh; a fresh transcript merges with its
+// stale Composer row through a targeted `composerData:<sid>` lookup that
+// probes the db files in the same sorted order a full scan uses.
 //
 // The shape is reporter-documented (gh #306) and unverifiable against real
 // Cursor data here, so every step degrades gracefully: blank/malformed lines
@@ -965,6 +992,55 @@ impl CursorConnector {
 const AGENT_TRANSCRIPTS_DIR: &str = "agent-transcripts";
 /// Normalized agent slug, shared with the Composer path (same agent).
 const CURSOR_AGENT_SLUG: &str = "cursor";
+
+/// Metadata marker of a merged Composer + transcript conversation (§6.3):
+/// distinguishes merges from the transcript-only `"agent"` shape and the
+/// Composer-only shape (marker absent).
+const CURSOR_MERGED_FORMAT: &str = "merged";
+/// Merge-rules revision (§6.5 escape hatch): hosts that refuse to re-emit
+/// unchanged conversations can bump this to force a rebuild.
+const CURSOR_MERGE_REVISION: i64 = 1;
+/// Extra key carrying the raw transcript record on pair and error rows
+/// (§6.2): `cursor_` namespacing keeps it out of the source bubble's keys.
+const CURSOR_TRANSCRIPT_RECORD_KEY: &str = "cursor_transcript_record";
+
+/// The relation tier between a Composer message and a transcript record
+/// (§6.1), decided in priority order t1 > t2 > t4 > t5 with a floor of
+/// MIN=1: any non-empty prefix/containment relation pairs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergeTier {
+    /// t1 — the normalized texts are equal; ties go to the transcript.
+    Equal,
+    /// t2 — the Composer text is a prefix of the record's text.
+    ComposerPrefix,
+    /// t4 — the Composer text is contained in the record's text.
+    ComposerContained,
+    /// t5 — the record's text is contained in the Composer text: only the
+    /// Composer side holds the truncated tail, so it wins the row content.
+    RecordContained,
+}
+
+/// One liftable transcript record: its normalized message, its
+/// whitespace-normalized text-only matching key, and the raw record for
+/// provenance.
+struct LiftedRecord {
+    message: NormalizedMessage,
+    text_only_norm: String,
+    record: Value,
+}
+
+/// A transcript record positioned in the merge stream (§6.2): the stream is
+/// the ordering skeleton of every merged conversation.
+enum TranscriptStreamEntry {
+    /// A liftable record, by index into the merge's `lifts` vector.
+    Lift(usize),
+    /// A `turn_ended` record with a non-blank `error` string: lifted as a
+    /// synthetic assistant row at its record position.
+    Error { error: String, record: Value },
+    /// Everything else (success `turn_ended`, unliftable or blank records):
+    /// dropped, exactly like today's transcript-only parse.
+    Skip,
+}
 
 impl CursorConnector {
     /// Default root holding `~/.cursor/projects/`. Overridable via
@@ -1053,10 +1129,13 @@ impl CursorConnector {
         out
     }
 
-    /// The `(root, transcript)` pairs that BOTH `scan()` and
-    /// `discover_source_files()` consume, so discovery always covers every
-    /// scanned source (the connector conformance contract).
-    fn agent_transcript_sources(ctx: &ScanContext) -> Vec<(ScanRoot, PathBuf)> {
+    /// Every primary Agent transcript reachable from the scan targets, in a
+    /// fixed `(root, path)` order. The merge consumes this inventory in full
+    /// (a session with a fresh half is merged regardless of the other
+    /// half's mtime), while discovery and the transcript-only path consume
+    /// its freshness-filtered subset. Deduped by filesystem identity so
+    /// overlapping scan roots cannot double-read a file.
+    fn agent_transcript_inventory(ctx: &ScanContext) -> Vec<(ScanRoot, PathBuf)> {
         let mut out = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
         for root in Self::agent_scan_roots(ctx) {
@@ -1064,11 +1143,6 @@ impl CursorConnector {
                 continue;
             }
             for transcript in Self::agent_transcript_files(&root.path) {
-                let workspace_metadata_changed = Self::agent_workspace_metadata_path(&transcript)
-                    .is_some_and(|path| path.is_file() && file_modified_since(&path, ctx.since_ts));
-                if !file_modified_since(&transcript, ctx.since_ts) && !workspace_metadata_changed {
-                    continue;
-                }
                 if !seen.insert(dedupe_path_key(&transcript)) {
                     continue;
                 }
@@ -1076,6 +1150,25 @@ impl CursorConnector {
             }
         }
         out
+    }
+
+    /// Whether a transcript counts as fresh for an incremental scan: its own
+    /// mtime or its `.workspace-trusted` sidecar's, with the usual 1s slack.
+    fn agent_transcript_is_fresh(transcript: &Path, since_ts: Option<i64>) -> bool {
+        let workspace_metadata_changed = Self::agent_workspace_metadata_path(transcript)
+            .is_some_and(|path| path.is_file() && file_modified_since(&path, since_ts));
+        file_modified_since(transcript, since_ts) || workspace_metadata_changed
+    }
+
+    /// The fresh `(root, transcript)` pairs that BOTH `scan()`'s
+    /// transcript-only path and `discover_source_files()` consume, so
+    /// discovery always covers every freshly scanned source (the connector
+    /// conformance contract).
+    fn agent_transcript_sources(ctx: &ScanContext) -> Vec<(ScanRoot, PathBuf)> {
+        Self::agent_transcript_inventory(ctx)
+            .into_iter()
+            .filter(|(_, transcript)| Self::agent_transcript_is_fresh(transcript, ctx.since_ts))
+            .collect()
     }
 
     /// The encoded `<project>` directory name for a transcript path.
@@ -1125,6 +1218,17 @@ impl CursorConnector {
             return None;
         }
         Some(PathBuf::from(workspace))
+    }
+
+    /// A file's mtime in epoch milliseconds, if it can be stated.
+    fn file_mtime_ms(path: &Path) -> Option<i64> {
+        std::fs::metadata(path).ok().and_then(|meta| {
+            meta.modified().ok().and_then(|m| {
+                m.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| i64::try_from(d.as_millis()).ok())
+            })
+        })
     }
 
     /// Read a JSONL transcript into per-line records, skipping blank and
@@ -1251,13 +1355,7 @@ impl CursorConnector {
         // The documented record shape has no timestamps; fall back to the file's
         // mtime so the conversation still has a sortable time.
         if started_at.is_none() {
-            if let Some(ms) = std::fs::metadata(transcript).ok().and_then(|meta| {
-                meta.modified().ok().and_then(|m| {
-                    m.duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .and_then(|d| i64::try_from(d.as_millis()).ok())
-                })
-            }) {
+            if let Some(ms) = Self::file_mtime_ms(transcript) {
                 started_at = Some(ms);
                 ended_at = Some(ms);
             }
@@ -1318,16 +1416,8 @@ impl CursorConnector {
         })
     }
 
-    /// Append Agent-transcript conversations to `out` (additive to Composer).
-    fn scan_agent_transcripts(ctx: &ScanContext, out: &mut Vec<NormalizedConversation>) {
-        for (root, transcript) in Self::agent_transcript_sources(ctx) {
-            if let Some(conv) = Self::parse_agent_transcript(&transcript, &root) {
-                out.push(conv);
-            }
-        }
-    }
-
-    /// Agent-transcript files as discovered sources (mirrors `scan_agent_transcripts`).
+    /// Agent-transcript files as discovered sources (mirrors the scan half's
+    /// freshness gate over the same inventory).
     fn discover_agent_sources(ctx: &ScanContext, out: &mut Vec<DiscoveredSourceFile>) {
         let mut seen_metadata = HashSet::new();
         for (root, transcript) in Self::agent_transcript_sources(ctx) {
@@ -1358,6 +1448,530 @@ impl CursorConnector {
             );
         }
     }
+
+    // ------------------------------------------------------------------
+    // Composer + Agent-transcript merge (design §6.1–§6.5)
+    // ------------------------------------------------------------------
+
+    /// The session id a primary transcript file carries (its file stem) —
+    /// the join key against Composer `composerData:<sid>` rows.
+    fn transcript_sid(transcript: &Path) -> Option<String> {
+        transcript
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(String::from)
+    }
+
+    /// Matching key: collapse whitespace runs to single spaces and trim,
+    /// case preserved (§6.1).
+    fn whitespace_norm(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The text-only portion of a transcript record's content value — the
+    /// matching key on the record side (§6.1). A plain string passes
+    /// through; a block array contributes only text blocks (`type` absent
+    /// or `text`/`input_text`/`output_text`), joined with `\n`. Tool
+    /// renderings stay out of the key: the Composer side never carries
+    /// them, so a `[Tool: ...]` segment would break every
+    /// prefix/containment comparison.
+    fn text_only_portion(content: &Value) -> String {
+        if let Some(text) = content.as_str() {
+            return text.to_string();
+        }
+        let Some(blocks) = content.as_array() else {
+            return String::new();
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for block in blocks {
+            let block_type = block.get("type").and_then(Value::as_str);
+            let is_text = matches!(
+                block_type,
+                None | Some("text" | "input_text" | "output_text")
+            );
+            if is_text && let Some(text) = block.get("text").and_then(Value::as_str) {
+                parts.push(text);
+            }
+        }
+        parts.join("\n")
+    }
+
+    /// The relation tier between a normalized Composer text and a normalized
+    /// record text (§6.1). `None` means the two do not relate. Both texts
+    /// empty cannot occur here — Composer messages are trim-nonempty by
+    /// construction and an empty record key never lifts — so unlike the
+    /// probe reference this returns `None` rather than t1 for that pair.
+    fn pair_tier(composer_norm: &str, record_norm: &str) -> Option<MergeTier> {
+        if composer_norm.is_empty() || record_norm.is_empty() {
+            return None;
+        }
+        if composer_norm == record_norm {
+            return Some(MergeTier::Equal);
+        }
+        if record_norm.starts_with(composer_norm) {
+            return Some(MergeTier::ComposerPrefix);
+        }
+        if record_norm.contains(composer_norm) {
+            return Some(MergeTier::ComposerContained);
+        }
+        if composer_norm.contains(record_norm) {
+            return Some(MergeTier::RecordContained);
+        }
+        None
+    }
+
+    /// The non-blank string `error` of a `turn_ended` record, if it carries
+    /// one — the error-record classifier (§6.2). Success records, blank
+    /// errors and non-string errors all return `None` and stay dropped.
+    fn turn_ended_error(rec: &Value) -> Option<&str> {
+        if rec.get("type").and_then(Value::as_str) != Some("turn_ended") {
+            return None;
+        }
+        rec.get("error")
+            .and_then(Value::as_str)
+            .filter(|error| !error.trim().is_empty())
+    }
+
+    /// Pair-row extra: the Composer bubble object merged with a namespaced
+    /// copy of the raw transcript record (§6.2). A non-object bubble extra
+    /// (not produced by `parse_bubble` today) degrades to the record alone
+    /// rather than losing provenance.
+    fn merged_row_extra(bubble: &Value, record: &Value) -> Value {
+        let mut map = bubble.as_object().cloned().unwrap_or_default();
+        map.insert(CURSOR_TRANSCRIPT_RECORD_KEY.to_string(), record.clone());
+        Value::Object(map)
+    }
+
+    /// Merged-conversation metadata (§6.3): the Composer keys (source,
+    /// model, unifiedMode), the transcript attribution/project-dir
+    /// fallbacks, the merge markers, and the transcript-file provenance
+    /// (one file → string, several → array, in stream order).
+    fn merged_conversation_metadata(
+        composer_metadata: &Value,
+        transcript_attribution: &str,
+        transcript_project_dir: Option<&str>,
+        files: &[(ScanRoot, PathBuf)],
+    ) -> Value {
+        let mut map = composer_metadata.as_object().cloned().unwrap_or_else(|| {
+            // Not produced today; keep the source marker if it is ever lost.
+            let mut fallback = Map::new();
+            fallback.insert(
+                "source".to_string(),
+                Value::String(CURSOR_AGENT_SLUG.to_string()),
+            );
+            fallback
+        });
+        map.insert(
+            "cursor_workspace_attribution".to_string(),
+            Value::String(transcript_attribution.to_string()),
+        );
+        if let Some(project) = transcript_project_dir {
+            map.insert(
+                "cursor_project_dir".to_string(),
+                Value::String(project.to_string()),
+            );
+        }
+        map.insert(
+            "cursor_format".to_string(),
+            Value::String(CURSOR_MERGED_FORMAT.to_string()),
+        );
+        map.insert(
+            "cursor_merge_revision".to_string(),
+            Value::from(CURSOR_MERGE_REVISION),
+        );
+        let provenance = if files.len() == 1 {
+            Value::String(files[0].1.to_string_lossy().to_string())
+        } else {
+            Value::Array(
+                files
+                    .iter()
+                    .map(|(_, path)| Value::String(path.to_string_lossy().to_string()))
+                    .collect(),
+            )
+        };
+        map.insert("cursor_transcript_path".to_string(), provenance);
+        Value::Object(map)
+    }
+
+    /// Merge one Composer conversation with every transcript file of the
+    /// same session id (design §6.1–§6.3). The transcript record stream is
+    /// the ordering skeleton: pair rows keep the record's role and content
+    /// (the Composer variant wins only on t5) and donate
+    /// author/created_at/extra from the Composer bubble plus a namespaced
+    /// copy of the raw record; unmatched Composer messages insert directly
+    /// after the record paired with the previous Composer message (head if
+    /// none, tail after the walk) unless the suppress rule drops them;
+    /// `turn_ended` error records lift as synthetic assistant rows;
+    /// unpaired records keep today's transcript row shape; idx is
+    /// re-indexed densely. Deterministic for fixed inputs.
+    fn merge_composer_transcripts(
+        composer: NormalizedConversation,
+        files: &[(ScanRoot, PathBuf)],
+        tick: &dyn Fn(),
+    ) -> NormalizedConversation {
+        // Call sites only merge sids that have at least one transcript file;
+        // keep the Composer conversation whole if that is ever violated.
+        let Some((first_root, first_transcript)) = files.first() else {
+            return composer;
+        };
+
+        // Record stream plus per-file time bounds, mirroring what
+        // parse_agent_transcript would compute for each file.
+        let mut stream: Vec<TranscriptStreamEntry> = Vec::new();
+        let mut lifts: Vec<LiftedRecord> = Vec::new();
+        let mut lift_stream_pos: Vec<usize> = Vec::new();
+        let mut transcript_started: Option<i64> = None;
+        let mut transcript_ended: Option<i64> = None;
+        for (_root, transcript) in files {
+            tick();
+            let mut file_started: Option<i64> = None;
+            let mut file_ended: Option<i64> = None;
+            for rec in &Self::read_agent_transcript_records(transcript) {
+                if let Some(error) = Self::turn_ended_error(rec) {
+                    stream.push(TranscriptStreamEntry::Error {
+                        error: error.to_string(),
+                        record: rec.clone(),
+                    });
+                    continue;
+                }
+                if let Some(message) = Self::agent_record_to_message(rec) {
+                    if let Some(ts) = message.created_at {
+                        file_started = Some(file_started.map_or(ts, |cur| cur.min(ts)));
+                        file_ended = Some(file_ended.map_or(ts, |cur| cur.max(ts)));
+                    }
+                    let content_val = rec
+                        .pointer("/message/content")
+                        .or_else(|| rec.get("content"));
+                    let text_only = content_val.map_or_else(String::new, Self::text_only_portion);
+                    lift_stream_pos.push(stream.len());
+                    lifts.push(LiftedRecord {
+                        text_only_norm: Self::whitespace_norm(&text_only),
+                        message,
+                        record: rec.clone(),
+                    });
+                    stream.push(TranscriptStreamEntry::Lift(lifts.len() - 1));
+                } else {
+                    stream.push(TranscriptStreamEntry::Skip);
+                }
+            }
+            // Same mtime fallback parse_agent_transcript applies per file.
+            if file_started.is_none() {
+                if let Some(ms) = Self::file_mtime_ms(transcript) {
+                    file_started = Some(ms);
+                    file_ended = Some(ms);
+                }
+            }
+            if let Some(start) = file_started {
+                transcript_started = Some(transcript_started.map_or(start, |cur| cur.min(start)));
+            }
+            if let Some(end) = file_ended {
+                transcript_ended = Some(transcript_ended.map_or(end, |cur| cur.max(end)));
+            }
+        }
+
+        // Transcript-side conversation fallbacks, taken from the first file
+        // in stream order (deterministic) and mirroring
+        // parse_agent_transcript for that file.
+        let explicit_workspace = Self::agent_workspace_from_metadata(first_transcript);
+        let transcript_attribution = if explicit_workspace.is_some() {
+            "workspace_trusted"
+        } else {
+            "unresolved"
+        };
+        let transcript_workspace = explicit_workspace.map(|workspace| {
+            PathBuf::from(
+                first_root.rewrite_workspace(&workspace.to_string_lossy(), Some(CURSOR_AGENT_SLUG)),
+            )
+        });
+        let transcript_project_dir = Self::agent_project_dir_name(first_transcript);
+        // Title fallback over the lifted messages in stream order — the same
+        // rule parse_agent_transcript applies (first user line, else the
+        // first message's). A Composer title is effectively always Some, so
+        // this rarely fires, but the fallback must match the transcript
+        // shape when it does.
+        let mut first_user: Option<&NormalizedMessage> = None;
+        let mut first_any: Option<&NormalizedMessage> = None;
+        for lift in &lifts {
+            if first_any.is_none() {
+                first_any = Some(&lift.message);
+            }
+            if lift.message.role == "user" && first_user.is_none() {
+                first_user = Some(&lift.message);
+            }
+        }
+        let transcript_title = first_user
+            .or(first_any)
+            .and_then(|message| message.content.lines().find(|line| !line.trim().is_empty()))
+            .map(|line| line.chars().take(100).collect::<String>());
+
+        // Forward-only, role-checked, one-to-one greedy matcher over the
+        // whitespace-normalized texts (§6.1): the Composer cursor never
+        // moves backward, each record is used at most once, and the first
+        // positional relation wins (tier order only labels the relation).
+        let composer_norms: Vec<String> = composer
+            .messages
+            .iter()
+            .map(|message| Self::whitespace_norm(&message.content))
+            .collect();
+        let n_composer = composer.messages.len();
+        let n_lifts = lifts.len();
+        let mut used = vec![false; n_lifts];
+        let mut pair_lift: Vec<Option<usize>> = vec![None; n_composer];
+        let mut pair_tier_of: Vec<Option<MergeTier>> = vec![None; n_composer];
+        let mut cursor = 0;
+        for ci in 0..n_composer {
+            let mut j = cursor;
+            while j < n_lifts {
+                if used[j] || lifts[j].message.role != composer.messages[ci].role {
+                    j += 1;
+                    continue;
+                }
+                if let Some(tier) = Self::pair_tier(&composer_norms[ci], &lifts[j].text_only_norm) {
+                    used[j] = true;
+                    pair_lift[ci] = Some(j);
+                    pair_tier_of[ci] = Some(tier);
+                    cursor = j + 1;
+                    break;
+                }
+                j += 1;
+            }
+        }
+
+        // Conservative suppress rule (§6.2): an unmatched Composer message
+        // with a role-ok prefix/containment relation to ANY liftable
+        // record — paired or not, at any position — is suppressed rather
+        // than inserted.
+        let suppressed: Vec<bool> = (0..n_composer)
+            .map(|ci| {
+                pair_lift[ci].is_none()
+                    && (0..n_lifts).any(|j| {
+                        lifts[j].message.role == composer.messages[ci].role
+                            && Self::pair_tier(&composer_norms[ci], &lifts[j].text_only_norm)
+                                .is_some()
+                    })
+            })
+            .collect();
+
+        // Insert anchoring: directly after the record paired with the
+        // previous Composer message, at the head before the first pair, and
+        // past the last record for tail messages.
+        let mut last_pair_pos: Option<usize> = None;
+        let mut insert_at: Vec<Option<usize>> = vec![None; n_composer];
+        for ci in 0..n_composer {
+            if let Some(j) = pair_lift[ci] {
+                last_pair_pos = Some(lift_stream_pos[j]);
+            } else if !suppressed[ci] {
+                insert_at[ci] = Some(last_pair_pos.map_or(0, |pos| pos + 1));
+            } else {
+                tracing::debug!(
+                    external_id = ?composer.external_id,
+                    "cursor: composer message suppressed (role-ok transcript relation)"
+                );
+            }
+        }
+        // Anchor → Composer indexes in Composer order (several messages can
+        // share an anchor). Read by position only; never iterated, so the
+        // HashMap cannot affect determinism.
+        let mut insert_groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (ci, anchor) in insert_at.iter().enumerate() {
+            if let Some(anchor) = anchor {
+                insert_groups.entry(*anchor).or_default().push(ci);
+            }
+        }
+        let mut composer_of_lift: Vec<Option<usize>> = vec![None; n_lifts];
+        for (ci, j) in pair_lift.iter().enumerate() {
+            if let Some(j) = j {
+                composer_of_lift[*j] = Some(ci);
+            }
+        }
+
+        // Emit the merged sequence, then dense re-index (§6.2).
+        let mut messages: Vec<NormalizedMessage> = Vec::new();
+        for (pos, entry) in stream.iter().enumerate() {
+            if let Some(inserts) = insert_groups.get(&pos) {
+                for &ci in inserts {
+                    // Unmatched, unsuppressed Composer message: today's
+                    // Composer row, anchored here.
+                    messages.push(composer.messages[ci].clone());
+                }
+            }
+            match entry {
+                TranscriptStreamEntry::Lift(j) => {
+                    let lift = &lifts[*j];
+                    if let Some(ci) = composer_of_lift[*j] {
+                        let composer_msg = &composer.messages[ci];
+                        // Pair row: the record's role and — except on t5,
+                        // where only the Composer side holds the truncated
+                        // tail — its content, with author, timestamp and
+                        // bubble extra donated from the Composer side plus
+                        // the raw record for provenance.
+                        messages.push(NormalizedMessage {
+                            idx: 0,
+                            role: lift.message.role.clone(),
+                            author: composer_msg.author.clone(),
+                            created_at: composer_msg.created_at,
+                            content: if pair_tier_of[ci] == Some(MergeTier::RecordContained) {
+                                composer_msg.content.clone()
+                            } else {
+                                lift.message.content.clone()
+                            },
+                            extra: Self::merged_row_extra(&composer_msg.extra, &lift.record),
+                            snippets: Vec::new(),
+                            invocations: lift.message.invocations.clone(),
+                        });
+                    } else {
+                        // Unpaired record: today's transcript row, unchanged.
+                        messages.push(lift.message.clone());
+                    }
+                }
+                TranscriptStreamEntry::Error { error, record } => {
+                    // Synthetic assistant row at the record's position (§6.2).
+                    messages.push(NormalizedMessage {
+                        idx: 0,
+                        role: "assistant".to_string(),
+                        author: None,
+                        created_at: None,
+                        content: error.clone(),
+                        extra: {
+                            let mut map = Map::new();
+                            map.insert(CURSOR_TRANSCRIPT_RECORD_KEY.to_string(), record.clone());
+                            Value::Object(map)
+                        },
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    });
+                }
+                TranscriptStreamEntry::Skip => {}
+            }
+        }
+        // Tail-anchored inserts land after the walk.
+        if let Some(inserts) = insert_groups.get(&stream.len()) {
+            for &ci in inserts {
+                messages.push(composer.messages[ci].clone());
+            }
+        }
+        reindex_messages(&mut messages);
+
+        NormalizedConversation {
+            agent_slug: composer.agent_slug,
+            external_id: composer.external_id,
+            title: composer.title.or(transcript_title),
+            workspace: composer.workspace.or(transcript_workspace),
+            source_path: composer.source_path,
+            // Conversation-level Composer fields win; the transcript bounds
+            // fill the gaps, and ended_at takes whichever side ends later.
+            started_at: composer.started_at.or(transcript_started),
+            ended_at: composer.ended_at.max(transcript_ended),
+            metadata: Self::merged_conversation_metadata(
+                &composer.metadata,
+                transcript_attribution,
+                transcript_project_dir.as_deref(),
+                files,
+            ),
+            messages,
+        }
+    }
+
+    /// The `composerData:<sid>` value of one store, if present: a
+    /// primary-key point query (F8: never a value-predicated scan). NULL
+    /// values count as absent, mirroring the full scan's NULL skip.
+    fn composer_row_for_sid(conn: &Connection, sid: &str) -> Result<Option<String>> {
+        let key = format!("composerData:{sid}");
+        let rows = conn.query_map_collect(
+            "SELECT value FROM cursorDiskKV WHERE key = ?",
+            params![key.as_str()],
+            |row| {
+                let value: Option<String> = row.get_typed(0)?;
+                Ok(value)
+            },
+        )?;
+        Ok(rows.into_iter().flatten().next())
+    }
+
+    /// Resolve the Composer conversations for `sids` from db files an
+    /// incremental scan would otherwise not read (§6.4): a fresh transcript
+    /// needs its stale Composer half. Each store is probed in the same
+    /// sorted order a full scan reads them, and a store resolves a sid only
+    /// when its row parses to a conversation — the same winner the full
+    /// scan's cross-store first-emitted dedupe would pick. A store that
+    /// cannot be opened fails the scan (F5/F9 semantics: identical to a
+    /// full scan over the same files); per-sid query failures warn and move
+    /// on, mirroring the full scan's composerData-query tolerance. The
+    /// conversation-level since cutoff is bypassed — the session is emitted
+    /// anyway because its transcript half is fresh.
+    fn lookup_composer_conversations(
+        db_paths: &[PathBuf],
+        sids: &[String],
+        tick: &dyn Fn(),
+    ) -> (HashMap<String, Option<NormalizedConversation>>, Vec<String>) {
+        let mut found: HashMap<String, Option<NormalizedConversation>> = HashMap::new();
+        let mut failures: Vec<String> = Vec::new();
+        let mut pending: Vec<String> = sids.to_vec();
+        for db_path in db_paths {
+            if pending.is_empty() {
+                break;
+            }
+            if store_is_provably_empty(db_path) {
+                continue;
+            }
+            tick();
+            let conn =
+                match open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref()) {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        failures.push(format!(
+                            "{}: failed to open Cursor db: {error:#}",
+                            db_path.display()
+                        ));
+                        continue;
+                    }
+                };
+            if let Err(error) = conn.execute("PRAGMA busy_timeout = 5000;") {
+                failures.push(format!(
+                    "{}: failed to set busy_timeout: {error:#}",
+                    db_path.display()
+                ));
+                continue;
+            }
+            let mut still_pending: Vec<String> = Vec::new();
+            for sid in &pending {
+                tick();
+                match Self::composer_row_for_sid(&conn, sid) {
+                    Ok(Some(value)) => {
+                        let key = format!("composerData:{sid}");
+                        let parsed = Self::parse_composer_data(
+                            &key,
+                            &value,
+                            db_path,
+                            None,
+                            &mut HashSet::new(),
+                            Some(&conn),
+                        );
+                        if let Some(composer_conv) = parsed {
+                            found.insert(sid.clone(), Some(composer_conv));
+                        } else {
+                            // Parses to nothing here; a later store may
+                            // still resolve it, exactly like the full
+                            // scan's cross-store dedupe.
+                            still_pending.push(sid.clone());
+                        }
+                    }
+                    Ok(None) => still_pending.push(sid.clone()),
+                    Err(error) => {
+                        tracing::warn!(
+                            db = %db_path.display(),
+                            session = %sid,
+                            error = %error,
+                            "cursor: targeted composerData lookup failed; a stale Composer row may be missed"
+                        );
+                        still_pending.push(sid.clone());
+                    }
+                }
+            }
+            pending = still_pending;
+        }
+        (found, failures)
+    }
 }
 
 impl Connector for CursorConnector {
@@ -1366,7 +1980,42 @@ impl Connector for CursorConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut all_convs = Vec::new();
+        let tick = || {
+            if let Some(tick) = &ctx.progress_tick {
+                tick();
+            }
+        };
+
+        let roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .filter(|path| path.exists())
+            .collect();
+        // Every db file, in the fixed order a full scan reads them — the
+        // targeted lookup below must probe exactly this order — of which
+        // only the fresh ones are extracted now.
+        let all_db_paths: Vec<PathBuf> = roots
+            .iter()
+            .flat_map(|root| Self::find_db_files(root))
+            .collect();
+        let fresh_db_paths: Vec<PathBuf> = all_db_paths
+            .iter()
+            // Skip files not modified since last scan
+            .filter(|db_path| file_modified_since(db_path, ctx.since_ts))
+            .cloned()
+            .collect();
+
+        // Composer (`state.vscdb` -> `composerData:*`) from fresh stores.
+        //
+        // Local fix (cass review 2026-11-07, F9): a store that cannot be
+        // read fails the scan instead of hiding behind a warn (F5
+        // semantics) — a BusyRecovery-class store is read through the
+        // snapshot fallback in `open_read_only_with_snapshot_fallback`,
+        // and every other open failure reaches the host.
+        let composer_convs =
+            super::checked_scan::collect_databases_checked("Cursor", fresh_db_paths, |db_path| {
+                Self::extract_from_db(db_path, ctx.since_ts, &tick)
+            })?;
         // The same composer id can be mirrored across DBs (globalStorage vs
         // workspaceStorage, explicit overlapping roots, backups). extract_from_db
         // only dedupes within one store, so span a session-id set across ALL
@@ -1375,42 +2024,105 @@ impl Connector for CursorConnector {
         // external_id pass through: dropping them would trade a duplicate bug
         // for a loss bug. Mirrors the opencode connector's spanning dedupe.
         let mut seen_db_session_ids: HashSet<String> = HashSet::new();
-        let tick = || {
-            if let Some(tick) = &ctx.progress_tick {
-                tick();
-            }
-        };
-
-        // Composer (`state.vscdb` -> `composerData:*`) — unchanged behavior.
-        let roots: Vec<PathBuf> = Self::source_roots(ctx)
+        let composer_convs: Vec<NormalizedConversation> = composer_convs
             .into_iter()
-            .map(|root| root.path)
-            .filter(|path| path.exists())
+            .filter(|conv| {
+                conv.external_id
+                    .as_ref()
+                    .is_none_or(|id| seen_db_session_ids.insert(id.clone()))
+            })
             .collect();
-        let db_paths: Vec<PathBuf> = roots
+
+        // Transcript inventory and its fresh subset. The merge (§6.4) always
+        // reads both halves of a session: the inventory feeds the merges
+        // regardless of mtime, the fresh subset decides what is emitted.
+        let inventory = Self::agent_transcript_inventory(ctx);
+        let fresh_transcripts: Vec<(ScanRoot, PathBuf)> = inventory
             .iter()
-            .flat_map(|root| Self::find_db_files(root))
-            // Skip files not modified since last scan
-            .filter(|db_path| file_modified_since(db_path, ctx.since_ts))
+            .filter(|(_, transcript)| Self::agent_transcript_is_fresh(transcript, ctx.since_ts))
+            .cloned()
             .collect();
+        let mut files_by_sid: HashMap<String, Vec<(ScanRoot, PathBuf)>> = HashMap::new();
+        for (root, transcript) in &inventory {
+            if let Some(sid) = Self::transcript_sid(transcript) {
+                files_by_sid
+                    .entry(sid)
+                    .or_default()
+                    .push((root.clone(), transcript.clone()));
+            }
+        }
 
-        // Local fix (cass review 2026-11-07, F9): a store that cannot be
-        // read fails the scan instead of hiding behind a warn (F5
-        // semantics) — a BusyRecovery-class store is read through the
-        // snapshot fallback in `open_read_only_with_snapshot_fallback`,
-        // and every other open failure reaches the host.
-        let composer_convs =
-            super::checked_scan::collect_databases_checked("Cursor", db_paths, |db_path| {
-                Self::extract_from_db(db_path, ctx.since_ts, &tick)
-            })?;
-        all_convs.extend(composer_convs.into_iter().filter(|conv| {
-            conv.external_id
-                .as_ref()
-                .is_none_or(|id| seen_db_session_ids.insert(id.clone()))
-        }));
+        let mut all_convs = Vec::new();
+        let mut merged_sids: HashSet<String> = HashSet::new();
 
-        // Cursor Agent transcripts (gh #306) — additive second source.
-        Self::scan_agent_transcripts(ctx, &mut all_convs);
+        // Pass 1 — every fresh-store Composer conversation. A sid with any
+        // transcript merges (the db side is fresh, so the transcript is
+        // parsed regardless of its own mtime); composer-only sids keep
+        // today's shape.
+        for conv in composer_convs {
+            let Some(sid) = conv.external_id.clone() else {
+                // Defensive: parse_composer_data always sets an id.
+                all_convs.push(conv);
+                continue;
+            };
+            if let Some(files) = files_by_sid.get(&sid).cloned() {
+                merged_sids.insert(sid);
+                all_convs.push(Self::merge_composer_transcripts(conv, &files, &tick));
+            } else {
+                all_convs.push(conv);
+            }
+        }
+
+        // Pass 2 — fresh transcripts pass 1 did not already merge. A
+        // targeted composerData:<sid> lookup over the db files resolves the
+        // stale Composer half (§6.4); sids with no resolvable half keep
+        // today's per-file transcript-only output, byte for byte.
+        let mut need_lookup: Vec<String> = Vec::new();
+        let mut need_lookup_seen: HashSet<String> = HashSet::new();
+        for sid in fresh_transcripts
+            .iter()
+            .filter_map(|(_, transcript)| Self::transcript_sid(transcript))
+        {
+            if !merged_sids.contains(&sid) && need_lookup_seen.insert(sid.clone()) {
+                need_lookup.push(sid);
+            }
+        }
+        let (looked_up, lookup_failures) =
+            Self::lookup_composer_conversations(&all_db_paths, &need_lookup, &tick);
+        for (root, transcript) in fresh_transcripts {
+            let sid = Self::transcript_sid(&transcript);
+            if let Some(sid) = &sid
+                && merged_sids.contains(sid)
+            {
+                continue;
+            }
+            if let Some(sid) = &sid
+                && let Some(Some(composer)) = looked_up.get(sid)
+            {
+                merged_sids.insert(sid.clone());
+                let files = files_by_sid.get(sid).cloned().unwrap_or_default();
+                all_convs.push(Self::merge_composer_transcripts(
+                    composer.clone(),
+                    &files,
+                    &tick,
+                ));
+                continue;
+            }
+            // Transcript-only: today's per-file shape, byte for byte.
+            if let Some(conv) = Self::parse_agent_transcript(&transcript, &root) {
+                all_convs.push(conv);
+            }
+        }
+        // F5/F9 semantics for the targeted lookup too: a store it could not
+        // read fails the scan instead of quietly degrading merged sessions
+        // to transcript-only rows.
+        if !lookup_failures.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Cursor scan incomplete: {} database(s) failed: {}",
+                lookup_failures.len(),
+                lookup_failures.join("; ")
+            ));
+        }
 
         Ok(all_convs)
     }
@@ -3603,6 +4315,988 @@ mod agent_transcript_tests {
         // and must not panic or fabricate anything.
         let tmp = TempDir::new().unwrap();
         let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
+        assert!(convs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cursor_fragment_merge_tests {
+    //! Tests for the Composer + Agent-transcript fragment merge (design
+    //! 2026-11-08-cursor-fragment-design, §6.1–§6.5). All fixtures are
+    //! synthetic: a `state.vscdb`-shaped SQLite database plus JSONL transcripts
+    //! under one explicit scan root, with made-up text only. The same session
+    //! id on both sides is what triggers the merge; transcript-only and
+    //! composer-only shapes pin today's byte-for-byte behavior.
+    use super::*;
+    use crate::connectors::sqlite_sync::ConnectionExt;
+    use frankensqlite::params;
+    use serde_json::json;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // ------------------------------------------------------------------
+    // Fixture helpers
+    // ------------------------------------------------------------------
+
+    /// Create a Cursor-shaped SQLite store (cursorDiskKV + ItemTable).
+    fn create_store(path: &Path) -> Connection {
+        let conn = Connection::open(path.to_string_lossy().as_ref()).unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn
+    }
+
+    /// Write one Composer session (v0.40 headers-only shape) into a store:
+    /// a `composerData:<sid>` row plus one `bubbleId:<sid>:<bubble>` row per
+    /// message.
+    fn write_composer_session(
+        db_path: &Path,
+        sid: &str,
+        composer: &Value,
+        bubbles: &[(&str, Value)],
+    ) {
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = create_store(db_path);
+        let composer_key = format!("composerData:{sid}");
+        conn.execute_compat(
+            "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![composer_key.as_str(), composer.to_string()],
+        )
+        .unwrap();
+        for (bubble_id, bubble) in bubbles {
+            let bubble_key = format!("bubbleId:{sid}:{bubble_id}");
+            conn.execute_compat(
+                "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![bubble_key.as_str(), bubble.to_string()],
+            )
+            .unwrap();
+        }
+        drop(conn);
+    }
+
+    fn text_record(role: &str, text: &str) -> Value {
+        json!({"role": role, "message": {"content": [{"type": "text", "text": text}]}})
+    }
+
+    fn tool_record(role: &str, text: &str, tool: &str, file_path: &str) -> Value {
+        json!({"role": role, "message": {"content": [
+            {"type": "text", "text": text},
+            {"type": "tool_use", "name": tool, "input": {"file_path": file_path}},
+        ]}})
+    }
+
+    fn tool_only_record(role: &str, tool: &str, file_path: &str) -> Value {
+        json!({"role": role, "message": {"content": [
+            {"type": "tool_use", "name": tool, "input": {"file_path": file_path}},
+        ]}})
+    }
+
+    fn turn_ended(status: &str) -> Value {
+        json!({"type": "turn_ended", "status": status})
+    }
+
+    fn error_turn_ended(error: &str) -> Value {
+        json!({"type": "turn_ended", "status": "error", "error": error})
+    }
+
+    fn jsonl_text(records: &[Value]) -> String {
+        let mut text = String::new();
+        for record in records {
+            text.push_str(&record.to_string());
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Write a primary Agent transcript `<root>/<project>/agent-transcripts/<sid>/<sid>.jsonl`.
+    fn write_transcript(root: &Path, project: &str, sid: &str, records: &[Value]) -> PathBuf {
+        let dir = root.join(project).join(AGENT_TRANSCRIPTS_DIR).join(sid);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{sid}.jsonl"));
+        fs::write(&file, jsonl_text(records)).unwrap();
+        file
+    }
+
+    fn ctx_for(root: &Path) -> ScanContext {
+        ScanContext::with_roots(
+            root.to_path_buf(),
+            vec![ScanRoot::local(root.to_path_buf())],
+            None,
+        )
+    }
+
+    fn ctx_since(root: &Path, since_ts: i64) -> ScanContext {
+        ScanContext::with_roots(
+            root.to_path_buf(),
+            vec![ScanRoot::local(root.to_path_buf())],
+            Some(since_ts),
+        )
+    }
+
+    fn mtime_ms(path: &Path) -> i64 {
+        fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap()
+    }
+
+    fn pair_row(conv: &NormalizedConversation, i: usize) -> &NormalizedMessage {
+        &conv.messages[i]
+    }
+
+    // ------------------------------------------------------------------
+    // The canonical fixture: one Composer session and a same-id transcript
+    // exercising every merge tier, plus insert / suppress / error-record
+    // shapes. Expected merged sequence (idx 0..8) is written out below and
+    // was computed by hand from the design rules.
+    // ------------------------------------------------------------------
+
+    fn canonical_composer() -> Value {
+        json!({
+            "name": "Login regression",
+            "createdAt": 1700000000000i64,
+            "lastUpdatedAt": 1700000008000i64,
+            "unifiedMode": "agentPlus",
+            "modelConfig": {"modelName": "test-model"},
+            "fullConversationHeadersOnly": [
+                {"bubbleId": "u1"}, {"bubbleId": "a1"}, {"bubbleId": "a2"},
+                {"bubbleId": "u2"}, {"bubbleId": "a3"}, {"bubbleId": "u3"},
+                {"bubbleId": "u4"},
+            ],
+        })
+    }
+
+    fn canonical_bubbles() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "u1",
+                json!({"type": 1, "text": "Fix the login bug", "timestamp": 1700000001000i64, "workspaceProjectDir": "/work/demo"}),
+            ),
+            (
+                "a1",
+                json!({"type": 2, "text": "I will grep first", "timestamp": 1700000002000i64, "modelType": "gpt-x"}),
+            ),
+            (
+                "a2",
+                json!({"type": 2, "text": "Reading the file now", "timestamp": 1700000003000i64}),
+            ),
+            (
+                "u2",
+                json!({"type": 1, "text": "Summarize", "timestamp": 1700000004000i64}),
+            ),
+            (
+                "a3",
+                json!({"type": 2, "text": "Long composer answer with tail detail the transcript truncated", "timestamp": 1700000005000i64, "modelType": "gpt-x"}),
+            ),
+            (
+                "u3",
+                json!({"type": 1, "text": "Standalone question never in the transcript", "timestamp": 1700000006000i64}),
+            ),
+            (
+                "u4",
+                json!({"type": 1, "text": "the login", "timestamp": 1700000007000i64}),
+            ),
+        ]
+    }
+
+    fn canonical_records() -> Vec<Value> {
+        vec![
+            text_record("user", "Fix the login bug"),
+            tool_record("assistant", "I will grep first", "Grep", "/src/login.rs"),
+            turn_ended("success"),
+            text_record(
+                "assistant",
+                "Reading the file now and the next fifty lines for context",
+            ),
+            error_turn_ended("Model call failed: rate limited"),
+            text_record(
+                "user",
+                "Please Summarize: we wrapped the composer text inside a quoted context header",
+            ),
+            text_record("assistant", "Long composer answer with tail"),
+            tool_only_record("assistant", "Read", "/src/auth.rs"),
+            text_record(
+                "user",
+                "A final user nudge that exists only in the transcript",
+            ),
+        ]
+    }
+
+    fn canonical_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let db = root.join("globalStorage/state.vscdb");
+        write_composer_session(&db, "alpha-1", &canonical_composer(), &canonical_bubbles());
+        let transcript = write_transcript(root, "proj-a", "alpha-1", &canonical_records());
+        (db, transcript)
+    }
+
+    #[test]
+    fn merged_conversation_pairs_all_tiers_donates_and_dense_indexes() {
+        let tmp = TempDir::new().unwrap();
+        let (db, transcript) = canonical_fixture(tmp.path());
+        let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
+        assert_eq!(
+            convs.len(),
+            1,
+            "composer + same-id transcript must merge into one conversation"
+        );
+        let c = &convs[0];
+
+        // Conversation-level fields: composer wins, transcript fills gaps.
+        assert_eq!(c.agent_slug, "cursor");
+        assert_eq!(c.external_id.as_deref(), Some("alpha-1"));
+        assert_eq!(c.source_path, db.join("alpha-1"));
+        assert_eq!(c.title.as_deref(), Some("Login regression"));
+        assert_eq!(c.workspace.as_deref(), Some(Path::new("/work/demo")));
+        assert_eq!(c.started_at, Some(1700000000000i64));
+        assert!(c.ended_at.unwrap() >= 1700000008000i64);
+        assert_eq!(c.metadata["source"], "cursor");
+        assert_eq!(c.metadata["model"], "test-model");
+        assert_eq!(c.metadata["unifiedMode"], "agentPlus");
+        assert_eq!(c.metadata["cursor_format"], "merged");
+        assert_eq!(c.metadata["cursor_merge_revision"], 1);
+        assert_eq!(
+            c.metadata["cursor_transcript_path"],
+            json!(transcript.to_str().unwrap())
+        );
+        assert_eq!(c.metadata["cursor_project_dir"], "proj-a");
+        assert_eq!(c.metadata["cursor_workspace_attribution"], "unresolved");
+
+        // Dense idx over the whole merged sequence.
+        assert_eq!(c.messages.len(), 9);
+        for (i, msg) in c.messages.iter().enumerate() {
+            assert_eq!(msg.idx, i as i64, "idx must be dense");
+        }
+
+        // idx 0 — t1 pair (u1 / "Fix the login bug"), composer donates timestamp.
+        let m = pair_row(c, 0);
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, "Fix the login bug");
+        assert_eq!(m.created_at, Some(1700000001000i64));
+        assert_eq!(m.author, None);
+        assert!(m.invocations.is_empty());
+        assert_eq!(m.extra["text"], "Fix the login bug");
+        assert_eq!(m.extra["type"], json!(1));
+        assert_eq!(m.extra["workspaceProjectDir"], "/work/demo");
+        assert_eq!(m.extra["cursor_transcript_record"]["role"], "user");
+
+        // idx 1 — t1 pair with tools: transcript flatten wins, composer donates.
+        let m = pair_row(c, 1);
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.content, "I will grep first\n[Tool: Grep - /src/login.rs]");
+        assert_eq!(m.created_at, Some(1700000002000i64));
+        assert_eq!(m.author.as_deref(), Some("gpt-x"));
+        assert_eq!(m.invocations.len(), 1);
+        assert_eq!(m.invocations[0].kind, "tool");
+        assert_eq!(m.invocations[0].name, "Grep");
+        assert_eq!(m.extra["cursor_transcript_record"]["role"], "assistant");
+
+        // idx 2 — t2 pair: composer text is a prefix of the record text.
+        let m = pair_row(c, 2);
+        assert_eq!(m.role, "assistant");
+        assert_eq!(
+            m.content,
+            "Reading the file now and the next fifty lines for context"
+        );
+        assert_eq!(m.created_at, Some(1700000003000i64));
+        assert_eq!(m.author, None);
+
+        // idx 3 — error turn_ended record becomes a synthetic assistant row at
+        // its record position, extra carries only the namespaced record.
+        let m = pair_row(c, 3);
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.content, "Model call failed: rate limited");
+        assert_eq!(m.created_at, None);
+        assert_eq!(m.author, None);
+        assert!(m.invocations.is_empty());
+        assert_eq!(m.extra.as_object().map(serde_json::Map::len), Some(1));
+        assert_eq!(
+            m.extra["cursor_transcript_record"]["error"],
+            "Model call failed: rate limited"
+        );
+        assert_eq!(m.extra["cursor_transcript_record"]["type"], "turn_ended");
+
+        // idx 4 — t4 pair: composer text contained in the record text.
+        let m = pair_row(c, 4);
+        assert_eq!(m.role, "user");
+        assert_eq!(
+            m.content,
+            "Please Summarize: we wrapped the composer text inside a quoted context header"
+        );
+        assert_eq!(m.created_at, Some(1700000004000i64));
+
+        // idx 5 — t5 pair: record contained in composer, so the composer
+        // variant (the only side holding the truncated tail) wins content.
+        let m = pair_row(c, 5);
+        assert_eq!(m.role, "assistant");
+        assert_eq!(
+            m.content,
+            "Long composer answer with tail detail the transcript truncated"
+        );
+        assert_eq!(m.created_at, Some(1700000005000i64));
+        assert_eq!(m.author.as_deref(), Some("gpt-x"));
+        assert!(m.invocations.is_empty());
+        assert!(m.extra["cursor_transcript_record"].is_object());
+
+        // idx 6 — unmatched composer message with no role-ok relation inserts
+        // after the previous pair, keeping composer content and bubble extra
+        // (and no transcript-record key: it is not a pair).
+        let m = pair_row(c, 6);
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, "Standalone question never in the transcript");
+        assert_eq!(m.created_at, Some(1700000006000i64));
+        assert!(m.extra.get("cursor_transcript_record").is_none());
+        assert_eq!(m.extra["type"], json!(1));
+
+        // idx 7 / 8 — unpaired records stay as today's transcript rows:
+        // flatten content, no timestamps, empty extra.
+        let m = pair_row(c, 7);
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.content, "[Tool: Read - /src/auth.rs]");
+        assert_eq!(m.created_at, None);
+        assert_eq!(m.author, None);
+        assert_eq!(m.extra, json!({}));
+        assert_eq!(m.invocations.len(), 1);
+        assert_eq!(m.invocations[0].name, "Read");
+        let m = pair_row(c, 8);
+        assert_eq!(m.role, "user");
+        assert_eq!(
+            m.content,
+            "A final user nudge that exists only in the transcript"
+        );
+        assert_eq!(m.created_at, None);
+        assert_eq!(m.extra, json!({}));
+
+        // The suppressed u4 ("the login", contained in the paired user record)
+        // must not appear anywhere.
+        assert!(
+            c.messages.iter().all(|msg| msg.content != "the login"),
+            "composer message with a role-ok relation must be suppressed"
+        );
+    }
+
+    #[test]
+    fn merge_is_deterministic_across_scans() {
+        let tmp = TempDir::new().unwrap();
+        canonical_fixture(tmp.path());
+        let connector = CursorConnector::new();
+        let first = connector.scan(&ctx_for(tmp.path())).unwrap();
+        let second = connector.scan(&ctx_for(tmp.path())).unwrap();
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap(),
+            "same inputs must merge identically (idx included)"
+        );
+    }
+
+    #[test]
+    fn merged_output_extends_by_append_only_tail() {
+        let tmp = TempDir::new().unwrap();
+        let (_, transcript) = canonical_fixture(tmp.path());
+        let ctx = ctx_for(tmp.path());
+        let first = CursorConnector::new().scan(&ctx).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].messages.len(), 9);
+
+        // Incremental stability (§6.5): appending records to the transcript
+        // must leave every already-emitted row byte-identical and only append
+        // a tail.
+        let mut grown = canonical_records();
+        grown.push(text_record("user", "One more followup question"));
+        grown.push(text_record("assistant", "One more answer line"));
+        fs::write(&transcript, jsonl_text(&grown)).unwrap();
+
+        let second = CursorConnector::new().scan(&ctx).unwrap();
+        assert_eq!(second.len(), 1);
+        let new_messages = &second[0].messages;
+        assert_eq!(new_messages.len(), 11);
+        for i in 0..9 {
+            assert_eq!(
+                serde_json::to_value(&new_messages[i]).unwrap(),
+                serde_json::to_value(&first[0].messages[i]).unwrap(),
+                "row {i} changed after a tail-only append"
+            );
+        }
+        assert_eq!(new_messages[9].role, "user");
+        assert_eq!(new_messages[9].content, "One more followup question");
+        assert_eq!(new_messages[9].extra, json!({}));
+        assert_eq!(new_messages[10].role, "assistant");
+        assert_eq!(new_messages[10].content, "One more answer line");
+        assert_eq!(new_messages[10].idx, 10);
+    }
+
+    #[test]
+    fn unmatched_head_composer_message_inserts_before_first_record() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let db = root.join("globalStorage/state.vscdb");
+        write_composer_session(
+            &db,
+            "head-1",
+            &json!({"name": "Head anchor", "fullConversationHeadersOnly": [
+                {"bubbleId": "ux"}, {"bubbleId": "u1"},
+            ]}),
+            &[
+                (
+                    "ux",
+                    json!({"type": 1, "text": "Where do I start", "timestamp": 1700000001000i64}),
+                ),
+                (
+                    "u1",
+                    json!({"type": 1, "text": "Fix the login bug", "timestamp": 1700000002000i64}),
+                ),
+            ],
+        );
+        write_transcript(
+            root,
+            "proj-a",
+            "head-1",
+            &[text_record("user", "Fix the login bug")],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(root)).unwrap();
+        assert_eq!(convs.len(), 1);
+        let c = &convs[0];
+        assert_eq!(c.messages.len(), 2);
+        // No previous pair: the insert anchors at the head, before the record.
+        assert_eq!(c.messages[0].content, "Where do I start");
+        assert_eq!(c.messages[0].created_at, Some(1700000001000i64));
+        assert!(
+            c.messages[0]
+                .extra
+                .get("cursor_transcript_record")
+                .is_none()
+        );
+        assert_eq!(c.messages[1].content, "Fix the login bug");
+        assert_eq!(c.messages[1].created_at, Some(1700000002000i64));
+        assert_eq!(
+            c.messages[1].extra["cursor_transcript_record"]["role"],
+            "user"
+        );
+    }
+
+    #[test]
+    fn unmatched_composer_message_inserts_between_pairs() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let db = root.join("globalStorage/state.vscdb");
+        write_composer_session(
+            &db,
+            "mid-1",
+            &json!({"name": "Mid anchor", "fullConversationHeadersOnly": [
+                {"bubbleId": "u1"}, {"bubbleId": "um"}, {"bubbleId": "u2"},
+            ]}),
+            &[
+                (
+                    "u1",
+                    json!({"type": 1, "text": "First question", "timestamp": 1700000001000i64}),
+                ),
+                (
+                    "um",
+                    json!({"type": 1, "text": "An interleaved remark not in the transcript", "timestamp": 1700000002000i64}),
+                ),
+                (
+                    "u2",
+                    json!({"type": 1, "text": "Second question", "timestamp": 1700000003000i64}),
+                ),
+            ],
+        );
+        write_transcript(
+            root,
+            "proj-a",
+            "mid-1",
+            &[
+                text_record("user", "First question"),
+                text_record("user", "Second question"),
+            ],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(root)).unwrap();
+        assert_eq!(convs.len(), 1);
+        let c = &convs[0];
+        assert_eq!(c.messages.len(), 3);
+        assert_eq!(c.messages[0].content, "First question");
+        assert_eq!(c.messages[0].created_at, Some(1700000001000i64));
+        // Anchored directly after the record paired with the previous
+        // composer message — i.e. between the two pairs.
+        assert_eq!(
+            c.messages[1].content,
+            "An interleaved remark not in the transcript"
+        );
+        assert_eq!(c.messages[1].created_at, Some(1700000002000i64));
+        assert!(
+            c.messages[1]
+                .extra
+                .get("cursor_transcript_record")
+                .is_none()
+        );
+        assert_eq!(c.messages[2].content, "Second question");
+        assert_eq!(c.messages[2].created_at, Some(1700000003000i64));
+    }
+
+    #[test]
+    fn unmatched_tail_composer_message_inserts_at_end() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let db = root.join("globalStorage/state.vscdb");
+        write_composer_session(
+            &db,
+            "tail-1",
+            &json!({"name": "Tail anchor", "fullConversationHeadersOnly": [
+                {"bubbleId": "u1"}, {"bubbleId": "ut"},
+            ]}),
+            &[
+                (
+                    "u1",
+                    json!({"type": 1, "text": "First question", "timestamp": 1700000001000i64}),
+                ),
+                (
+                    "ut",
+                    json!({"type": 1, "text": "A trailing remark absent from the transcript", "timestamp": 1700000002000i64}),
+                ),
+            ],
+        );
+        write_transcript(
+            root,
+            "proj-a",
+            "tail-1",
+            &[text_record("user", "First question")],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(root)).unwrap();
+        assert_eq!(convs.len(), 1);
+        let c = &convs[0];
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.messages[0].content, "First question");
+        assert_eq!(c.messages[0].created_at, Some(1700000001000i64));
+        // Anchor past the last record: the insert lands after the walk.
+        assert_eq!(
+            c.messages[1].content,
+            "A trailing remark absent from the transcript"
+        );
+        assert_eq!(c.messages[1].created_at, Some(1700000002000i64));
+        assert!(
+            c.messages[1]
+                .extra
+                .get("cursor_transcript_record")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn out_of_order_duplicate_is_suppressed_not_inserted() {
+        // u_bg's text equals record r0's text (t1), but r0 sits before the
+        // forward cursor once r1 pairs u_q, so u_bg stays unmatched — and the
+        // literal §6.2 suppress rule (relation with ANY role-ok record,
+        // paired or not) drops it instead of inserting. r0 itself must never
+        // be dropped: it survives as a transcript-only row.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let db = root.join("globalStorage/state.vscdb");
+        write_composer_session(
+            &db,
+            "sup-1",
+            &json!({"name": "Out of order", "fullConversationHeadersOnly": [
+                {"bubbleId": "uq"}, {"bubbleId": "ubg"},
+            ]}),
+            &[
+                (
+                    "uq",
+                    json!({"type": 1, "text": "the main question stands", "timestamp": 1700000001000i64}),
+                ),
+                (
+                    "ubg",
+                    json!({"type": 1, "text": "alpha beta background", "timestamp": 1700000002000i64}),
+                ),
+            ],
+        );
+        write_transcript(
+            root,
+            "proj-a",
+            "sup-1",
+            &[
+                text_record("user", "alpha beta background"),
+                text_record("user", "the main question stands"),
+            ],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(root)).unwrap();
+        assert_eq!(convs.len(), 1);
+        let c = &convs[0];
+        assert_eq!(
+            c.messages.len(),
+            2,
+            "no third row for the suppressed composer message"
+        );
+        // r0 survives as a transcript-only row.
+        assert_eq!(c.messages[0].content, "alpha beta background");
+        assert_eq!(c.messages[0].extra, json!({}));
+        assert_eq!(c.messages[0].created_at, None);
+        // r1 pairs u_q; the composer side donates its timestamp.
+        assert_eq!(c.messages[1].content, "the main question stands");
+        assert_eq!(c.messages[1].created_at, Some(1700000001000i64));
+        assert_eq!(
+            c.messages[1].extra["cursor_transcript_record"]["role"],
+            "user"
+        );
+    }
+
+    #[test]
+    fn error_edge_records_stay_dropped_in_merged_conversations() {
+        // Only a turn_ended record with a non-blank string `error` becomes a
+        // synthetic row; blank and non-string errors stay dropped, and
+        // success turn_ended records never yield rows.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let db = root.join("globalStorage/state.vscdb");
+        write_composer_session(
+            &db,
+            "err-1",
+            &json!({"name": "Error edges", "fullConversationHeadersOnly": [{"bubbleId": "u1"}]}),
+            &[(
+                "u1",
+                json!({"type": 1, "text": "Question one", "timestamp": 1700000001000i64}),
+            )],
+        );
+        write_transcript(
+            root,
+            "proj-a",
+            "err-1",
+            &[
+                text_record("user", "Question one"),
+                json!({"type": "turn_ended", "status": "error", "error": "   "}),
+                json!({"type": "turn_ended", "status": "error", "error": 42}),
+                turn_ended("success"),
+            ],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(root)).unwrap();
+        assert_eq!(convs.len(), 1);
+        let c = &convs[0];
+        assert_eq!(c.messages.len(), 1);
+        assert_eq!(c.messages[0].content, "Question one");
+        assert_eq!(c.messages[0].created_at, Some(1700000001000i64));
+    }
+
+    #[test]
+    fn multi_file_transcript_sid_merges_once_with_all_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let db = root.join("globalStorage/state.vscdb");
+        write_composer_session(
+            &db,
+            "eps-7",
+            &json!({
+                "name": "Epsilon session",
+                "createdAt": 1700000000000i64,
+                "fullConversationHeadersOnly": [{"bubbleId": "u1"}, {"bubbleId": "u2"}],
+            }),
+            &[
+                (
+                    "u1",
+                    json!({"type": 1, "text": "Question alpha", "timestamp": 1700000001000i64}),
+                ),
+                (
+                    "u2",
+                    json!({"type": 1, "text": "Question beta", "timestamp": 1700000002000i64}),
+                ),
+            ],
+        );
+        let file_x = write_transcript(
+            root,
+            "proj-x",
+            "eps-7",
+            &[text_record("user", "Question alpha")],
+        );
+        let file_y = write_transcript(
+            root,
+            "proj-y",
+            "eps-7",
+            &[text_record("user", "Question beta")],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(root)).unwrap();
+        assert_eq!(
+            convs.len(),
+            1,
+            "all files of one sid merge into a single conversation"
+        );
+        let c = &convs[0];
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.messages[0].content, "Question alpha");
+        assert_eq!(c.messages[0].created_at, Some(1700000001000i64));
+        assert_eq!(c.messages[1].content, "Question beta");
+        assert_eq!(c.messages[1].created_at, Some(1700000002000i64));
+        assert_eq!(
+            c.metadata["cursor_transcript_path"],
+            json!([file_x.to_str().unwrap(), file_y.to_str().unwrap()])
+        );
+        assert_eq!(c.metadata["cursor_project_dir"], "proj-x");
+    }
+
+    // ------------------------------------------------------------------
+    // Freshness gate (§6.4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stale_db_with_fresh_transcript_merges_via_targeted_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Stale db first, then a clear sleep, then the transcripts: the db
+        // stays stale while both transcripts come back fresh, deterministically.
+        let db = root.join("globalStorage/state.vscdb");
+        write_composer_session(&db, "alpha-1", &canonical_composer(), &canonical_bubbles());
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        write_transcript(root, "proj-a", "alpha-1", &canonical_records());
+        // A second, transcript-only session that is also fresh.
+        write_transcript(
+            root,
+            "proj-b",
+            "beta-8",
+            &[text_record("user", "Beta eight question")],
+        );
+        let since = mtime_ms(&db) + 1001;
+        let convs = CursorConnector::new()
+            .scan(&ctx_since(root, since))
+            .unwrap();
+        assert_eq!(
+            convs.len(),
+            2,
+            "fresh transcript merges with the stale composer row; other fresh sid stays separate"
+        );
+        let merged = &convs[0];
+        assert_eq!(merged.external_id.as_deref(), Some("alpha-1"));
+        assert_eq!(merged.metadata["cursor_format"], "merged");
+        // Composer identity and donations prove the stale db was read.
+        assert_eq!(merged.source_path, db.join("alpha-1"));
+        assert_eq!(merged.title.as_deref(), Some("Login regression"));
+        assert_eq!(merged.messages[0].created_at, Some(1700000001000i64));
+        assert_eq!(merged.messages[5].author.as_deref(), Some("gpt-x"));
+        let other = &convs[1];
+        assert_eq!(other.external_id.as_deref(), Some("beta-8"));
+        assert_eq!(other.metadata["cursor_format"], "agent");
+        assert!(other.messages[0].created_at.is_none());
+    }
+
+    #[test]
+    fn fresh_db_with_stale_transcript_merges_and_skips_stale_only_sids() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Transcripts first (both will be stale), then the db (fresh): the db
+        // must be written after a sleep so its mtime is clearly newer.
+        write_transcript(
+            root,
+            "proj-c",
+            "beta-7",
+            &[text_record("user", "Beta seven question")],
+        );
+        let alpha_transcript = write_transcript(root, "proj-a", "alpha-1", &canonical_records());
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let db = root.join("globalStorage/state.vscdb");
+        // The conversation itself must pass the incremental cutoff: give it a
+        // lastUpdatedAt newer than the (stale) transcripts.
+        let mut composer = canonical_composer();
+        composer["lastUpdatedAt"] = json!(mtime_ms(&alpha_transcript) + 2000);
+        write_composer_session(&db, "alpha-1", &composer, &canonical_bubbles());
+        let since = mtime_ms(&alpha_transcript) + 1001;
+        let convs = CursorConnector::new()
+            .scan(&ctx_since(root, since))
+            .unwrap();
+        assert_eq!(
+            convs.len(),
+            1,
+            "fresh db parses stale transcripts for its sids; stale transcript-only sids stay silent"
+        );
+        let merged = &convs[0];
+        assert_eq!(merged.external_id.as_deref(), Some("alpha-1"));
+        assert_eq!(merged.metadata["cursor_format"], "merged");
+        // Transcript content made it in despite the stale mtime.
+        assert_eq!(
+            merged.messages[1].content,
+            "I will grep first\n[Tool: Grep - /src/login.rs]"
+        );
+        assert_eq!(merged.messages[0].created_at, Some(1700000001000i64));
+    }
+
+    #[test]
+    fn message_less_composer_row_does_not_block_a_later_db_in_targeted_lookup() {
+        // Cross-store resolution mirrors the full scan: a store whose row
+        // parses to no conversation does not block a later store from
+        // resolving the sid.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let global_db = root.join("globalStorage/state.vscdb");
+        fs::create_dir_all(global_db.parent().unwrap()).unwrap();
+        {
+            let conn = create_store(&global_db);
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params!["composerData:delta-4", r#"{"name": "Empty shell"}"#],
+            )
+            .unwrap();
+            drop(conn);
+        }
+        let w2_db = root.join("workspaceStorage/w2/state.vscdb");
+        write_composer_session(
+            &w2_db,
+            "delta-4",
+            &json!({"name": "Delta four", "fullConversationHeadersOnly": [{"bubbleId": "u1"}]}),
+            &[(
+                "u1",
+                json!({"type": 1, "text": "First pairing question", "timestamp": 1700000001000i64}),
+            )],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        write_transcript(
+            root,
+            "proj-d",
+            "delta-4",
+            &[text_record("user", "First pairing question")],
+        );
+        let since = mtime_ms(&global_db).max(mtime_ms(&w2_db)) + 1001;
+        let convs = CursorConnector::new()
+            .scan(&ctx_since(root, since))
+            .unwrap();
+        assert_eq!(convs.len(), 1);
+        let merged = &convs[0];
+        assert_eq!(merged.metadata["cursor_format"], "merged");
+        assert_eq!(merged.source_path, w2_db.join("delta-4"));
+        assert_eq!(merged.messages[0].created_at, Some(1700000001000i64));
+    }
+
+    #[test]
+    fn unopenable_stale_db_fails_scan_during_targeted_lookup() {
+        // F9 semantics for the lookup too: a store that cannot be read fails
+        // the scan instead of silently degrading to a transcript-only row —
+        // the same store would fail a full scan.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let global_db = root.join("globalStorage/state.vscdb");
+        fs::create_dir_all(global_db.parent().unwrap()).unwrap();
+        fs::write(&global_db, b"this is not a sqlite database at all").unwrap();
+        let w2_db = root.join("workspaceStorage/w2/state.vscdb");
+        write_composer_session(
+            &w2_db,
+            "delta-5",
+            &json!({"name": "Delta five", "fullConversationHeadersOnly": [{"bubbleId": "u1"}]}),
+            &[(
+                "u1",
+                json!({"type": 1, "text": "Second pairing question", "timestamp": 1700000001000i64}),
+            )],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        write_transcript(
+            root,
+            "proj-d",
+            "delta-5",
+            &[text_record("user", "Second pairing question")],
+        );
+        let since = mtime_ms(&global_db).max(mtime_ms(&w2_db)) + 1001;
+        let err = CursorConnector::new()
+            .scan(&ctx_since(root, since))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Cursor scan incomplete"),
+            "lookup failure must fail the scan, got: {err:#}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Unchanged shapes (regression pins)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn transcript_only_conversations_keep_todays_shape() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let beta2 = write_transcript(
+            root,
+            "proj-t",
+            "beta-2",
+            &[
+                text_record("user", "Beta only question"),
+                error_turn_ended("Beta model failed"),
+            ],
+        );
+        write_transcript(
+            root,
+            "proj-p",
+            "beta-3",
+            &[text_record("user", "Beta three left")],
+        );
+        write_transcript(
+            root,
+            "proj-q",
+            "beta-3",
+            &[text_record("user", "Beta three right")],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(root)).unwrap();
+        assert_eq!(convs.len(), 3);
+        // Error records never yield rows on the transcript-only path.
+        let b2 = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("beta-2"))
+            .unwrap();
+        assert_eq!(b2.source_path, beta2);
+        assert_eq!(b2.metadata["cursor_format"], "agent");
+        assert_eq!(b2.metadata["source"], "cursor");
+        assert_eq!(b2.messages.len(), 1);
+        assert_eq!(b2.messages[0].content, "Beta only question");
+        assert_eq!(b2.messages[0].extra, json!({}));
+        assert!(b2.messages[0].created_at.is_none());
+        // Same sid in two projects stays two conversations.
+        let b3s: Vec<_> = convs
+            .iter()
+            .filter(|c| c.external_id.as_deref() == Some("beta-3"))
+            .collect();
+        assert_eq!(b3s.len(), 2);
+        assert_eq!(b3s[0].metadata["cursor_format"], "agent");
+        assert_eq!(b3s[1].metadata["cursor_format"], "agent");
+    }
+
+    #[test]
+    fn composer_only_conversations_keep_todays_shape() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let db = root.join("globalStorage/state.vscdb");
+        write_composer_session(
+            &db,
+            "gamma-3",
+            &json!({"name": "Gamma only", "fullConversationHeadersOnly": [{"bubbleId": "u1"}]}),
+            &[(
+                "u1",
+                json!({"type": 1, "text": "Composer only question", "timestamp": 1700000001000i64}),
+            )],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(root)).unwrap();
+        assert_eq!(convs.len(), 1);
+        let c = &convs[0];
+        assert_eq!(c.external_id.as_deref(), Some("gamma-3"));
+        assert_eq!(c.source_path, db.join("gamma-3"));
+        assert!(
+            c.metadata.get("cursor_format").is_none(),
+            "no merge markers without a transcript"
+        );
+        assert!(c.metadata.get("cursor_merge_revision").is_none());
+        assert!(c.metadata.get("cursor_transcript_path").is_none());
+        assert_eq!(c.messages.len(), 1);
+        assert_eq!(c.messages[0].content, "Composer only question");
+        assert_eq!(c.messages[0].created_at, Some(1700000001000i64));
+        assert!(
+            c.messages[0]
+                .extra
+                .get("cursor_transcript_record")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn all_stale_sources_emit_nothing() {
+        let tmp = TempDir::new().unwrap();
+        canonical_fixture(tmp.path());
+        let convs = CursorConnector::new()
+            .scan(&ctx_since(tmp.path(), i64::MAX))
+            .unwrap();
         assert!(convs.is_empty());
     }
 }

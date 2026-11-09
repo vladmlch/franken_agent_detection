@@ -199,10 +199,7 @@ fn temp_dir_available_bytes() -> Result<u64, FrankenError> {
 /// the temp dir with less than the copy's own size free, is refused with a
 /// scan error and no copy at all. The user's files are never touched either
 /// way.
-fn open_snapshot_copy(
-    db_path: &Path,
-    _budget: &SnapshotBudget,
-) -> Result<Connection, FrankenError> {
+fn open_snapshot_copy(db_path: &Path, budget: &SnapshotBudget) -> Result<Connection, FrankenError> {
     let file_name = db_path.file_name().ok_or_else(|| {
         FrankenError::Internal(format!(
             "cannot snapshot a non-file SQLite path: {}",
@@ -219,6 +216,44 @@ fn open_snapshot_copy(
                 db_path.display()
             )));
         };
+        // F18: bound the copy before any file is copied. A crashed app can
+        // leave a huge store with an unusable WAL-index (the owner's Devin
+        // CLI store is a 27.6 GB db + ~98 MB `-wal`); copying it on every
+        // scan would fill the system temp dir, so an over-cap store is
+        // refused instead. The refusal names the store, its size, and the
+        // limit, and notes that the app's next start rebuilds the
+        // WAL-index — the same scan-error path every other unreadable
+        // store takes, so the scan reports it and keeps indexing the rest.
+        let wal_bytes = before_wal.map_or(0, |wal| wal.len);
+        let total_bytes = before_db.len + wal_bytes;
+        if total_bytes > budget.max_bytes {
+            let db_bytes = before_db.len;
+            let max_bytes = budget.max_bytes;
+            return Err(FrankenError::Internal(format!(
+                "the SQLite store {} is too large to read through a private snapshot copy \
+                 ({db_bytes} bytes db + {wal_bytes} bytes write-ahead log = {total_bytes} \
+                 bytes, over the {max_bytes}-byte snapshot limit): no copy is made and the \
+                 store's files are never modified; the app rebuilds the store's WAL-index \
+                 on its next start, so a later scan will read it",
+                db_path.display()
+            )));
+        }
+        // Under the cap, still refuse a copy that would leave the temp dir
+        // with less than the copy's own size free, so one scan cannot fill
+        // the disk up to the last byte. The boundary is exact: free space
+        // equal to twice the copy leaves exactly the copy's own size, which
+        // is not less, so it still copies.
+        let free_bytes = budget.free_bytes;
+        if free_bytes < total_bytes.saturating_mul(2) {
+            return Err(FrankenError::Internal(format!(
+                "too little free space in the temp dir to copy the SQLite store {} for a \
+                 read-only snapshot ({total_bytes} bytes to copy, {free_bytes} bytes \
+                 available: the copy would leave less than the copy's own size free): no \
+                 copy is made and the store's files are never modified; the app rebuilds \
+                 the store's WAL-index on its next start, so a later scan will read it",
+                db_path.display()
+            )));
+        }
         let snapshot = fresh_snapshot_dir()?;
         let copy_db = snapshot.dir.join(file_name);
         std::fs::copy(db_path, &copy_db)?;

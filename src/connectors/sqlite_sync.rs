@@ -39,6 +39,19 @@ thread_local! {
 /// dirs; `std::fs::create_dir` refuses an existing name.
 static SNAPSHOT_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// The largest db + `-wal` total the snapshot-copy fallback will copy into
+/// the temp dir (F18): 2 GiB.
+///
+/// A crashed app can leave a huge store with an unusable WAL-index (the
+/// owner's Devin CLI store is a 27.6 GB db + ~98 MB `-wal`); snapshotting
+/// such a store on every scan would copy tens of GiB into the system temp
+/// dir, so an over-cap store is refused with a scan error naming the store,
+/// its size, and this limit instead. There is deliberately no environment
+/// knob: the fallback must stay bounded for every store it meets, and an
+/// over-cap store reads normally again on the app's next start, which
+/// rebuilds its WAL-index.
+const SNAPSHOT_FALLBACK_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Drive a `!Send` fsqlite future to completion on the calling thread.
 fn drive<T>(future: impl Future<Output = T>) -> Result<T, FrankenError> {
     let runtime = match DRIVER.with(|slot| slot.borrow_mut().take()) {
@@ -143,6 +156,34 @@ fn fresh_snapshot_dir() -> Result<SnapshotDir, FrankenError> {
     ))
 }
 
+/// What one snapshot copy may consume (F18): the cap on the db + `-wal`
+/// total, and the free space the temp dir reported when the fallback
+/// engaged.
+///
+/// Production fills both from the real filesystem — `max_bytes` is
+/// [`SNAPSHOT_FALLBACK_MAX_BYTES`], `free_bytes` is the temp dir's
+/// available space — so the bounds hold with no configuration. Tests
+/// inject synthetic values instead: this is the seam that lets the
+/// refusal paths run against a few-KiB store rather than a 2 GiB
+/// fixture.
+struct SnapshotBudget {
+    max_bytes: u64,
+    free_bytes: u64,
+}
+
+/// Bytes an unprivileged process can still allocate in the system temp dir
+/// (statvfs `f_bavail`), for the snapshot-copy free-space check. The temp
+/// dir is where [`fresh_snapshot_dir`] puts every copy, so this is the
+/// space a copy would consume.
+fn temp_dir_available_bytes() -> Result<u64, FrankenError> {
+    fs4::available_space(std::env::temp_dir()).map_err(|error| {
+        FrankenError::Internal(format!(
+            "could not check the free space in the temp dir before snapshotting a SQLite \
+             store: {error}"
+        ))
+    })
+}
+
 /// Copy the main db file and its `-wal` (never its `-shm`) into a fresh
 /// private directory, then open the copy with WAL-index recovery allowed —
 /// on our copy rebuilding the wal-index is fine, unlike on the user's
@@ -152,7 +193,16 @@ fn fresh_snapshot_dir() -> Result<SnapshotDir, FrankenError> {
 /// `-wal` recorded before and re-checked after the copy, so a store the
 /// app is actively writing is retried once and then refused with a clear
 /// error instead of being read half-written.
-fn open_snapshot_copy(db_path: &Path) -> Result<Connection, FrankenError> {
+///
+/// `budget` bounds the copy (F18) before any file is copied: a store whose
+/// db + `-wal` total exceeds `budget.max_bytes`, or whose copy would leave
+/// the temp dir with less than the copy's own size free, is refused with a
+/// scan error and no copy at all. The user's files are never touched either
+/// way.
+fn open_snapshot_copy(
+    db_path: &Path,
+    _budget: &SnapshotBudget,
+) -> Result<Connection, FrankenError> {
     let file_name = db_path.file_name().ok_or_else(|| {
         FrankenError::Internal(format!(
             "cannot snapshot a non-file SQLite path: {}",
@@ -226,6 +276,15 @@ fn open_snapshot_copy(db_path: &Path) -> Result<Connection, FrankenError> {
 /// only the copy's own `-shm`), and the copy is removed when the connection
 /// drops.
 ///
+/// The copy is bounded (F18): a store whose db + `-wal` total exceeds
+/// [`SNAPSHOT_FALLBACK_MAX_BYTES`] (2 GiB, no environment knob), or whose
+/// copy would leave the temp dir with less than the copy's own size free,
+/// is refused before any copy with a scan error naming the store, its
+/// size, and the bound — the same error path any other unreadable store
+/// takes, so the scan reports it and keeps indexing the other stores. A
+/// refused store reads normally again on the app's next start, which
+/// rebuilds its WAL-index.
+///
 /// Any other open error — and a fallback that itself fails — is returned
 /// so the caller's scan surfaces it as an error instead of hiding it.
 pub fn open_read_only_with_snapshot_fallback(path: &str) -> Result<Connection, FrankenError> {
@@ -248,7 +307,11 @@ pub fn open_read_only_with_snapshot_fallback(path: &str) -> Result<Connection, F
                 "SQLite store has an unusable WAL-index for a read-only open; \
                  reading a private snapshot copy (the store's files are never modified)"
             );
-            open_snapshot_copy(db_path)
+            let budget = SnapshotBudget {
+                max_bytes: SNAPSHOT_FALLBACK_MAX_BYTES,
+                free_bytes: temp_dir_available_bytes()?,
+            };
+            open_snapshot_copy(db_path, &budget)
         }
         Err(error) => Err(error),
     }
@@ -783,6 +846,211 @@ mod tests {
         assert!(
             leaked_snapshot_dirs().is_empty(),
             "no snapshot copy may be taken for a non-WAL-index failure"
+        );
+    }
+
+    // cass F18 (2026-11-09): the snapshot-copy budget — size cap and
+    // free-space floor. `open_snapshot_copy` takes its budget as a
+    // parameter: production fills it from the real filesystem, tests
+    // inject synthetic values, so these refusal paths run against a
+    // few-KiB store instead of a 2 GiB fixture.
+
+    /// The db + `-wal` total of a fixture, summed exactly as the fallback
+    /// sums it for the budget checks.
+    fn store_total_bytes(db: &std::path::Path) -> u64 {
+        let wal_bytes = std::fs::metadata(sidecar(db, "-wal")).map_or(0, |meta| meta.len());
+        std::fs::metadata(db).expect("the fixture db exists").len() + wal_bytes
+    }
+
+    /// A store whose db + `-wal` total exceeds the budget's cap is refused
+    /// with the typed scan error naming the store, its size, and the cap,
+    /// and no temp copy is created. Production caps at
+    /// `SNAPSHOT_FALLBACK_MAX_BYTES`; this test injects a cap one byte
+    /// below the fixture's total so the fixture stays a few KiB. The
+    /// fixture keeps its crashed-app state (an unusable wal-index), which
+    /// is the only state that ever reaches the fallback, and the store's
+    /// files stay untouched.
+    #[serial]
+    #[test]
+    fn snapshot_fallback_refuses_a_store_over_the_size_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = wal_mode_store(dir.path());
+        damage_shm(&db, "garbage");
+        let before_trio = trio_state(&db);
+        let before_names = directory_names(&db);
+        let db_bytes = std::fs::metadata(&db).unwrap().len();
+        let wal_bytes = std::fs::metadata(sidecar(&db, "-wal")).map_or(0, |meta| meta.len());
+        let total_bytes = store_total_bytes(&db);
+        let cap = total_bytes - 1;
+        let budget = SnapshotBudget {
+            max_bytes: cap,
+            free_bytes: u64::MAX,
+        };
+
+        let Err(error) = open_snapshot_copy(&db, &budget) else {
+            panic!("an over-cap store must be refused instead of copied");
+        };
+        let FrankenError::Internal(message) = error else {
+            panic!("expected the typed Internal refusal, got {error:?}");
+        };
+        assert!(
+            message.contains(&db.display().to_string()),
+            "the refusal must name the store: {message}"
+        );
+        assert!(
+            message.contains(&format!("{db_bytes} bytes db")),
+            "the refusal must name the db size: {message}"
+        );
+        assert!(
+            message.contains(&format!("{wal_bytes} bytes write-ahead log")),
+            "the refusal must name the `-wal` size: {message}"
+        );
+        assert!(
+            message.contains(&format!("= {total_bytes} bytes")),
+            "the refusal must name the total size: {message}"
+        );
+        assert!(
+            message.contains(&format!("over the {cap}-byte")),
+            "the refusal must name the cap: {message}"
+        );
+        assert!(
+            message.contains("a later scan will read it"),
+            "the refusal must say the app's next start makes the store readable: {message}"
+        );
+        assert!(
+            leaked_snapshot_dirs().is_empty(),
+            "no temp copy may be created for an over-cap store"
+        );
+        assert_eq!(
+            trio_state(&db),
+            before_trio,
+            "a refused over-cap store must never be modified"
+        );
+        assert_eq!(
+            directory_names(&db),
+            before_names,
+            "a refused over-cap store must not gain any file"
+        );
+    }
+
+    /// A store under the cap with ample free space still falls back and
+    /// reads through the snapshot copy — the F9 behavior preserved under
+    /// the F18 budget — and the copy is removed when the connection drops.
+    #[serial]
+    #[test]
+    fn snapshot_fallback_reads_a_store_under_the_size_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = wal_mode_store(dir.path());
+        damage_shm(&db, "garbage");
+        let budget = SnapshotBudget {
+            max_bytes: SNAPSHOT_FALLBACK_MAX_BYTES,
+            free_bytes: u64::MAX,
+        };
+
+        let conn = open_snapshot_copy(&db, &budget)
+            .unwrap_or_else(|error| panic!("an under-cap store must fall back: {error:?}"));
+        assert!(
+            conn.used_snapshot_fallback(),
+            "an under-cap store reads through the snapshot copy"
+        );
+        let value: i64 = conn
+            .query_row_map("SELECT v FROM t", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(value, 7, "the store's rows must be readable");
+        let snapshot_dir = conn
+            .snapshot_dir()
+            .expect("a copy must exist")
+            .to_path_buf();
+        drop(conn);
+        assert!(
+            !snapshot_dir.exists(),
+            "the snapshot copy must be removed when the connection drops"
+        );
+        assert!(
+            leaked_snapshot_dirs().is_empty(),
+            "no snapshot copy may outlive its connection"
+        );
+    }
+
+    /// A store whose copy would leave the temp dir with less than the
+    /// copy's own size free is refused with the typed scan error saying so,
+    /// and no temp copy is created. The boundary is exact: `free_bytes`
+    /// equal to twice the copy still leaves the copy's own size free, so it
+    /// proceeds and reads; one byte less refuses.
+    #[serial]
+    #[test]
+    fn snapshot_fallback_refuses_a_store_with_too_little_free_space() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = wal_mode_store(dir.path());
+        damage_shm(&db, "garbage");
+        let before_trio = trio_state(&db);
+        let before_names = directory_names(&db);
+        let total_bytes = store_total_bytes(&db);
+
+        // The exact boundary still copies: exactly the copy's own size
+        // would remain free, which is not less than the copy's own size.
+        let boundary = SnapshotBudget {
+            max_bytes: SNAPSHOT_FALLBACK_MAX_BYTES,
+            free_bytes: total_bytes.saturating_mul(2),
+        };
+        let conn = open_snapshot_copy(&db, &boundary)
+            .unwrap_or_else(|error| panic!("the boundary must still copy: {error:?}"));
+        let value: i64 = conn
+            .query_row_map("SELECT v FROM t", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(value, 7);
+        drop(conn);
+        assert!(
+            leaked_snapshot_dirs().is_empty(),
+            "the boundary copy must be cleaned up before the refusal case"
+        );
+
+        // One byte less: the copy would leave less than the copy's own size
+        // free, so it is refused before any copy is made.
+        let free_bytes = total_bytes.saturating_mul(2) - 1;
+        let budget = SnapshotBudget {
+            max_bytes: SNAPSHOT_FALLBACK_MAX_BYTES,
+            free_bytes,
+        };
+        let Err(error) = open_snapshot_copy(&db, &budget) else {
+            panic!("a low-free-space store must be refused instead of copied");
+        };
+        let FrankenError::Internal(message) = error else {
+            panic!("expected the typed Internal refusal, got {error:?}");
+        };
+        assert!(
+            message.contains(&db.display().to_string()),
+            "the refusal must name the store: {message}"
+        );
+        assert!(
+            message.contains(&format!("{total_bytes} bytes to copy")),
+            "the refusal must name the copy size: {message}"
+        );
+        assert!(
+            message.contains(&format!("{free_bytes} bytes available")),
+            "the refusal must name the free space: {message}"
+        );
+        assert!(
+            message.contains("less than the copy"),
+            "the refusal must say the copy would leave too little free: {message}"
+        );
+        assert!(
+            message.contains("a later scan will read it"),
+            "the refusal must say the app's next start makes the store readable: {message}"
+        );
+        assert!(
+            leaked_snapshot_dirs().is_empty(),
+            "no temp copy may be created for a low-free-space store"
+        );
+        assert_eq!(
+            trio_state(&db),
+            before_trio,
+            "a refused low-free-space store must never be modified"
+        );
+        assert_eq!(
+            directory_names(&db),
+            before_names,
+            "a refused low-free-space store must not gain any file"
         );
     }
 

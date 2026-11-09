@@ -25,9 +25,11 @@
 //! array is accepted too. Image payloads never reach the indexed text — an
 //! `[image]` marker stands in for each one.
 //!
-//! Read-only: the store is opened `SQLITE_OPEN_READ_ONLY` with a busy timeout
-//! because the live CLI may hold it open. Devin's cloud sessions are not on
-//! disk and are out of scope here.
+//! Read-only: the store is opened through the F9 helper's strict never-write
+//! mode (`SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_STRICT_READ_ONLY`, with a busy
+//! timeout because the live CLI may hold it open), so no sidecar of the
+//! user's store is ever created or modified. Devin's cloud sessions are not
+//! on disk and are out of scope here.
 
 #![allow(clippy::doc_markdown, clippy::too_many_lines)]
 

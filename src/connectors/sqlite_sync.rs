@@ -206,20 +206,33 @@ fn open_snapshot_copy(db_path: &Path) -> Result<Connection, FrankenError> {
 /// connector does, and fall back to a private snapshot copy when the
 /// store's WAL-index is unusable (cass F9).
 ///
-/// A strict read-only open never performs WAL-index recovery, so when a
-/// `-wal` file exists — even at 0 bytes — and the `-shm` wal-index is
-/// absent, zeroed, empty, torn, or garbage (typical after the app crashed),
-/// the open fails with the typed [`FrankenError::BusyRecovery`]. The
-/// user's files are a personal archive and are never modified, not even
-/// the `-shm` sidecar. Instead the db and its `-wal` are copied into a
-/// private temporary directory (never the `-shm`), the copy is opened
-/// with WAL-index recovery allowed (it rebuilds only the copy's own
-/// `-shm`), and the copy is removed when the connection drops.
+/// The open uses the fork's never-write mode
+/// (`SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_STRICT_READ_ONLY`): the engine may
+/// not create or modify any sidecar of the store, so it never performs
+/// WAL-index recovery. When the `-shm` wal-index is absent, zeroed, empty,
+/// torn, or garbage (typical after the app crashed) and recovery would be
+/// needed to read — a `-wal` with committed frames, or any damaged `-shm`
+/// beside one — the open fails with the typed
+/// [`FrankenError::BusyRecovery`]. Registry fsqlite 0.4.13 instead rebuilds
+/// a never-initialized `-shm` in place on a plain read-only open (GH#528),
+/// which would touch the user's files; the strict bit keeps that from ever
+/// happening. One read stays available without any write: a header-less
+/// (0-byte) `-wal` with no `-shm` reads the main file directly, exactly
+/// like stock SQLite (GH#515), so a cleanly checkpointed store needs no
+/// snapshot. The user's files are a personal archive and are never
+/// modified, not even the `-shm` sidecar. When the open is refused, the db
+/// and its `-wal` are copied into a private temporary directory (never the
+/// `-shm`), the copy is opened with WAL-index recovery allowed (it rebuilds
+/// only the copy's own `-shm`), and the copy is removed when the connection
+/// drops.
 ///
 /// Any other open error — and a fallback that itself fails — is returned
 /// so the caller's scan surfaces it as an error instead of hiding it.
 pub fn open_read_only_with_snapshot_fallback(path: &str) -> Result<Connection, FrankenError> {
-    match open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+    match open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
+    ) {
         Ok(connection) => Ok(connection),
         Err(FrankenError::BusyRecovery) => {
             let db_path = Path::new(path);
@@ -290,10 +303,11 @@ pub fn store_is_provably_empty(db_path: &Path) -> bool {
     if !header_is_sqlite {
         return false;
     }
-    // A strict read-only open only (see above for why no snapshot fallback).
+    // A strict read-only open only (see above for why no snapshot fallback),
+    // so even this probe can never write a sidecar of the user's store.
     let Ok(connection) = open_with_flags(
         db_path.to_string_lossy().as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
     ) else {
         return false;
     };
@@ -573,22 +587,50 @@ mod tests {
             .collect()
     }
 
-    /// A strict read-only open never performs WAL-index recovery: with a
-    /// `-wal` file present and the `-shm` wal-index garbage or torn, the open
-    /// fails with the typed `BusyRecovery`. This is the premise the snapshot
-    /// fallback (cass F9) exists for. Engine versions differ on the
-    /// absent/zeroed/empty classes, but the torn/garbage classes fail the
-    /// strict open on every stack.
+    /// The names of every entry in the store's directory, for the
+    /// no-file-created assertion: a refused or strict open must not leave
+    /// any new sidecar (`-shm`, `-journal`, the MVCC companion, ...) behind.
+    fn directory_names(db: &std::path::Path) -> Vec<String> {
+        let dir = db.parent().expect("the store has a parent directory");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read the store's directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A strict read-only open never performs WAL-index recovery and never
+    /// writes any sidecar: with the `-shm` wal-index absent, garbage, torn,
+    /// zeroed, or empty, the open fails with the typed `BusyRecovery` and
+    /// the db / `-wal` / `-shm` bytes and mtimes are untouched, with no
+    /// file created next to the store. This is the premise the snapshot
+    /// fallback (cass F9) exists for. Registry fsqlite 0.4.13 rebuilds the
+    /// zeroed and empty classes in place on a *plain* read-only open
+    /// (GH#528); the strict bit refuses them instead, so the original files
+    /// survive every class byte- and mtime-identically. (`absent` refuses
+    /// too: this fixture's checkpoint leaves a valid 32-byte WAL header, and
+    /// a strict open never creates the missing `-shm`. The one no-write
+    /// read — a 0-byte header-less `-wal` with no `-shm`, GH#515 — is
+    /// covered by the engine's own keepers.)
     #[test]
     fn strict_read_only_open_refuses_an_unusable_wal_index() {
-        for state in ["garbage", "torn"] {
+        for state in ["garbage", "torn", "absent", "zeroed", "empty"] {
             let dir = tempfile::TempDir::new().unwrap();
             let db = wal_mode_store(dir.path());
             damage_shm(&db, state);
+            let before_trio = trio_state(&db);
+            let before_names = directory_names(&db);
 
             let Err(error) = open_with_flags(
                 db.to_string_lossy().as_ref(),
-                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
             ) else {
                 panic!("{state}: the strict open must refuse an unusable wal-index");
             };
@@ -596,6 +638,23 @@ mod tests {
                 matches!(error, FrankenError::BusyRecovery),
                 "{state}: expected the typed BusyRecovery, got {error:?}"
             );
+            assert_eq!(
+                trio_state(&db),
+                before_trio,
+                "{state}: a refused strict open must leave the db, `-wal`, and `-shm` \
+                 byte- and mtime-identical"
+            );
+            assert_eq!(
+                directory_names(&db),
+                before_names,
+                "{state}: a refused strict open must not create any file"
+            );
+            if state == "absent" {
+                assert!(
+                    !sidecar(&db, "-shm").exists(),
+                    "{state}: a refused strict open must not create the missing `-shm`"
+                );
+            }
         }
     }
 
@@ -604,12 +663,16 @@ mod tests {
     /// state and on every frankensqlite build:
     ///   * the store's rows are readable in every state;
     ///   * the fallback engages exactly when the strict read-only open
-    ///     refuses the store (engine builds differ on which
-    ///     never-initialized wal-index classes they rebuild in place);
+    ///     refuses the store (the fork's strict bit refuses every class
+    ///     this fixture can produce — `absent` included, since its
+    ///     checkpoint leaves a valid 32-byte WAL header that a strict open
+    ///     never builds an `-shm` for; engine builds without the strict bit
+    ///     may instead accept a never-initialized class and rebuild it in
+    ///     place, which is exactly what the fallback protects against);
     ///   * when it engages, the original db / `-wal` / `-shm` bytes and
-    ///     mtimes never change, no `-shm` is (re)created next to the
-    ///     original, the copy exists while the connection lives, and it is
-    ///     removed when the connection drops.
+    ///     mtimes never change, no new file appears next to the original,
+    ///     the copy exists while the connection lives, and it is removed
+    ///     when the connection drops.
     #[serial]
     #[test]
     fn snapshot_fallback_reads_the_store_and_cleans_up_after_itself() {
@@ -619,15 +682,19 @@ mod tests {
             damage_shm(&db, state);
 
             // Whether this engine's strict open refuses the damaged store.
-            // An engine that accepts it may rebuild the never-initialized
-            // `-shm` in place, so capture the originals only afterwards.
+            // The probe uses the strict bit, so on the fork every class
+            // that would need a WAL-index write is refused; an engine
+            // without it may accept a class and rebuild the
+            // never-initialized `-shm` in place, so capture the originals
+            // only afterwards.
             let strict = open_with_flags(
                 db.to_string_lossy().as_ref(),
-                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
             );
             let strict_refused = strict.is_err();
             drop(strict.ok());
             let before = trio_state(&db);
+            let before_names = directory_names(&db);
 
             let conn = open_read_only_with_snapshot_fallback(db.to_string_lossy().as_ref())
                 .unwrap_or_else(|error| panic!("{state}: fallback failed: {error:?}"));
@@ -662,6 +729,11 @@ mod tests {
                     before,
                     "{state}: the original db, `-wal`, and `-shm` must never be modified"
                 );
+                assert_eq!(
+                    directory_names(&db),
+                    before_names,
+                    "{state}: no new file may appear next to the original store"
+                );
                 if state == "absent" {
                     assert!(
                         !sidecar(&db, "-shm").exists(),
@@ -674,15 +746,16 @@ mod tests {
                     "{state}: no snapshot copy is taken when the strict open succeeds"
                 );
                 drop(conn);
-                // The db and `-wal` are never written by any read-only open.
-                let after = trio_state(&db);
+                // Nothing is ever written by a strict read-only open.
                 assert_eq!(
-                    after[0], before[0],
-                    "{state}: the db must never be modified"
+                    trio_state(&db),
+                    before,
+                    "{state}: the db, `-wal`, and `-shm` must never be modified"
                 );
                 assert_eq!(
-                    after[1], before[1],
-                    "{state}: the `-wal` must never be modified"
+                    directory_names(&db),
+                    before_names,
+                    "{state}: no new file may appear next to the original store"
                 );
             }
         }

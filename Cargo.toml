@@ -169,3 +169,40 @@ assert_is_empty = "allow"
 # reason. Applies to dependencies only, never this crate's own test code.
 [profile.dev.package."*"]
 opt-level = 1
+
+# cass F17 (2026-11-09): local-only redirect of the fsqlite family to the
+# fork that adds the strict read-only open mode (SQLITE_OPEN_STRICT_READ_ONLY,
+# `Connection::open_strict_read_only`, `compat::open_strict_read_only`), which
+# never creates or modifies any sidecar of a store it opens. Registry fsqlite
+# 0.4.13 rebuilds a never-initialized `-shm` in place on a plain read-only
+# open (GH#528), which touches the user's files; the fork refuses those
+# classes with the typed BusyRecovery instead, so the F9 snapshot fallback
+# engages again and the originals stay byte- and mtime-identical.
+#
+# Every family member the lockfile can resolve is listed: the fork's crates
+# depend on each other through the fork workspace, so patching only the
+# facade would mix the fork facade with registry siblings and fail to build.
+# This table affects only FAD's own standalone builds and tests; the cass
+# monorepo root ignores a member crate's patch table. The orchestrator will
+# repoint these path entries at the fork's pushed git revision.
+[patch.crates-io]
+fsqlite = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite" }
+fsqlite-ast = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-ast" }
+fsqlite-btree = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-btree" }
+fsqlite-core = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-core" }
+fsqlite-error = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-error" }
+fsqlite-ext-fts5 = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-ext-fts5" }
+fsqlite-ext-icu = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-ext-icu" }
+fsqlite-ext-json = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-ext-json" }
+fsqlite-ext-misc = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-ext-misc" }
+fsqlite-ext-rtree = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-ext-rtree" }
+fsqlite-func = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-func" }
+fsqlite-mvcc = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-mvcc" }
+fsqlite-observability = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-observability" }
+fsqlite-pager = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-pager" }
+fsqlite-parser = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-parser" }
+fsqlite-planner = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-planner" }
+fsqlite-types = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-types" }
+fsqlite-vdbe = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-vdbe" }
+fsqlite-vfs = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-vfs" }
+fsqlite-wal = { path = "/Volumes/SSD_1TB_M2/work/wt/fsq-0413-ro/crates/fsqlite-wal" }

@@ -238,6 +238,13 @@ pub struct ScanContext {
 
     /// Optional liveness tick for long pre-first-yield scans (cass#373 Variant A).
     pub progress_tick: Option<ScanProgressTick>,
+
+    /// Whether connectors may fall back to default stores resolved from the
+    /// ambient environment (`$HOME`/XDG) when explicit roots do not satisfy
+    /// them. Production keeps `true` (the issue #174 local-roots behavior);
+    /// hermetic test harnesses that must not touch the developer's real
+    /// agent stores opt out via [`ScanContext::without_local_default_stores`].
+    pub allow_local_default_stores: bool,
 }
 
 impl std::fmt::Debug for ScanContext {
@@ -249,6 +256,10 @@ impl std::fmt::Debug for ScanContext {
             .field(
                 "progress_tick",
                 &self.progress_tick.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "allow_local_default_stores",
+                &self.allow_local_default_stores,
             )
             .finish()
     }
@@ -263,6 +274,7 @@ impl ScanContext {
             scan_roots: Vec::new(),
             since_ts,
             progress_tick: None,
+            allow_local_default_stores: true,
         }
     }
 
@@ -278,7 +290,19 @@ impl ScanContext {
             scan_roots,
             since_ts,
             progress_tick: None,
+            allow_local_default_stores: true,
         }
+    }
+
+    /// Opt out of resolving default stores from the ambient `$HOME`/XDG
+    /// environment: connectors that consult this flag (opencode today)
+    /// never union their env-derived default stores into a scan or a
+    /// discovery pass. Hermetic test harnesses use this so in-process
+    /// tests can never read the developer's real agent stores.
+    #[must_use]
+    pub const fn without_local_default_stores(mut self) -> Self {
+        self.allow_local_default_stores = false;
+        self
     }
 
     /// Attach a liveness tick called periodically during long scans (cass#373).
@@ -757,6 +781,34 @@ mod tests {
         assert_eq!(root.path, PathBuf::from("/home/user/.claude"));
         assert!(root.origin.is_local());
         assert!(root.platform.is_none());
+    }
+
+    #[test]
+    fn scan_context_local_default_stores_default_on_and_opt_out_is_pure() {
+        let default = ScanContext::local_default(PathBuf::from("/data"), None);
+        assert!(default.allow_local_default_stores);
+        let with_roots = ScanContext::with_roots(
+            PathBuf::from("/data"),
+            vec![ScanRoot::local(PathBuf::from("/data/logs"))],
+            None,
+        );
+        assert!(with_roots.allow_local_default_stores);
+        assert!(!with_roots.use_default_detection());
+
+        // Opt-out flips only the flag: roots, data_dir and default-detection
+        // semantics are untouched, and the default contexts stay opted-in
+        // (the issue #174 production behavior).
+        let hermetic = with_roots.without_local_default_stores();
+        assert!(!hermetic.allow_local_default_stores);
+        assert_eq!(hermetic.data_dir, PathBuf::from("/data"));
+        assert_eq!(hermetic.scan_roots.len(), 1);
+        assert!(!hermetic.use_default_detection());
+        assert!(ScanContext::local_default(PathBuf::new(), None).use_default_detection());
+        assert!(
+            ScanContext::local_default(PathBuf::new(), None)
+                .without_local_default_stores()
+                .use_default_detection()
+        );
     }
 
     #[test]

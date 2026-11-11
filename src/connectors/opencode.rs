@@ -145,8 +145,12 @@ impl OpenCodeConnector {
     /// local sessions would be double-indexed under the remote `source_id`
     /// (cass#357). Vacuously true when `scan_roots` is empty, preserving
     /// default detection and the issue #174 local-explicit-root behavior.
+    /// A context that opted out via
+    /// [`ScanContext::without_local_default_stores`] never resolves
+    /// home/XDG stores at all — hermetic harnesses rely on this so no
+    /// in-process test can read the developer's real `~/.local/share/opencode`.
     fn allow_local_default_dbs(ctx: &ScanContext) -> bool {
-        ctx.scan_roots.iter().all(|root| root.origin.is_local())
+        ctx.allow_local_default_stores && ctx.scan_roots.iter().all(|root| root.origin.is_local())
     }
 
     /// All known locations where OpenCode may store its SQLite database,
@@ -323,8 +327,10 @@ impl OpenCodeConnector {
         if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
                 storage_roots.push(ScanRoot::local(ctx.data_dir.clone()));
-            } else if let Some(root) = Self::storage_root() {
-                storage_roots.push(ScanRoot::local(root));
+            } else if ctx.allow_local_default_stores {
+                if let Some(root) = Self::storage_root() {
+                    storage_roots.push(ScanRoot::local(root));
+                }
             }
         } else {
             if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
@@ -1408,8 +1414,10 @@ impl Connector for OpenCodeConnector {
         if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
                 storage_roots.push(ctx.data_dir.clone());
-            } else if let Some(root) = Self::storage_root() {
-                storage_roots.push(root);
+            } else if ctx.allow_local_default_stores {
+                if let Some(root) = Self::storage_root() {
+                    storage_roots.push(root);
+                }
             }
         } else {
             if ctx.data_dir.exists()
@@ -4965,6 +4973,45 @@ mod tests {
             !OpenCodeConnector::allow_local_default_dbs(&mixed_ctx),
             "any remote root disables the local-default fallback"
         );
+    }
+
+    /// Hermetic opt-out: a context built with
+    /// [`ScanContext::without_local_default_stores`] must never resolve
+    /// `$HOME`/XDG candidates — neither through the sqlite gate nor through
+    /// the default-detection `storage_root()` fallback. The conformance
+    /// harness relies on this so in-process tests can never read this
+    /// machine's real `~/.local/share/opencode` (or a planted probe store).
+    #[test]
+    fn hermetic_contexts_never_resolve_home_or_xdg_default_stores() {
+        let dir = TempDir::new().unwrap();
+
+        let local_ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        )
+        .without_local_default_stores();
+        assert!(!OpenCodeConnector::allow_local_default_dbs(&local_ctx));
+        for root in OpenCodeConnector::sqlite_source_roots(&local_ctx) {
+            assert!(
+                root.path.starts_with(dir.path()),
+                "hermetic local-roots context resolved a default store: {}",
+                root.path.display()
+            );
+        }
+        for root in OpenCodeConnector::storage_source_roots(&local_ctx) {
+            assert!(
+                root.path.starts_with(dir.path()),
+                "hermetic local-roots context resolved a default storage root: {}",
+                root.path.display()
+            );
+        }
+
+        let default_ctx =
+            ScanContext::local_default(PathBuf::new(), None).without_local_default_stores();
+        assert!(!OpenCodeConnector::allow_local_default_dbs(&default_ctx));
+        assert!(OpenCodeConnector::sqlite_source_roots(&default_ctx).is_empty());
+        assert!(OpenCodeConnector::storage_source_roots(&default_ctx).is_empty());
     }
 
     // =====================================================

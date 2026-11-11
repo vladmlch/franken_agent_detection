@@ -1130,6 +1130,7 @@ mod tests {
             scan_roots: vec![ScanRoot::local(root.to_path_buf())],
             since_ts: None,
             progress_tick: None,
+            allow_local_default_stores: true,
         }
     }
 

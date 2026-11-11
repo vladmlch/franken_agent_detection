@@ -20,8 +20,54 @@ mod conformance {
     use serde_json::json;
     use std::collections::HashSet;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    /// Hermeticity containment: true when `path` lies inside one of the
+    /// context's own scan roots or its data dir (raw or canonical form —
+    /// macOS `$TMPDIR` is a symlink to `/private/var` and connectors
+    /// canonicalize discovered paths). File-shaped roots (a SQLite db)
+    /// also own the recovery sidecars SQLite keeps next to the db file
+    /// (`-wal`/`-shm`/`-journal` siblings). Anything resolved from the
+    /// ambient `$HOME`/XDG environment — this machine's real agent stores,
+    /// or a planted probe store — falls outside these and must fail the
+    /// caller's assert.
+    fn path_within_ctx_roots(path: &Path, ctx: &ScanContext) -> bool {
+        let sqlite_sidecars = |db: &Path| {
+            ["-wal", "-shm", "-journal"].map(|suffix| {
+                let mut name = db.as_os_str().to_os_string();
+                name.push(suffix);
+                PathBuf::from(name)
+            })
+        };
+        ctx.scan_roots
+            .iter()
+            .map(|root| root.path.clone())
+            .chain([ctx.data_dir.clone()])
+            .any(|base| {
+                path.starts_with(&base)
+                    || sqlite_sidecars(&base).iter().any(|sidecar| sidecar == path)
+                    || fs::canonicalize(&base).is_ok_and(|canonical| {
+                        path.starts_with(&canonical)
+                            || sqlite_sidecars(&canonical)
+                                .iter()
+                                .any(|sidecar| sidecar == path)
+                    })
+            })
+    }
+
+    /// Hermetic scan context for this harness: explicit roots with the
+    /// local default-store fallback opted out
+    /// ([`ScanContext::without_local_default_stores`]), so no test in this
+    /// module can resolve — let alone read — stores under the real
+    /// `$HOME`/XDG environment of the machine running the suite.
+    fn hermetic_ctx(
+        data_dir: PathBuf,
+        scan_roots: Vec<ScanRoot>,
+        since_ts: Option<i64>,
+    ) -> ScanContext {
+        ScanContext::with_roots(data_dir, scan_roots, since_ts).without_local_default_stores()
+    }
 
     // =========================================================================
     // Contract 1: Timestamp Parsing Conformance
@@ -395,8 +441,7 @@ mod conformance {
                 .find(|(slug, _)| *slug == "devin")
                 .expect("Devin factory must be registered");
             let connector = factory();
-            let context =
-                ScanContext::with_roots(retained, vec![ScanRoot::local(database.clone())], None);
+            let context = hermetic_ctx(retained, vec![ScanRoot::local(database.clone())], None);
             let conversations = connector.scan(&context).expect("scan Devin fixture");
             assert_eq!(
                 conversations.len(),
@@ -443,7 +488,7 @@ mod conformance {
             for (slug, factory) in factories {
                 let connector = factory();
                 let root = ScanRoot::local(temp.path().join(slug));
-                let ctx = ScanContext::with_roots(
+                let ctx = hermetic_ctx(
                     temp.path().to_path_buf(),
                     vec![root],
                     Some(1_700_000_000_000),
@@ -453,6 +498,14 @@ mod conformance {
                     .unwrap_or_else(|err| panic!("connector {slug} discovery failed: {err}")); // ubs:ignore[rust.ownership.panic-macro] — Fail conformance with the connector identity on discovery error.
 
                 for source in sources {
+                    // Hermeticity pin: with explicit scan roots, no connector
+                    // may resolve additional default stores from the ambient
+                    // $HOME/XDG environment.
+                    assert!(
+                        path_within_ctx_roots(&source.source_path, &ctx),
+                        "connector {slug} discovered a source outside its scan roots: {}",
+                        source.source_path.display()
+                    );
                     // Known divergence: the claude connector's own emitted
                     // identity is "claude_code" while its registry slug is
                     // "claude" (public API; alignment is a tracked decision).
@@ -661,7 +714,7 @@ mod conformance {
                     "checked-in fixture store missing: {}",
                     root.display()
                 );
-                let ctx = ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root)], None);
+                let ctx = hermetic_ctx(root.clone(), vec![ScanRoot::local(root)], None);
 
                 let matched = get_connector_factories()
                     .into_iter()
@@ -1110,7 +1163,7 @@ mod conformance {
                              INSERT INTO message_nodes VALUES (1, 's1', NULL, '{\"role\":\"user\",\"content\":\"Hello Devin\"}', 1700000000);",
                         )
                         .expect("populate Devin db");
-                        return Some(ScanContext::with_roots(
+                        return Some(hermetic_ctx(
                             base.to_path_buf(),
                             vec![ScanRoot::local(db_path)],
                             None,
@@ -1188,7 +1241,7 @@ mod conformance {
                 }
                 other => panic!("no schema conformance fixture defined for connector {other}"), // ubs:ignore[rust.ownership.panic-macro] — Fail fast if a new connector factory is added without a schema conformance fixture.
             };
-            Some(ScanContext::with_roots(
+            Some(hermetic_ctx(
                 root.clone(),
                 vec![ScanRoot::local(root)],
                 None,
@@ -1204,7 +1257,7 @@ mod conformance {
                 let tmp = TempDir::new().expect("create temp dir for connector fixture");
                 let Some(ctx) = build_connector_fixture_context(slug, tmp.path()) else {
                     // Detection-only build slice (e.g. `devin` without `feature = "devin"`).
-                    let empty_ctx = ScanContext::with_roots(
+                    let empty_ctx = hermetic_ctx(
                         tmp.path().to_path_buf(),
                         vec![ScanRoot::local(tmp.path().to_path_buf())],
                         None,
@@ -1233,6 +1286,17 @@ mod conformance {
                     !convs.is_empty(),
                     "{slug}: schema conformance fixture yielded no conversations"
                 );
+                // Hermeticity pin: no conversation may resolve from outside
+                // the context's own scan roots — default stores under the
+                // ambient $HOME/XDG environment (this machine's real agent
+                // stores, or a planted probe store) must never leak in.
+                for conv in &convs {
+                    assert!(
+                        path_within_ctx_roots(&conv.source_path, &ctx),
+                        "{slug}: hermetic scan resolved a conversation outside its scan roots: {}",
+                        conv.source_path.display()
+                    );
+                }
                 assert!(
                     ticks.load(Ordering::Relaxed) >= 1,
                     "{slug}: scan did not invoke ctx.progress_tick at least once"
@@ -1259,6 +1323,11 @@ mod conformance {
                     slug
                 };
                 for source in &discovered {
+                    assert!(
+                        path_within_ctx_roots(&source.source_path, &ctx),
+                        "{slug}: hermetic discovery resolved a source outside its scan roots: {}",
+                        source.source_path.display()
+                    );
                     assert_eq!(
                         source.provider_slug, expected_provider,
                         "{slug}: discovered source reported unexpected provider_slug"
@@ -1408,11 +1477,8 @@ mod conformance {
                         .cloned()
                         .map(|r| r.with_rewrite(orig_ws, "/conformance-rewritten-workspace"))
                         .collect();
-                    let rewrite_ctx = ScanContext::with_roots(
-                        ctx.data_dir.clone(),
-                        rewritten_roots,
-                        ctx.since_ts,
-                    );
+                    let rewrite_ctx =
+                        hermetic_ctx(ctx.data_dir.clone(), rewritten_roots, ctx.since_ts);
                     let rewritten_convs = factory().scan(&rewrite_ctx).unwrap_or_else(|err| {
                         // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and rewrite scan error in conformance test.
                         panic!("{slug}: workspace rewrite conformance scan failed: {err}")
@@ -1452,11 +1518,8 @@ mod conformance {
                             )
                         })
                         .collect();
-                    let agent_rewrite_ctx = ScanContext::with_roots(
-                        ctx.data_dir.clone(),
-                        agent_scoped_roots,
-                        ctx.since_ts,
-                    );
+                    let agent_rewrite_ctx =
+                        hermetic_ctx(ctx.data_dir.clone(), agent_scoped_roots, ctx.since_ts);
                     let agent_rewritten_convs =
                         factory().scan(&agent_rewrite_ctx).unwrap_or_else(|err| {
                             // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and agent-scoped rewrite scan error in conformance test.
@@ -1947,7 +2010,7 @@ mod conformance {
                 crate::types::Origin::remote("conformance"),
                 None,
             )];
-            let ctx = ScanContext::with_roots(nonexistent, roots, None);
+            let ctx = hermetic_ctx(nonexistent, roots, None);
 
             for (slug, factory) in get_connector_factories() {
                 let connector = factory();
@@ -1978,7 +2041,7 @@ mod conformance {
                 crate::types::Origin::remote("conformance"),
                 None,
             )];
-            let ctx = ScanContext::with_roots(tmp_path, roots, None);
+            let ctx = hermetic_ctx(tmp_path, roots, None);
 
             for (slug, factory) in get_connector_factories() {
                 let connector = factory();
@@ -2008,7 +2071,7 @@ mod conformance {
             }
 
             let roots = vec![ScanRoot::local(system_path.clone())];
-            let ctx = ScanContext::with_roots(system_path, roots, None);
+            let ctx = hermetic_ctx(system_path, roots, None);
 
             for (_slug, factory) in get_connector_factories() {
                 let connector = factory();
@@ -2191,11 +2254,7 @@ mod conformance {
                 );
 
                 let connector = connector_for(case.factory_slug);
-                let ctx = ScanContext::with_roots(
-                    store_root.clone(),
-                    vec![ScanRoot::local(store_root)],
-                    None,
-                );
+                let ctx = hermetic_ctx(store_root.clone(), vec![ScanRoot::local(store_root)], None);
                 let discovered = connector
                     .discover_source_files(&ctx)
                     .expect("discover_source_files");
@@ -2233,7 +2292,7 @@ mod conformance {
                 fs::write(&local_file, case.payload).expect("write local fixture");
 
                 let connector = connector_for(case.factory_slug);
-                let local_ctx = ScanContext::with_roots(
+                let local_ctx = hermetic_ctx(
                     local_store.clone(),
                     vec![ScanRoot::local(local_store)],
                     None,
@@ -2266,7 +2325,7 @@ mod conformance {
                 let remote_origin = Origin::remote("mirror-host");
                 let remote_root = ScanRoot::remote(container.clone(), remote_origin.clone(), None)
                     .with_mirrored_source_path(case.tilde_source);
-                let remote_ctx = ScanContext::with_roots(container, vec![remote_root], None);
+                let remote_ctx = hermetic_ctx(container, vec![remote_root], None);
 
                 let remote_discovered = connector
                     .discover_source_files(&remote_ctx)
@@ -2316,8 +2375,7 @@ mod conformance {
                 let contents_root =
                     ScanRoot::remote(contents_container.clone(), remote_origin, None)
                         .with_mirrored_source_path(trailing_source);
-                let contents_ctx =
-                    ScanContext::with_roots(contents_container, vec![contents_root], None);
+                let contents_ctx = hermetic_ctx(contents_container, vec![contents_root], None);
                 let contents_convs = connector.scan(&contents_ctx).expect("contents scan");
                 assert_eq!(
                     contents_convs.len(),

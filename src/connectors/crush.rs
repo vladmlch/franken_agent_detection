@@ -32,6 +32,17 @@ use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
 };
 
+/// The `-wal`/`-shm` sibling of a store file (`crush.db` ->
+/// `crush.db-wal`). A live store's truth spans the whole bundle, and a
+/// WAL-only commit never touches the primary file.
+fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
+    let mut name = db
+        .file_name()
+        .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+    name.push_str(suffix);
+    db.with_file_name(name)
+}
+
 pub struct CrushConnector;
 
 impl Default for CrushConnector {
@@ -182,15 +193,38 @@ impl CrushConnector {
         Ok(Self::source_roots(ctx)
             .into_iter()
             .filter(|root| root.path.exists() && !path_is_excluded(&root.path, &excluded_paths))
-            .map(|root| {
-                DiscoveredSourceFile::new(
-                    "crush",
-                    &root,
-                    root.path.clone(),
-                    DiscoveredSourceRole::SqliteDatabase,
-                    true,
-                )
-                .with_fs_metadata()
+            .flat_map(|root| {
+                let mut sources = vec![
+                    DiscoveredSourceFile::new(
+                        "crush",
+                        &root,
+                        root.path.clone(),
+                        DiscoveredSourceRole::SqliteDatabase,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                ];
+                // A live store's truth spans the db and its -wal (+ -shm): a
+                // WAL-only commit leaves the primary file's size and mtime
+                // untouched, so the sidecars observed here are the reuse
+                // evidence that still sees it — the same discovery contract
+                // the shelley connector keeps for its SQLite stores.
+                for (suffix, required_for_reconstruction) in [("-wal", true), ("-shm", false)] {
+                    let sidecar = sidecar_path(&root.path, suffix);
+                    if sidecar.is_file() {
+                        sources.push(
+                            DiscoveredSourceFile::new(
+                                "crush",
+                                &root,
+                                sidecar,
+                                DiscoveredSourceRole::MetadataSidecar,
+                                required_for_reconstruction,
+                            )
+                            .with_fs_metadata(),
+                        );
+                    }
+                }
+                sources
             })
             .collect())
     }
@@ -235,6 +269,12 @@ impl Connector for CrushConnector {
         let mut failures = super::checked_scan::ScanFailures::new("Crush");
 
         for source in sources {
+            // Discovery lists the store's -wal/-shm sidecars so the host's
+            // reuse evidence covers WAL-only commits; they are reconstruction
+            // inputs, not scannable sources.
+            if source.role != DiscoveredSourceRole::SqliteDatabase {
+                continue;
+            }
             if !hooks.should_scan(&source) {
                 continue;
             }
@@ -242,6 +282,18 @@ impl Connector for CrushConnector {
             if super::checked_scan::skip_provably_empty_store("Crush", &source.source_path) {
                 continue;
             }
+            // A WAL-only commit (how the live CLI appends a turn) appends
+            // frames to the -wal without touching the primary file, so the
+            // -wal observed here — built exactly like discovery — is the
+            // completion evidence that must invalidate a future skip.
+            let wal = sidecar_path(&source.source_path, "-wal");
+            let wal_discovered = wal.is_file().then(|| {
+                let mut sidecar = source.clone();
+                sidecar.source_path = wal;
+                sidecar.role = DiscoveredSourceRole::MetadataSidecar;
+                sidecar.required_for_reconstruction = true;
+                sidecar.with_fs_metadata()
+            });
             match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
                 Ok(db_convs) => {
                     tracing::debug!(
@@ -258,10 +310,14 @@ impl Connector for CrushConnector {
                             conversations_emitted += 1;
                         }
                     }
-                    if conversations_emitted > 0 && !source.fs_metadata_changed() {
+                    let changed = source.fs_metadata_changed()
+                        || wal_discovered
+                            .as_ref()
+                            .is_some_and(DiscoveredSourceFile::fs_metadata_changed);
+                    if conversations_emitted > 0 && !changed {
                         hooks.complete(&SourceCompletion {
                             source,
-                            required_sidecars: Vec::new(),
+                            required_sidecars: wal_discovered.into_iter().collect(),
                             conversations_emitted,
                         })?;
                     }
@@ -712,6 +768,287 @@ mod tests {
                 .and_then(|v| v.get("command"))
                 .and_then(serde_json::Value::as_str),
             Some("cargo check")
+        );
+    }
+
+    fn open_test_connection(path: &Path) -> crate::connectors::sqlite_sync::Connection {
+        crate::connectors::sqlite_sync::Connection::open(path.to_string_lossy().as_ref()).unwrap()
+    }
+
+    fn create_crush_schema(conn: &crate::connectors::sqlite_sync::Connection) {
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                cost REAL
+            );
+            CREATE TABLE messages (
+                session_id TEXT,
+                role TEXT,
+                parts TEXT,
+                created_at INTEGER,
+                model TEXT,
+                provider TEXT
+            );",
+        )
+        .unwrap();
+    }
+
+    /// One committed session (one user turn) in the store's own schema.
+    fn insert_crush_turn(
+        conn: &crate::connectors::sqlite_sync::Connection,
+        session_id: &str,
+        text: &str,
+        created_at: i64,
+    ) {
+        conn.execute_compat(
+            "INSERT INTO sessions (id, title, prompt_tokens, completion_tokens, cost) \
+             VALUES (?, ?, ?, ?, ?)",
+            params![session_id, "Crush turn", 1_i64, 2_i64, 0.01_f64],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO messages (session_id, role, parts, created_at, model, provider) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                session_id,
+                "user",
+                format!(r#"[{{"type":"text","text":"{text}"}}]"#),
+                created_at,
+                "crush-model",
+                "crush"
+            ],
+        )
+        .unwrap();
+    }
+
+    /// A planted store plus a live WAL writer holding one WAL-only commit
+    /// (the live-CLI shape: the CLI appends a turn while holding the store
+    /// with autocheckpoint off, so only the `-wal` changes).
+    fn plant_store_with_live_wal(
+        dir: &Path,
+    ) -> (PathBuf, crate::connectors::sqlite_sync::Connection) {
+        let db_path = dir.join("crush.db");
+        let conn = open_test_connection(&db_path);
+        create_crush_schema(&conn);
+        insert_crush_turn(
+            &conn,
+            "seed-turn",
+            "committed before the CLI held the store",
+            1_733_000_000_000_i64,
+        );
+        drop(conn);
+
+        let writer = open_test_connection(&db_path);
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
+        insert_crush_turn(
+            &writer,
+            "live-turn",
+            "appended while the CLI holds the store",
+            1_733_000_100_000_i64,
+        );
+        assert!(
+            sidecar_path(&db_path, "-wal").is_file(),
+            "fixture must hold a live WAL"
+        );
+        (db_path, writer)
+    }
+
+    /// Discovery must list the whole live store bundle (the shelley
+    /// contract): the database plus each present engine sidecar — a
+    /// WAL-only commit is visible only through the `-wal` row.
+    #[test]
+    fn source_boundary_discovery_lists_the_store_bundle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db_path, writer) = plant_store_with_live_wal(dir.path());
+        let wal_path = sidecar_path(&db_path, "-wal");
+        let shm_path = sidecar_path(&db_path, "-shm");
+
+        let connector = CrushConnector::new();
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass-data"),
+            vec![ScanRoot::local(db_path.clone())],
+            None,
+        );
+        let sources = connector.discover_source_files(&ctx).unwrap();
+        let expected = 1 + usize::from(wal_path.is_file()) + usize::from(shm_path.is_file());
+        assert_eq!(
+            sources.len(),
+            expected,
+            "discovery lists the database plus each present sidecar"
+        );
+        assert_eq!(sources[0].source_path, db_path);
+        assert_eq!(sources[0].role, DiscoveredSourceRole::SqliteDatabase);
+        let wal = sources
+            .iter()
+            .find(|source| source.source_path == wal_path)
+            .expect("discovery must list the live -wal");
+        assert_eq!(wal.role, DiscoveredSourceRole::MetadataSidecar);
+        assert!(wal.required_for_reconstruction);
+        assert_eq!(wal.origin, sources[0].origin);
+        assert_eq!(wal.scan_root, sources[0].scan_root);
+        if shm_path.is_file() {
+            let shm = sources
+                .iter()
+                .find(|source| source.source_path == shm_path)
+                .expect("present SHM sidecar must be discovered");
+            assert_eq!(shm.role, DiscoveredSourceRole::MetadataSidecar);
+            assert!(!shm.required_for_reconstruction);
+        }
+
+        // A clean close folds the WAL back into the database; whether the
+        // engine also removes the sidecar files is its business (this
+        // engine may leave them behind, as shelley's discovery test
+        // documents) — discovery must follow whatever is on disk
+        // (checkpoint/delete coverage).
+        drop(writer);
+        let sources = connector.discover_source_files(&ctx).unwrap();
+        let expected = 1 + usize::from(wal_path.is_file()) + usize::from(shm_path.is_file());
+        assert_eq!(
+            sources.len(),
+            expected,
+            "discovery follows the store bundle's on-disk presence after close"
+        );
+        assert_eq!(sources[0].source_path, db_path);
+        assert_eq!(sources[0].role, DiscoveredSourceRole::SqliteDatabase);
+    }
+
+    /// A WAL-only commit — how the live CLI appends a turn while holding
+    /// the store open — leaves the primary file's size and mtime untouched,
+    /// so a completion whose reuse evidence names only the primary
+    /// authorizes the host's ledger to skip the store and the appended
+    /// turn never reaches the index (the devin WAL bug class, found by the
+    /// cass durable-source ledger). The completion must carry the `-wal`,
+    /// exactly like the shelley connector's stores.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn source_boundary_completion_carries_the_live_wal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db_path, writer) = plant_store_with_live_wal(dir.path());
+        let wal_path = sidecar_path(&db_path, "-wal");
+
+        let connector = CrushConnector::new();
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass-data"),
+            vec![ScanRoot::local(db_path.clone())],
+            None,
+        );
+
+        // Strict read-only: the boundary scan must never create or write
+        // any sidecar of the store it reads.
+        let db_before = std::fs::read(&db_path).unwrap();
+        let wal_before = std::fs::read(&wal_path).unwrap();
+
+        let mut completions: Vec<SourceCompletion> = Vec::new();
+        let mut emitted = 0usize;
+        {
+            let mut on_complete = |completion: &SourceCompletion| {
+                completions.push(completion.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    emitted += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        // Both the seeded conversation and the WAL-only turn are readable
+        // through the strict read-only open while the writer still holds
+        // the store.
+        assert_eq!(emitted, 2, "the WAL-only turn must be scanned");
+        assert_eq!(completions.len(), 1, "one store => one completion");
+        let completion = &completions[0];
+        assert_eq!(completion.source.role, DiscoveredSourceRole::SqliteDatabase);
+        assert_eq!(completion.source.source_path, db_path);
+        assert_eq!(
+            completion.required_sidecars.len(),
+            1,
+            "the -wal is the reuse evidence a WAL-only commit invalidates"
+        );
+        let wal = &completion.required_sidecars[0];
+        assert_eq!(wal.source_path, wal_path);
+        assert_eq!(wal.role, DiscoveredSourceRole::MetadataSidecar);
+        assert!(wal.required_for_reconstruction);
+        assert_eq!(wal.origin, completion.source.origin);
+        assert_eq!(wal.scan_root, completion.source.scan_root);
+
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            db_before,
+            "reader must not mutate the store"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).unwrap(),
+            wal_before,
+            "reader must not mutate the WAL"
+        );
+
+        // Truncate coverage: the engine's own TRUNCATE checkpoint folds the
+        // frames into the database and resets the `-wal` (to zero, or to a
+        // header-only file) — the observed sidecar evidence must change
+        // with it and keep matching the on-disk truth.
+        writer
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        let wal_len_after = std::fs::metadata(&wal_path).unwrap().len();
+        assert_ne!(
+            wal_len_after,
+            wal_before.len() as u64,
+            "a TRUNCATE checkpoint resets the wal"
+        );
+        let sources = connector.discover_source_files(&ctx).unwrap();
+        let wal_row = sources
+            .iter()
+            .find(|source| source.source_path == wal_path)
+            .expect("a reset wal is still present evidence");
+        assert_eq!(
+            wal_row.size_bytes,
+            Some(wal_len_after),
+            "the observed wal size must follow the on-disk wal"
+        );
+
+        // Delete coverage: a clean close folds the WAL into the database and
+        // the `-wal` must drop out of the completion's reuse evidence.
+        // This engine may leave a dead header-only file behind after close
+        // (shelley's discovery test documents the same), so clear any
+        // leftover sidecars: the store is fully checkpointed and closed,
+        // which is the clean-close shape being modeled.
+        drop(writer);
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(sidecar_path(&db_path, "-shm"));
+        let mut completions_after: Vec<SourceCompletion> = Vec::new();
+        let mut emitted_after = 0usize;
+        {
+            let mut on_complete = |completion: &SourceCompletion| {
+                completions_after.push(completion.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    emitted_after += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(emitted_after, 2, "the checkpointed turn is now in the db");
+        assert_eq!(completions_after.len(), 1);
+        assert!(
+            completions_after[0].required_sidecars.is_empty(),
+            "no wal on disk => no sidecar evidence"
         );
     }
 }

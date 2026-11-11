@@ -84,6 +84,18 @@ const MAX_CHAIN_DEPTH: usize = 50_000;
 #[cfg(feature = "devin")]
 const MAX_TOOL_ARGUMENTS_BYTES: usize = 32 * 1024;
 
+/// The `-wal`/`-shm` sibling of a store file (`sessions.db` ->
+/// `sessions.db-wal`). A live store's truth spans the whole bundle, and a
+/// WAL-only commit never touches the primary file.
+#[cfg(feature = "devin")]
+fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
+    let mut name = db
+        .file_name()
+        .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+    name.push_str(suffix);
+    db.with_file_name(name)
+}
+
 pub struct DevinConnector;
 
 impl Default for DevinConnector {
@@ -176,15 +188,38 @@ impl DevinConnector {
                 !path_is_excluded(&root.path, &excluded_paths)
                     && !path_is_excluded(db, &excluded_paths)
             })
-            .map(|(root, db)| {
-                DiscoveredSourceFile::new(
-                    "devin",
-                    &root,
-                    db,
-                    DiscoveredSourceRole::SqliteDatabase,
-                    true,
-                )
-                .with_fs_metadata()
+            .flat_map(|(root, db)| {
+                let mut sources = vec![
+                    DiscoveredSourceFile::new(
+                        "devin",
+                        &root,
+                        db.clone(),
+                        DiscoveredSourceRole::SqliteDatabase,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                ];
+                // A live store's truth spans the db and its -wal (+ -shm): a
+                // WAL-only commit leaves the primary file's size and mtime
+                // untouched, so the sidecars observed here are the reuse
+                // evidence that still sees it — the same discovery contract
+                // the shelley connector keeps for its SQLite stores.
+                for (suffix, required_for_reconstruction) in [("-wal", true), ("-shm", false)] {
+                    let sidecar = sidecar_path(&db, suffix);
+                    if sidecar.is_file() {
+                        sources.push(
+                            DiscoveredSourceFile::new(
+                                "devin",
+                                &root,
+                                sidecar,
+                                DiscoveredSourceRole::MetadataSidecar,
+                                required_for_reconstruction,
+                            )
+                            .with_fs_metadata(),
+                        );
+                    }
+                }
+                sources
             })
             .collect())
     }
@@ -643,6 +678,12 @@ impl Connector for DevinConnector {
         // Local fix (cass review 2026-11-02, F5): failures reach the host.
         let mut failures = checked_scan::ScanFailures::new();
         for source in sources {
+            // Discovery lists the store's -wal/-shm sidecars so the host's
+            // reuse evidence covers WAL-only commits; they are reconstruction
+            // inputs, not scannable sources.
+            if source.role != DiscoveredSourceRole::SqliteDatabase {
+                continue;
+            }
             if !hooks.should_scan(&source) {
                 continue;
             }
@@ -654,6 +695,18 @@ impl Connector for DevinConnector {
                 continue;
             }
             ctx.tick();
+            // A WAL-only commit (how the live CLI appends a turn) appends
+            // frames to the -wal without touching the primary file, so the
+            // -wal observed here — built exactly like discovery — is the
+            // completion evidence that must invalidate a future skip.
+            let wal = sidecar_path(&source.source_path, "-wal");
+            let wal_discovered = wal.is_file().then(|| {
+                let mut sidecar = source.clone();
+                sidecar.source_path = wal;
+                sidecar.role = DiscoveredSourceRole::MetadataSidecar;
+                sidecar.required_for_reconstruction = true;
+                sidecar.with_fs_metadata()
+            });
             match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
                 Ok(found) => {
                     tracing::debug!(
@@ -667,10 +720,14 @@ impl Connector for DevinConnector {
                         on_conversation(conv)?;
                         conversations_emitted += 1;
                     }
-                    if conversations_emitted > 0 && !source.fs_metadata_changed() {
+                    let changed = source.fs_metadata_changed()
+                        || wal_discovered
+                            .as_ref()
+                            .is_some_and(DiscoveredSourceFile::fs_metadata_changed);
+                    if conversations_emitted > 0 && !changed {
                         hooks.complete(&SourceCompletion {
                             source,
-                            required_sidecars: Vec::new(),
+                            required_sidecars: wal_discovered.into_iter().collect(),
                             conversations_emitted,
                         })?;
                     }
@@ -1168,10 +1225,32 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         let sources = connector.discover_source_files(&ctx).unwrap();
-        assert_eq!(sources.len(), 1);
+        // The store's truth spans the db plus any -wal/-shm the engine left
+        // behind, so discovery lists the whole bundle (the shelley contract):
+        // the database first, then each present sidecar with its role.
+        let wal_path = sidecar_path(&db_path, "-wal");
+        let shm_path = sidecar_path(&db_path, "-shm");
+        let expected = 1 + usize::from(wal_path.is_file()) + usize::from(shm_path.is_file());
+        assert_eq!(sources.len(), expected);
         assert_eq!(sources[0].source_path, db_path);
         assert_eq!(sources[0].role, DiscoveredSourceRole::SqliteDatabase);
         assert_eq!(sources[0].scan_root, devin_root);
+        if wal_path.is_file() {
+            let wal = sources
+                .iter()
+                .find(|source| source.source_path == wal_path)
+                .expect("present WAL sidecar must be discovered");
+            assert_eq!(wal.role, DiscoveredSourceRole::MetadataSidecar);
+            assert!(wal.required_for_reconstruction);
+        }
+        if shm_path.is_file() {
+            let shm = sources
+                .iter()
+                .find(|source| source.source_path == shm_path)
+                .expect("present SHM sidecar must be discovered");
+            assert_eq!(shm.role, DiscoveredSourceRole::MetadataSidecar);
+            assert!(!shm.required_for_reconstruction);
+        }
 
         // Default detection with a store under data_dir scopes the scan to it.
         let scoped = ScanContext::local_default(devin_root.clone(), None);
@@ -1187,6 +1266,109 @@ mod tests {
         );
         assert!(connector.scan(&empty).unwrap().is_empty());
         assert!(connector.discover_source_files(&empty).unwrap().is_empty());
+    }
+
+    /// A WAL-only commit — how the live CLI appends a turn while holding the
+    /// store open — leaves the primary file's size and mtime untouched, so a
+    /// completion whose reuse evidence names only the primary authorizes the
+    /// host's ledger to skip the store and the appended turn never reaches
+    /// the index (found when cass moved to the merged 0.3.11 lineage; see
+    /// cass agent_detection_completeness devin_ingestion). The completion
+    /// must carry the -wal, exactly like the shelley connector's stores.
+    #[test]
+    fn source_boundary_completion_carries_the_live_wal() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        seed_reference_store(&db_path);
+        // The live-CLI shape: a second connection holds the store in WAL
+        // mode with committed-but-uncheckpointed frames.
+        let writer = open_test_connection(&db_path);
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
+        insert_session(
+            &writer,
+            "live-turn",
+            "Live turn",
+            "/work/live",
+            300,
+            400,
+            Some(9),
+            0,
+        );
+        insert_node(
+            &writer,
+            9,
+            "live-turn",
+            None,
+            &json!({"role": "user", "content": "appended while the CLI holds the store"}),
+            350,
+        );
+        let wal_path = sidecar_path(&db_path, "-wal");
+        assert!(wal_path.is_file(), "fixture must hold a live WAL");
+
+        let connector = DevinConnector::new();
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass-data"),
+            vec![ScanRoot::local(db_path.clone())],
+            None,
+        );
+
+        let mut completions: Vec<SourceCompletion> = Vec::new();
+        let mut emitted = 0usize;
+        {
+            let mut on_complete = |completion: &SourceCompletion| {
+                completions.push(completion.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    emitted += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        // Both the seeded conversation and the WAL-only turn are readable
+        // through the strict read-only open while the writer still holds it.
+        assert_eq!(emitted, 2, "the WAL-only turn must be scanned");
+        assert_eq!(completions.len(), 1, "one store => one completion");
+        let completion = &completions[0];
+        assert_eq!(completion.source.role, DiscoveredSourceRole::SqliteDatabase);
+        assert_eq!(completion.source.source_path, db_path);
+        assert_eq!(
+            completion.required_sidecars.len(),
+            1,
+            "the -wal is the reuse evidence a WAL-only commit invalidates"
+        );
+        let wal = &completion.required_sidecars[0];
+        assert_eq!(wal.source_path, wal_path);
+        assert_eq!(wal.role, DiscoveredSourceRole::MetadataSidecar);
+        assert!(wal.required_for_reconstruction);
+        assert_eq!(wal.origin, completion.source.origin);
+        assert_eq!(wal.scan_root, completion.source.scan_root);
+
+        // Discovery lists the whole store bundle, so the host's pre-scan
+        // dependency evidence covers the sidecars the completion names.
+        let discovered = connector.discover_source_files(&ctx).unwrap();
+        assert!(
+            discovered
+                .iter()
+                .any(|source| source.role == DiscoveredSourceRole::SqliteDatabase
+                    && source.source_path == db_path)
+        );
+        let discovered_wal = discovered
+            .iter()
+            .find(|source| source.source_path == wal_path)
+            .expect("discovery must list the live -wal");
+        assert_eq!(discovered_wal.role, DiscoveredSourceRole::MetadataSidecar);
+        assert!(discovered_wal.required_for_reconstruction);
+
+        drop(writer);
     }
 
     // cass review 2026-11-02 F5

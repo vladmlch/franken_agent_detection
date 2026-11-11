@@ -13,7 +13,8 @@
 #[allow(clippy::too_many_lines)]
 mod conformance {
     use crate::connectors::{
-        PathTrie, ScanContext, ScanRoot, get_connector_factories, parse_timestamp,
+        DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot, get_connector_factories,
+        parse_timestamp,
     };
     use crate::types::{NormalizedConversation, NormalizedMessage, PathMapping};
     use crate::{AgentDetectOptions, AgentDetectRootOverride, detect_installed_agents};
@@ -470,9 +471,22 @@ mod conformance {
             let sources = connector
                 .discover_source_files(&context)
                 .expect("discover Devin SQLite source");
-            assert_eq!(sources.len(), 1);
+            // The store's truth spans the db plus any -wal/-shm the engine
+            // left behind, so discovery lists the whole bundle (the shelley
+            // contract): the database first, then each present sidecar.
+            let sidecar = |suffix: &str| {
+                let name = database
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                database.with_file_name(format!("{name}{suffix}"))
+            };
+            let wal = sidecar("-wal");
+            let shm = sidecar("-shm");
+            let expected = 1 + usize::from(wal.is_file()) + usize::from(shm.is_file());
+            assert_eq!(sources.len(), expected);
             assert_eq!(sources[0].provider_slug, "devin");
             assert_eq!(sources[0].source_path, database);
+            assert_eq!(sources[0].role, DiscoveredSourceRole::SqliteDatabase);
             assert_eq!(
                 fs::read(&database).expect("read fixture after scan and discovery"),
                 original_bytes,

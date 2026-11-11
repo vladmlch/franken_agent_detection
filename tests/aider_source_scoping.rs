@@ -20,12 +20,19 @@ const HISTORY: &str = ".aider.chat.history.md";
 
 struct Fixture {
     root: TempDir,
+    /// Canonical form of `root`. macOS `$TMPDIR` is a symlink to
+    /// `/private/var/...` and the producer canonicalizes cwd/home-derived
+    /// scan roots, so every fixture path (and the child's HOME/cwd) must
+    /// start from the canonical base or the raw `/var/...` string never
+    /// matches a discovered `scan_root`.
+    base: PathBuf,
     files: Vec<PathBuf>,
 }
 
 impl Fixture {
     fn new() -> Self {
         let root = TempDir::new().unwrap();
+        let base = std::fs::canonicalize(root.path()).unwrap();
         let files = [
             "home",
             "home/project",
@@ -44,7 +51,7 @@ impl Fixture {
         ]
         .into_iter()
         .map(|directory| {
-            let parent = root.path().join(directory);
+            let parent = base.join(directory);
             std::fs::create_dir_all(&parent).unwrap();
             let path = parent.join(HISTORY);
             std::fs::write(
@@ -55,8 +62,8 @@ impl Fixture {
             path
         })
         .collect();
-        std::fs::write(root.path().join("marked-state/agent_search.db"), []).unwrap();
-        Self { root, files }
+        std::fs::write(base.join("marked-state/agent_search.db"), []).unwrap();
+        Self { root, base, files }
     }
 
     fn run(
@@ -80,17 +87,17 @@ impl Fixture {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "aider_scope_child", "--nocapture"])
-            .current_dir(self.root.path().join("cwd"))
-            .env("HOME", self.root.path().join("home"))
-            .env("USERPROFILE", self.root.path().join("home"))
-            .env(CHILD_ROOT, self.root.path())
+            .current_dir(self.base.join("cwd"))
+            .env("HOME", self.base.join("home"))
+            .env("USERPROFILE", self.base.join("home"))
+            .env(CHILD_ROOT, self.base.clone())
             .env(CHILD_DATA, data_dir)
             .env(CHILD_ROOTS, serde_json::to_string(explicit_roots).unwrap())
             .env(CHILD_EXPECTED, serde_json::to_string(expected).unwrap())
             .env(CHILD_SINCE, serde_json::to_string(&since_ts).unwrap())
             .env_remove("CASS_AIDER_DATA_ROOT");
         if let Some(override_root) = override_root {
-            command.env("CASS_AIDER_DATA_ROOT", self.root.path().join(override_root));
+            command.env("CASS_AIDER_DATA_ROOT", self.base.join(override_root));
         }
         let output = command.output().unwrap();
         assert!(
@@ -232,16 +239,18 @@ fn exact_history_file_does_not_expand_to_sibling_projects() {
 #[test]
 fn missing_exact_history_file_stays_scoped() {
     let fixture = Fixture::new();
-    std::fs::remove_file(fixture.root.path().join("selected/.aider.chat.history.md")).unwrap();
+    let removed = fixture.base.join("selected/.aider.chat.history.md");
+    std::fs::remove_file(&removed).unwrap();
     // Retain the nested project's history, which the previous parent expansion
     // incorrectly emitted in place of the requested missing file.
     let fixture = Fixture {
         files: fixture
             .files
             .into_iter()
-            .filter(|path| path != &fixture.root.path().join("selected/.aider.chat.history.md"))
+            .filter(|path| path != &removed)
             .collect(),
         root: fixture.root,
+        base: fixture.base,
     };
     fixture.run("selected/.aider.chat.history.md", None, &[], &[], None);
 }

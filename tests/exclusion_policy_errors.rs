@@ -282,16 +282,26 @@ fn case(root: &Path, provider: &'static str) -> Case {
     }
 }
 
-struct Fixture(TempDir);
+struct Fixture {
+    dir: TempDir,
+    /// Canonical form of `dir`. macOS `$TMPDIR` is a symlink to
+    /// `/private/var/...` while production canonicalizes discovered source
+    /// paths, so every fixture path (and the child's cwd/root env) must be
+    /// built from the canonical base or the raw `/var/...` string never
+    /// matches a discovered `source_path`.
+    root: PathBuf,
+}
 
 impl Fixture {
     #[allow(clippy::too_many_lines)]
     fn new() -> Self {
-        let fixture = Self(TempDir::new().unwrap());
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let fixture = Self { dir, root };
         for &provider in PROVIDERS {
             for (visibility, path) in ["private", "public"]
                 .into_iter()
-                .zip(case(fixture.0.path(), provider).sources)
+                .zip(case(&fixture.root, provider).sources)
             {
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 let text = format!("policy-{visibility}-{provider}");
@@ -464,7 +474,7 @@ impl Fixture {
                         content,
                         "{}",
                         json!({"type": "session",
-                        "id": "0192aa11-0000-7000-8000-000000000001", "cwd": fixture.0.path(), "version": 3})
+                        "id": "0192aa11-0000-7000-8000-000000000001", "cwd": fixture.root, "version": 3})
                     )
                     .unwrap();
                 }
@@ -474,13 +484,16 @@ impl Fixture {
         }
         // A compatibility diagnostics call must produce a visible result with
         // a valid policy, and no result when invalid policy prevents opening it.
-        let diagnostic = fixture.0.path().join("durable-diagnostic/main.jsonl");
+        let diagnostic = fixture.root.join("durable-diagnostic/main.jsonl");
         std::fs::create_dir_all(diagnostic.parent().unwrap()).unwrap();
         std::fs::write(
             diagnostic,
             "{\"format\":999,\"type\":\"commit\",\"seq\":1,\"writes\":[]}\n",
         )
         .unwrap();
+        // The TempDir is only stored to keep the fixture alive for the
+        // spawned children; assert it is intact (and read the field).
+        debug_assert!(fixture.dir.path().is_dir());
         fixture
     }
 
@@ -488,8 +501,8 @@ impl Fixture {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "exclusion_policy_child", "--nocapture"])
-            .current_dir(self.0.path())
-            .env(CHILD_ROOT, self.0.path())
+            .current_dir(&self.root)
+            .env(CHILD_ROOT, self.root.clone())
             .env(CHILD_EXPECTED, expected)
             .env(CHILD_DROP_CWD, if drop_cwd { "1" } else { "0" })
             .env_remove("CASS_EXCLUDE_PATHS");
@@ -754,7 +767,7 @@ fn unset_and_empty_exclusion_policies_preserve_all_real_sources() {
         fixture.run(Some(OsStr::new(policy)), "all", false);
     }
     fixture.run(
-        Some(fixture.0.path().join("private").as_os_str()),
+        Some(fixture.root.join("private").as_os_str()),
         "public",
         false,
     );
@@ -764,7 +777,7 @@ fn unset_and_empty_exclusion_policies_preserve_all_real_sources() {
 #[cfg(any(unix, windows))]
 fn mixed_unicode_and_non_unicode_exclusions_fail_before_every_source_callback() {
     let fixture = Fixture::new();
-    let mut policy = fixture.0.path().join("private").into_os_string();
+    let mut policy = fixture.root.join("private").into_os_string();
     policy.push(",");
     #[cfg(unix)]
     {
@@ -783,11 +796,11 @@ fn mixed_unicode_and_non_unicode_exclusions_fail_before_every_source_callback() 
 #[cfg(unix)]
 fn unresolvable_exclusion_entry_rejects_the_entire_policy() {
     let fixture = Fixture::new();
-    let not_a_directory = fixture.0.path().join("not-a-directory");
+    let not_a_directory = fixture.root.join("not-a-directory");
     std::fs::write(&not_a_directory, "regular file").unwrap();
     let policy = format!(
         "{},{}",
-        fixture.0.path().join("private").display(),
+        fixture.root.join("private").display(),
         not_a_directory.join("child").display()
     );
     fixture.run(Some(OsStr::new(&policy)), "error", false);
@@ -798,7 +811,7 @@ fn unresolvable_exclusion_entry_rejects_the_entire_policy() {
 fn exclusion_policy_with_unavailable_cwd_accepts_absolute_and_rejects_relative_paths() {
     let fixture = Fixture::new();
     fixture.run(
-        Some(fixture.0.path().join("private").as_os_str()),
+        Some(fixture.root.join("private").as_os_str()),
         "public",
         true,
     );

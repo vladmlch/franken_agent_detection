@@ -562,6 +562,10 @@ fn continue_source_callbacks_observe_skip_then_delivery_then_completion() {
         "good",
         json!([{"message":{"role":"user","content":"hello"}}]),
     );
+    // The producer canonicalizes discovered source paths, and macOS
+    // `$TMPDIR` is a symlink to `/private/var/...`, so the raw tempdir
+    // path never equals a discovered `source_path`.
+    let good = good.canonicalize().unwrap();
     fs::write(fixture.path().join("skipped.json"), "not JSON").unwrap();
     let events = RefCell::new(Vec::new());
     let ctx = context(&[fixture.path().to_path_buf()]);

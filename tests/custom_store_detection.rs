@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use franken_agent_detection::{
-    AgentDetectOptions, AgentDetectRootOverride, Connector, NormalizedConversation, Origin,
-    ScanContext, ScanRoot, detect_installed_agents, get_connector_factories,
+    AgentDetectOptions, AgentDetectRootOverride, Connector, DiscoveredSourceRole,
+    NormalizedConversation, Origin, ScanContext, ScanRoot, detect_installed_agents,
+    get_connector_factories,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -109,6 +110,18 @@ impl Fixture {
             "detection and scanning must not change source bytes or create sidecars"
         );
     }
+}
+
+/// The database a `-wal`/`-shm` bundle sidecar belongs to
+/// (`crush.db-wal` -> `crush.db`); `None` for any other path.
+fn bundle_database(path: &Path) -> Option<PathBuf> {
+    let name = path.to_string_lossy();
+    for suffix in ["-wal", "-shm"] {
+        if let Some(database) = name.strip_suffix(suffix) {
+            return Some(PathBuf::from(database));
+        }
+    }
+    None
 }
 
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -329,7 +342,20 @@ fn assert_scan(connector: &dyn Connector, ctx: &ScanContext, provider: &str, exp
     let sources = connector.discover_source_files(ctx).unwrap();
     if let Some(scope) = ctx.scan_roots.first() {
         for source in &sources {
-            assert!(source.source_path.starts_with(&scope.path));
+            // A scoped scan must not discover ambient stores. A store's own
+            // bundle sidecars (-wal/-shm, the shelley contract) sit beside
+            // the database rather than under it, so a sidecar is in scope
+            // exactly when the database it belongs to is.
+            let in_scope = source.source_path.starts_with(&scope.path)
+                || (source.role == DiscoveredSourceRole::MetadataSidecar
+                    && bundle_database(&source.source_path)
+                        .is_some_and(|database| database.starts_with(&scope.path)));
+            assert!(
+                in_scope,
+                "source {} outside scope {}",
+                source.source_path.display(),
+                scope.path.display(),
+            );
             assert_eq!(source.origin.source_id, scope.origin.source_id);
         }
     }

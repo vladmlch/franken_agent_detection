@@ -146,23 +146,20 @@ while preserving model, provider (`anthropic`, `openai`, `google`, `mistral`,
 qualified `openclaw/<agent>` multi-agent slugs and all canonical connector
 aliases).
 
-Claude Code session files of **32 MiB or larger** retain compact metadata in
-`extra.cass` instead of duplicating the full raw record. Reply identifiers are
-preserved as strings at these locations:
+Claude Code session files keep the **full raw record** in `extra` at every
+size; large sessions are no longer compacted to a `cass`-only skeleton. Reply
+identifiers live at their raw locations:
 
-| Identifier | Raw `extra` | Compact `extra` |
-|---|---|---|
-| Message ID | `message.id` | `cass.message_id` |
-| Request ID | `requestId` | `cass.request_id` |
+| Identifier | Raw `extra` |
+|---|---|
+| Message ID | `message.id` |
+| Request ID | `requestId` |
 
 Claude Code can repeat a reply's full token usage in multiple content-block
-records. Compaction does not merge or remove normalized messages, and token
-extraction is per record. Consumers aggregating usage should count each
-identified `(message_id, request_id)` pair once within a conversation.
-Compaction omits missing or non-string identifiers. Records without both
-nonblank identifiers must not be merged under a shared default key.
-Compaction retains the model, usage, tool-call count, and existing attachment
-metadata without retaining the raw message content a second time.
+records; normalization does not merge or remove them, and token extraction is
+per record. Consumers aggregating usage should count each identified
+`(message.id, requestId)` pair once within a conversation. Records without
+both nonblank identifiers must not be merged under a shared default key.
 
 Beyond `scan`:
 
@@ -345,19 +342,19 @@ updates content and tool results, removes messages, or reorders surviving
 IDs. `$rewindTo` removes its target and later messages, while `$set.messages`
 replaces history with an authoritative checkpoint. Optional-kind metadata
 headers and legacy messages without IDs remain supported. Replay keeps one
-payload per surviving ID, and the existing 32 MiB metadata compaction
-threshold is unchanged.
+payload per surviving ID, and the raw record is kept verbatim in `extra` at
+every session size.
 
 Gemini messages also retain stored thought summaries and tool activity when
 ordinary text is empty. Each native message remains one normalized message;
 tool names, call IDs and arguments are exposed through `invocations`.
 Readable tool results are included in searchable content, while binary
-result parts are omitted. Compact metadata does not duplicate the raw
-thought, tool-call or result payloads.
+result parts are omitted. The raw record stays whole in `extra`, so
+normalized content never duplicates thought, tool-call or result payloads.
 
 Gemini token extraction reads the native per-message `tokens` fields in both
-JSON and JSONL histories. The same six numeric fields survive metadata
-compaction at 32 MiB. Cached tokens are separated from the prompt, tool-use
+JSON and JSONL histories. The same six numeric fields are preserved in the raw
+record at every session size. Cached tokens are separated from the prompt, tool-use
 prompt tokens count as input, and generated thoughts count as output.
 `thinking_tokens` describes the reasoning subset already included in output;
 the aggregate counts it once. Invalid token fields are ignored, and messages
@@ -385,9 +382,9 @@ and participate in incremental selection. Reads are capped at 1 MiB, and a
 missing or malformed optional sidecar does not discard the transcript.
 The format follows the pinned [Qwen subagent writer](https://github.com/QwenLM/qwen-code/blob/a8990042e648a7807e251d99b3d37c0ee8c16100/packages/core/src/agents/agent-transcript.ts).
 
-At 32 MiB, Qwen JSONL metadata retains reply identity, model, selected scalar
-usage fields and tool-call counts without duplicating the raw content or
-tool payloads. Its public token extractor keeps cached input separate and
+Qwen JSONL records keep the full raw record in `extra` at every session size,
+including reply identity, model and the complete native usage fields. Its
+public token extractor keeps cached input separate and
 uses the recorded total to distinguish additional Google reasoning tokens
 from reasoning already included in OpenAI-compatible output. Ambiguous
 reasoning stays in metadata; total-only records retain estimation instead

@@ -36,8 +36,6 @@ use crate::types::{
 
 pub struct CodexConnector;
 
-const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
-
 /// How a rollout file holds its records, from its name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RolloutFormat {
@@ -72,7 +70,7 @@ impl RolloutFormat {
 }
 
 enum FileScanMetadata {
-    Process(Option<fs::Metadata>),
+    Process,
     Skip,
 }
 
@@ -278,16 +276,12 @@ impl CodexConnector {
         Some(Value::Object(usage))
     }
 
-    fn should_compact_large_message_extra(file_size_bytes: Option<u64>) -> bool {
-        file_size_bytes.is_some_and(|size| size >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES)
-    }
-
     fn file_metadata_if_modified(path: &Path, since_ts: Option<i64>) -> FileScanMetadata {
         let Ok(metadata) = fs::metadata(path) else {
-            return FileScanMetadata::Process(None);
+            return FileScanMetadata::Process;
         };
         if Self::metadata_modified_since(&metadata, since_ts) {
-            FileScanMetadata::Process(Some(metadata))
+            FileScanMetadata::Process
         } else {
             FileScanMetadata::Skip
         }
@@ -398,35 +392,6 @@ impl CodexConnector {
         }
 
         Ok(out)
-    }
-
-    fn compact_message_extra(raw: &Value) -> Value {
-        let mut cass = serde_json::Map::new();
-
-        if let Some(model) = raw
-            .get("model")
-            .or_else(|| raw.pointer("/response/model"))
-            .and_then(|v| v.as_str())
-            .filter(|value| !value.trim().is_empty())
-        {
-            cass.insert("model".to_string(), Value::String(model.to_string()));
-        }
-
-        if let Some(attachments) = raw
-            .get("attachment_refs")
-            .or_else(|| raw.get("attachments"))
-            .cloned()
-        {
-            cass.insert("attachments".to_string(), attachments);
-        }
-
-        if cass.is_empty() {
-            Value::Object(serde_json::Map::new())
-        } else {
-            let mut out = serde_json::Map::new();
-            out.insert("cass".to_string(), Value::Object(cass));
-            Value::Object(out)
-        }
     }
 
     fn attach_token_usage_to_latest_assistant(
@@ -585,11 +550,12 @@ fn scan_codex_with_hooks(
                 continue;
             }
             let source_path = file.clone();
-            let file_metadata = match CodexConnector::file_metadata_if_modified(&file, ctx.since_ts)
-            {
-                FileScanMetadata::Process(metadata) => metadata,
+            // Mtime-based incremental skip; the metadata itself is not needed
+            // once the freshness decision is made.
+            match CodexConnector::file_metadata_if_modified(&file, ctx.since_ts) {
+                FileScanMetadata::Process => {}
                 FileScanMetadata::Skip => continue,
-            };
+            }
             // Pre-parse identity, mirrored from discover_sources() (FAD#22).
             let discovered = DiscoveredSourceFile::new(
                 "codex",
@@ -605,30 +571,6 @@ fn scan_codex_with_hooks(
             let Some(format) = RolloutFormat::of(&file) else {
                 continue;
             };
-            let file_size_bytes = file_metadata.as_ref().map(std::fs::Metadata::len);
-            // Size a compressed session by its text, as its plain form is sized.
-            #[cfg(feature = "codex-zstd")]
-            let file_size_bytes = if format == RolloutFormat::CompressedJsonl {
-                std::fs::File::open(&file)
-                    .ok()
-                    .and_then(|mut opened| {
-                        reader::compressed_rollout_declared_len(&mut opened)
-                            .ok()
-                            .flatten()
-                    })
-                    .or(file_size_bytes)
-            } else {
-                file_size_bytes
-            };
-            let compact_message_extra =
-                CodexConnector::should_compact_large_message_extra(file_size_bytes);
-            if compact_message_extra {
-                tracing::debug!(
-                    path = %file.display(),
-                    size_bytes = file_size_bytes.unwrap_or_default(),
-                    "codex compacting per-message extra payloads for large session"
-                );
-            }
             let external_id = source_path
                 .strip_prefix(&sessions_dir)
                 .ok()
@@ -649,7 +591,7 @@ fn scan_codex_with_hooks(
             let mut ended_at = None;
             let mut session_cwd: Option<PathBuf> = None;
             // Pair individual records, not all occurrences of prompt text.
-            // Capture stream/turn identity before large-message extra compaction.
+            // Capture stream/turn identity before the records normalize.
             let mut user_prompts = user_prompts::UserPrompts::default();
             let mut token_count_tracker = token_usage_accumulation::TokenCountTracker::default();
 
@@ -720,11 +662,7 @@ fn scan_codex_with_hooks(
                                             author: None,
                                             created_at: created,
                                             content: content_text,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
+                                            extra: val,
                                             invocations,
                                             snippets: Vec::new(),
                                         });
@@ -733,9 +671,23 @@ fn scan_codex_with_hooks(
                                     // stdout / patch summary. Emit as a
                                     // first-class `tool` timeline entry; the
                                     // linking `call_id` is preserved in `extra`.
+                                    // F13: a textless output WITH identity
+                                    // (`call_id`/`id` — image-only results whose
+                                    // `output` is a list of `image_url` parts) is
+                                    // local evidence too: emit it as a `tool`
+                                    // message with EMPTY content and the raw
+                                    // record as `extra`, so call/result linking
+                                    // can pair it — never a fabricated result
+                                    // text. Identity-less textless records stay
+                                    // dropped: there is nothing to link them to.
                                     Some("function_call_output" | "custom_tool_call_output") => {
                                         let output_text = tool_output_text(payload);
-                                        if output_text.trim().is_empty() {
+                                        let has_identity = payload
+                                            .get("call_id")
+                                            .or_else(|| payload.get("id"))
+                                            .and_then(|v| v.as_str())
+                                            .is_some_and(|id| !id.trim().is_empty());
+                                        if output_text.trim().is_empty() && !has_identity {
                                             continue;
                                         }
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
@@ -745,11 +697,7 @@ fn scan_codex_with_hooks(
                                             author: None,
                                             created_at: created,
                                             content: output_text,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
+                                            extra: val,
                                             invocations: Vec::new(),
                                             snippets: Vec::new(),
                                         });
@@ -798,11 +746,7 @@ fn scan_codex_with_hooks(
                                             author: None,
                                             created_at: created,
                                             content: content_str,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
+                                            extra: val,
                                             invocations,
                                             snippets: Vec::new(),
                                         });
@@ -840,11 +784,7 @@ fn scan_codex_with_hooks(
                                                 author: None,
                                                 created_at: created,
                                                 content: text.to_string(),
-                                                extra: if compact_message_extra {
-                                                    CodexConnector::compact_message_extra(&val)
-                                                } else {
-                                                    val
-                                                },
+                                                extra: val,
                                                 invocations: Vec::new(),
                                                 snippets: Vec::new(),
                                             });
@@ -867,11 +807,7 @@ fn scan_codex_with_hooks(
                                                 author: Some("reasoning".to_string()),
                                                 created_at: created,
                                                 content: text.to_string(),
-                                                extra: if compact_message_extra {
-                                                    CodexConnector::compact_message_extra(&val)
-                                                } else {
-                                                    val
-                                                },
+                                                extra: val,
                                                 invocations: Vec::new(),
                                                 snippets: Vec::new(),
                                             });
@@ -911,11 +847,7 @@ fn scan_codex_with_hooks(
                                             author: None,
                                             created_at: created,
                                             content: content_text,
-                                            extra: if compact_message_extra {
-                                                CodexConnector::compact_message_extra(&val)
-                                            } else {
-                                                val
-                                            },
+                                            extra: val,
                                             invocations,
                                             snippets: Vec::new(),
                                         });
@@ -1008,11 +940,7 @@ fn scan_codex_with_hooks(
                             author: None,
                             created_at: created,
                             content: content_str,
-                            extra: if compact_message_extra {
-                                CodexConnector::compact_message_extra(item)
-                            } else {
-                                item.clone()
-                            },
+                            extra: item.clone(),
                             invocations,
                             snippets: Vec::new(),
                         });
@@ -1627,6 +1555,73 @@ mod tests {
     }
 
     #[test]
+    fn scan_emits_textless_image_tool_output_with_identity_as_empty_tool_message() {
+        // F13: `function_call_output` records whose captured output carries
+        // no text (image-only results: `output` is a list of `image_url`
+        // parts) used to be dropped entirely, leaving their calls unpaired
+        // downstream. The record is local evidence: emit it as a `tool`
+        // message with EMPTY content and the raw record as `extra` — never
+        // a fabricated result text — so call/result linking can pair it.
+        // Records WITHOUT identity (no call_id/id) stay dropped: there is
+        // nothing to link them to.
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = concat!(
+            r#"{"type":"event_msg","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"user_message","message":"inspect the made-up screenshot"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"type":"function_call","call_id":"call_img","name":"view_image","arguments":"{\"path\":\"/made-up.png\"}","id":"resp-1"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2025-12-01T10:00:02Z","payload":{"type":"function_call_output","call_id":"call_img","id":"resp-1","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,MADEUP"}}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2025-12-01T10:00:03Z","payload":{"type":"function_call_output","output":""}}"#,
+            "\n",
+        );
+        let rollout = sessions.join("rollout-images.jsonl");
+        fs::write(&rollout, content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::with_roots(rollout.clone(), vec![ScanRoot::local(rollout)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+        // user prompt + tool call + the textless image result = 3 messages;
+        // the identity-less empty output record stays dropped.
+        assert_eq!(
+            conv.messages.len(),
+            3,
+            "textless identity-bearing outputs emit; identity-less ones drop: {:#?}",
+            conv.messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>()
+        );
+        let image_result = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool" && m.content.is_empty())
+            .expect("image-only output emitted as a textless tool message");
+        assert_eq!(
+            image_result
+                .extra
+                .pointer("/payload/call_id")
+                .and_then(|v| v.as_str()),
+            Some("call_img"),
+            "the raw record stays linkable via extra.payload.call_id"
+        );
+        assert_eq!(
+            image_result
+                .extra
+                .pointer("/payload/type")
+                .and_then(|v| v.as_str()),
+            Some("function_call_output"),
+            "the raw record is preserved verbatim as extra"
+        );
+    }
+
+    #[test]
     #[ignore = "release-mode performance harness; run explicitly for Codex scan wall-clock evidence"]
     fn perf_scan_large_codex_fixture() {
         let file_count = std::env::var("FAD_CODEX_SCAN_BENCH_FILES")
@@ -1672,36 +1667,6 @@ mod tests {
     }
 
     #[test]
-    fn compact_message_extra_keeps_only_cass_metadata() {
-        let raw = json!({
-            "model": "gpt-5-codex",
-            "attachments": [{"path": "/tmp/screenshot.png"}],
-            "payload": {
-                "content": "very large duplicated content"
-            }
-        });
-
-        let compact = CodexConnector::compact_message_extra(&raw);
-        assert_eq!(compact["cass"]["model"], "gpt-5-codex");
-        assert_eq!(
-            compact["cass"]["attachments"][0]["path"],
-            "/tmp/screenshot.png"
-        );
-        assert!(compact.get("payload").is_none());
-    }
-
-    #[test]
-    fn should_compact_large_message_extra_respects_threshold() {
-        assert!(!CodexConnector::should_compact_large_message_extra(Some(
-            LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES - 1,
-        )));
-        assert!(CodexConnector::should_compact_large_message_extra(Some(
-            LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES,
-        )));
-        assert!(!CodexConnector::should_compact_large_message_extra(None));
-    }
-
-    #[test]
     fn file_metadata_if_modified_preserves_scan_fallbacks() {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("rollout-meta.jsonl");
@@ -1709,7 +1674,7 @@ mod tests {
 
         assert!(matches!(
             CodexConnector::file_metadata_if_modified(&file, None),
-            FileScanMetadata::Process(Some(_))
+            FileScanMetadata::Process
         ));
         assert!(
             matches!(
@@ -1722,7 +1687,7 @@ mod tests {
         let missing = dir.path().join("missing.jsonl");
         assert!(matches!(
             CodexConnector::file_metadata_if_modified(&missing, Some(i64::MAX)),
-            FileScanMetadata::Process(None)
+            FileScanMetadata::Process
         ));
     }
 

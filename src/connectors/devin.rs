@@ -25,9 +25,11 @@
 //! array is accepted too. Image payloads never reach the indexed text — an
 //! `[image]` marker stands in for each one.
 //!
-//! Read-only: the store is opened `SQLITE_OPEN_READ_ONLY` with a busy timeout
-//! because the live CLI may hold it open. Devin's cloud sessions are not on
-//! disk and are out of scope here.
+//! Read-only: the store is opened through the F9 helper's strict never-write
+//! mode (`SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_STRICT_READ_ONLY`, with a busy
+//! timeout because the live CLI may hold it open), so no sidecar of the
+//! user's store is ever created or modified. Devin's cloud sessions are not
+//! on disk and are out of scope here.
 
 #![allow(clippy::doc_markdown, clippy::too_many_lines)]
 
@@ -45,7 +47,7 @@ use std::path::Path;
 #[cfg(feature = "devin")]
 use anyhow::{Context, Result};
 #[cfg(feature = "devin")]
-use frankensqlite::compat::{OpenFlags, RowExt};
+use frankensqlite::compat::RowExt;
 #[cfg(feature = "devin")]
 use frankensqlite::params;
 
@@ -55,7 +57,7 @@ use super::scan::{
     SourceScanHooks,
 };
 #[cfg(feature = "devin")]
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
 #[cfg(feature = "devin")]
 use super::utils::{env_path_nonempty, path_is_excluded, unwrap_skill_invocations};
 #[cfg(feature = "devin")]
@@ -196,11 +198,8 @@ impl DevinConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Devin db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open Devin db: {}", db_path.display()))?;
         conn.execute("PRAGMA busy_timeout = 5000;")
             .context("failed to set busy_timeout on Devin db")?;
 
@@ -645,6 +644,13 @@ impl Connector for DevinConnector {
         let mut failures = checked_scan::ScanFailures::new();
         for source in sources {
             if !hooks.should_scan(&source) {
+                continue;
+            }
+            // Local fix (cass review 2026-11-07, F9): a store that is a valid
+            // but empty database never reaches the extractor — there is
+            // nothing to read, and a fresh install must not report a scan
+            // error on every index run.
+            if super::checked_scan::skip_provably_empty_store("Devin", &source.source_path) {
                 continue;
             }
             ctx.tick();

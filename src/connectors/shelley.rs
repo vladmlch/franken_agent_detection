@@ -40,11 +40,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
+use frankensqlite::compat::{ParamValue, RowExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
 use super::utils::{
     env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, unwrap_skill_invocations,
 };
@@ -519,11 +519,8 @@ fn table_columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
 /// candidates are admitted on the exact required table/column signature so
 /// sanitized fixtures and repaired databases remain usable.
 fn admit_database(path: &Path, kind: CandidateKind) -> Result<(Connection, SchemaPlan)> {
-    let conn = open_with_flags(
-        path.to_string_lossy().as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .with_context(|| format!("failed to open read-only: {}", path.display()))?;
+    let conn = open_read_only_with_snapshot_fallback(path.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to open read-only: {}", path.display()))?;
 
     // Bounded busy timeout: Shelley may hold a writer on this database.
     conn.execute("PRAGMA busy_timeout = 2000;")

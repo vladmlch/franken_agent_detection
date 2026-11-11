@@ -14,7 +14,7 @@ pub(super) struct ScanFailures {
 }
 
 impl ScanFailures {
-    pub(super) fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             failures: Vec::new(),
         }
@@ -41,6 +41,7 @@ impl ScanFailures {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn no_failures_passes_and_any_failure_fails_the_scan() {

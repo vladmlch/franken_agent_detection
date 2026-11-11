@@ -1,4 +1,5 @@
-//! Claude reply identity must survive large-session compaction for usage consumers.
+//! Claude reply identity and the full raw envelope must survive large sessions
+//! for usage consumers — no size cutoff compacts per-message `extra`.
 #![cfg(feature = "connectors")]
 
 use std::collections::HashSet;
@@ -12,7 +13,9 @@ use franken_agent_detection::{
 };
 use serde_json::{Value, json};
 
-const COMPACT_THRESHOLD: u64 = 32 * 1024 * 1024;
+/// The size at which the removed compaction layer used to kick in; sessions at
+/// and above it are the regression guard for "extras stay full".
+const LARGE_SESSION_BYTES: u64 = 32 * 1024 * 1024;
 const MODEL: &str = "claude-opus-4-6";
 const PADDING: [u8; 8192] = {
     let mut bytes = [b' '; 8192];
@@ -45,7 +48,7 @@ fn assistant_record(
                 "service_tier": "standard"
             }
         },
-        "summary": "unrelated metadata that compaction must discard ".repeat(128)
+        "summary": "unrelated metadata that large sessions must keep ".repeat(128)
     });
     if let Some(id) = message_id {
         record["message"]["id"] = json!(id);
@@ -177,7 +180,7 @@ fn assert_source_unchanged(path: &Path, prefix: &[u8], before: &fs::Metadata) {
     assert_eq!(file.read(&mut buffer).unwrap(), 0);
 }
 
-fn assert_messages(conversation: &NormalizedConversation, records: &[Value], compact: bool) {
+fn assert_messages(conversation: &NormalizedConversation, records: &[Value]) {
     assert_eq!(conversation.agent_slug, "claude_code");
     assert_eq!(conversation.metadata["sessionId"], "usage-session");
     assert_eq!(conversation.messages.len(), records.len());
@@ -186,20 +189,11 @@ fn assert_messages(conversation: &NormalizedConversation, records: &[Value], com
         assert_eq!(message.role, "assistant");
         assert_eq!(message.author.as_deref(), Some(MODEL));
         assert_eq!(message.created_at, Some(1_700_000_000_000));
-        if compact {
-            let extra = message.extra.as_object().unwrap();
-            assert_eq!(
-                extra.len(),
-                1,
-                "raw content and arbitrary metadata must be dropped"
-            );
-            let cass = extra.get("cass").unwrap();
-            assert_eq!(cass.get("message_id"), raw.pointer("/message/id"));
-            assert_eq!(cass.get("request_id"), raw.get("requestId"));
-            assert!(serde_json::to_vec(extra).unwrap().len() < 1024);
-        } else {
-            assert_eq!(&message.extra, raw);
-        }
+        // Full extras at any size: the raw envelope (including the bulky
+        // `summary` string) must survive verbatim, never be reduced to a
+        // `{cass:{…}}` skeleton — even for sessions at/above the old cutoff.
+        assert_eq!(&message.extra, raw);
+        assert!(serde_json::to_vec(&message.extra).unwrap().len() > 1024);
 
         let usage = extract_tokens_for_agent(
             &conversation.agent_slug,
@@ -300,7 +294,7 @@ fn assert_streaming_parity(
     {
         let mut complete = |done: &SourceCompletion| {
             assert_eq!(done.conversations_emitted, 1);
-            assert_eq!(done.source.size_bytes, Some(COMPACT_THRESHOLD));
+            assert_eq!(done.source.size_bytes, Some(LARGE_SESSION_BYTES));
             assert!(done.required_sidecars.is_empty());
             completed.push(done.source.source_path.clone());
             Ok(())
@@ -324,14 +318,14 @@ fn assert_streaming_parity(
 }
 
 #[test]
-fn claude_reply_usage_deduplicates_across_the_real_compaction_boundary() {
+fn claude_large_sessions_keep_full_extras_and_reply_usage_identity() {
     let temp = tempfile::tempdir().unwrap();
     let records = reply_records();
     let connector = ClaudeCodeConnector::new();
     for size in [
-        COMPACT_THRESHOLD - 1,
-        COMPACT_THRESHOLD,
-        COMPACT_THRESHOLD + 1,
+        LARGE_SESSION_BYTES - 1,
+        LARGE_SESSION_BYTES,
+        LARGE_SESSION_BYTES + 1,
     ] {
         let path = temp.path().join(format!("session-{size}.jsonl"));
         let prefix = write_session(&path, &records, size).unwrap();
@@ -345,14 +339,14 @@ fn claude_reply_usage_deduplicates_across_the_real_compaction_boundary() {
         let conversations = connector.scan(&ctx).unwrap();
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].source_path, path);
-        assert_messages(&conversations[0], &records, size >= COMPACT_THRESHOLD);
+        assert_messages(&conversations[0], &records);
         // Three blocks share one reply; two other complete pairs are distinct.
         // Eight partially/unidentified records must each retain their usage.
         assert_eq!(
             consumer_token_totals(&conversations[0]),
             (13 * 175, 11 * 175)
         );
-        if size == COMPACT_THRESHOLD {
+        if size == LARGE_SESSION_BYTES {
             assert_streaming_parity(&connector, &ctx, &conversations, &path);
         }
         assert_source_unchanged(&path, &prefix, &before);

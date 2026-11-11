@@ -23,11 +23,11 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, RowExt};
+use frankensqlite::compat::RowExt;
 use frankensqlite::{Row, SqliteValue, params};
 
 use super::jsonl::JsonlLines;
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -413,11 +413,8 @@ impl GooseConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Goose db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open Goose db: {}", db_path.display()))?;
 
         conn.execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
@@ -720,10 +717,12 @@ impl Connector for GooseConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
+
         self.scan_with_callback(ctx, &mut |conv| {
             convs.push(conv);
             Ok(())
         })?;
+
         Ok(convs)
     }
 
@@ -744,6 +743,14 @@ impl Connector for GooseConnector {
     ) -> Result<()> {
         let sources = Self::discover_sources(ctx)?;
         let mut seen_ids: HashSet<String> = HashSet::new();
+        // Local fix (cass review 2026-11-07, F9): a SQLite store that
+        // cannot be read fails the scan instead of hiding behind a debug
+        // log (F5 semantics) — a BusyRecovery-class store is read through
+        // the snapshot fallback in `open_read_only_with_snapshot_fallback`,
+        // and every other open failure reaches the host; a valid but empty
+        // store is "nothing to read" (the F9 empty-store rule). The JSONL
+        // side keeps its per-file debug log on both branches.
+        let mut failures = super::checked_scan::ScanFailures::new("Goose");
 
         for source in sources {
             if !hooks.should_scan(&source) {
@@ -752,6 +759,10 @@ impl Connector for GooseConnector {
             ctx.tick();
             match source.role {
                 DiscoveredSourceRole::SqliteDatabase => {
+                    if super::checked_scan::skip_provably_empty_store("Goose", &source.source_path)
+                    {
+                        continue;
+                    }
                     let mut emitted = 0usize;
                     match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
                         Ok(sqlite_convs) => {
@@ -769,12 +780,7 @@ impl Connector for GooseConnector {
                                 emitted += 1;
                             }
                         }
-                        Err(e) => {
-                            tracing::debug!(
-                                "goose sqlite: failed to read {}: {e}",
-                                source.source_path.display()
-                            );
-                        }
+                        Err(e) => failures.record(&source.source_path, &e),
                     }
                     if emitted > 0 && !source.fs_metadata_changed() {
                         hooks.complete(&SourceCompletion {
@@ -824,8 +830,7 @@ impl Connector for GooseConnector {
                 DiscoveredSourceRole::MetadataSidecar => {}
             }
         }
-
-        Ok(())
+        failures.finish()
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {

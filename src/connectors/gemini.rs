@@ -297,8 +297,6 @@ fn extract_path_from_position(content: &str, start: usize) -> Option<PathBuf> {
 
 pub struct GeminiConnector;
 
-const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
-
 impl Default for GeminiConnector {
     fn default() -> Self {
         Self::new()
@@ -346,10 +344,6 @@ impl GeminiConnector {
         // Keep connector traversal deterministic across filesystems/runs.
         files.sort();
         files
-    }
-
-    fn should_compact_large_message_extra(file_size_bytes: Option<u64>) -> bool {
-        file_size_bytes.is_some_and(|size| size >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES)
     }
 
     fn looks_like_root(path: &Path) -> bool {
@@ -433,51 +427,6 @@ impl GeminiConnector {
             }
         }
         Ok(out)
-    }
-
-    fn compact_message_extra(raw: &Value) -> Value {
-        let mut out = serde_json::Map::new();
-
-        if let Some(model) = raw
-            .get("model")
-            .or_else(|| raw.pointer("/message/model"))
-            .or_else(|| raw.pointer("/modelConfig/modelName"))
-            .or_else(|| raw.get("modelType"))
-            .or_else(|| raw.get("modelID"))
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty())
-        {
-            out.insert("model".to_string(), Value::String(model.to_string()));
-        }
-
-        if let Some(tokens) = raw.get("tokens") {
-            // Gemini's native TokensSummary has six numeric fields. Preserve
-            // those scalars for usage extraction without copying extensions,
-            // raw message content, or other potentially large nested values.
-            let mut compact_tokens = Map::new();
-            for key in ["input", "output", "cached", "thoughts", "tool", "total"] {
-                if let Some(count) = tokens
-                    .get(key)
-                    .and_then(Value::as_i64)
-                    .filter(|count| *count >= 0)
-                {
-                    compact_tokens.insert(key.to_owned(), Value::from(count));
-                }
-            }
-            if !compact_tokens.is_empty() {
-                out.insert("tokens".to_owned(), Value::Object(compact_tokens));
-            }
-        }
-
-        if let Some(attachments) = raw
-            .get("attachment_refs")
-            .or_else(|| raw.get("attachments"))
-            .cloned()
-        {
-            out.insert("attachments".to_string(), attachments);
-        }
-
-        Value::Object(out)
     }
 
     /// `$set.messages` replaces history; embedded header messages only upsert.
@@ -838,16 +787,6 @@ fn scan_gemini_with_hooks(
                 continue;
             }
             ctx.tick();
-            let file_size_bytes = fs::metadata(&file).ok().map(|metadata| metadata.len());
-            let compact_message_extra =
-                GeminiConnector::should_compact_large_message_extra(file_size_bytes);
-            if compact_message_extra {
-                tracing::debug!(
-                    path = %file.display(),
-                    size_bytes = file_size_bytes.unwrap_or_default(),
-                    "gemini compacting per-message extra payloads for large session"
-                );
-            }
 
             let Some(mut val) = GeminiConnector::parse_session_file(&file) else {
                 continue;
@@ -920,11 +859,7 @@ fn scan_gemini_with_hooks(
                     author: None,
                     created_at: created,
                     content: content_str,
-                    extra: if compact_message_extra {
-                        GeminiConnector::compact_message_extra(&item)
-                    } else {
-                        item
-                    },
+                    extra: item,
                     invocations,
                     snippets: Vec::new(),
                 });
@@ -1393,40 +1328,6 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["session-a.json", "session-z.json"]);
-    }
-
-    #[test]
-    fn compact_message_extra_keeps_model_attachments_and_numeric_tokens() {
-        let raw = serde_json::json!({
-            "modelConfig": {"modelName": "gemini-2.5-pro"},
-            "attachments": [{"uri": "gs://bucket/image.png"}],
-            "tokens": {
-                "input": 0, "output": 4, "total": 4,
-                "cached": -7, "thoughts": "12", "tool": null,
-                "extension": {"data": "large unknown payload"}
-            },
-            "parts": [{"text": "very large duplicated content"}]
-        });
-
-        let compact = GeminiConnector::compact_message_extra(&raw);
-        assert_eq!(compact["model"], "gemini-2.5-pro");
-        assert_eq!(compact["attachments"][0]["uri"], "gs://bucket/image.png");
-        assert_eq!(
-            compact["tokens"],
-            serde_json::json!({"input": 0, "output": 4, "total": 4})
-        );
-        assert!(compact.get("parts").is_none());
-    }
-
-    #[test]
-    fn should_compact_large_message_extra_respects_threshold() {
-        assert!(!GeminiConnector::should_compact_large_message_extra(Some(
-            LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES - 1,
-        )));
-        assert!(GeminiConnector::should_compact_large_message_extra(Some(
-            LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES,
-        )));
-        assert!(!GeminiConnector::should_compact_large_message_extra(None));
     }
 
     #[test]

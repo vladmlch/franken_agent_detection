@@ -1938,8 +1938,15 @@ mod conformance {
         #[test]
         fn all_connectors_handle_nonexistent_directory_with_explicit_roots() {
             let nonexistent = PathBuf::from("/nonexistent/path/that/does/not/exist");
-            // Use explicit scan roots to disable default detection fallback
-            let roots = vec![ScanRoot::local(nonexistent.clone())];
+            // Use explicit (remote) scan roots to disable default detection
+            // fallback — and, for connectors that keep a home/XDG default
+            // store under local roots (opencode, cass#357), to keep this
+            // machine's real stores out of the contract check.
+            let roots = vec![ScanRoot::remote(
+                nonexistent.clone(),
+                crate::types::Origin::remote("conformance"),
+                None,
+            )];
             let ctx = ScanContext::with_roots(nonexistent, roots, None);
 
             for (slug, factory) in get_connector_factories() {
@@ -1962,8 +1969,15 @@ mod conformance {
         fn all_connectors_handle_empty_directory_with_explicit_roots() {
             let tmp = TempDir::new().expect("create temp dir");
             let tmp_path = tmp.path().to_path_buf();
-            // Use explicit scan roots to disable default detection fallback
-            let roots = vec![ScanRoot::local(tmp_path.clone())];
+            // Use explicit (remote) scan roots to disable default detection
+            // fallback — and, for connectors that keep a home/XDG default
+            // store under local roots (opencode, cass#357), to keep this
+            // machine's real stores out of the contract check.
+            let roots = vec![ScanRoot::remote(
+                tmp_path.clone(),
+                crate::types::Origin::remote("conformance"),
+                None,
+            )];
             let ctx = ScanContext::with_roots(tmp_path, roots, None);
 
             for (slug, factory) in get_connector_factories() {

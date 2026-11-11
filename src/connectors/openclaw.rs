@@ -835,12 +835,14 @@ mod sqlite_store {
     use std::path::Path;
 
     use anyhow::{Context, Result, bail};
-    use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
+    use frankensqlite::compat::{ParamValue, RowExt};
     use frankensqlite::{Row, SqliteValue};
     use serde_json::Value;
 
     use super::super::parse_timestamp;
-    use super::super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+    use super::super::sqlite_sync::{
+        Connection, ConnectionExt, open_read_only_with_snapshot_fallback,
+    };
     use super::{OpenClawConnector, SessionEventAccumulator};
     use crate::types::NormalizedConversation;
 
@@ -866,11 +868,8 @@ mod sqlite_store {
     }
 
     fn admit(db_path: &Path) -> Result<AdmittedStore> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open read-only: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open read-only: {}", db_path.display()))?;
 
         // A live OpenClaw Gateway may hold a writer on this database.
         conn.execute("PRAGMA busy_timeout = 5000;")

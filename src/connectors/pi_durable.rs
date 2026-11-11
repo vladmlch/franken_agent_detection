@@ -676,15 +676,12 @@ fn read_sqlite_store(path: &Path) -> Result<DurableStore> {
 #[cfg(feature = "pi-durable")]
 #[allow(clippy::too_many_lines)]
 fn read_sqlite_store(path: &Path) -> Result<DurableStore> {
-    use super::sqlite_sync::{ConnectionExt, open_with_flags};
+    use super::sqlite_sync::{ConnectionExt, open_read_only_with_snapshot_fallback};
     use anyhow::Context as _;
-    use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
+    use frankensqlite::compat::{ParamValue, RowExt};
 
-    let conn = open_with_flags(
-        path.to_string_lossy().as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .with_context(|| format!("failed to open read-only: {}", path.display()))?;
+    let conn = open_read_only_with_snapshot_fallback(path.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to open read-only: {}", path.display()))?;
     // The harness may hold the writer; wait briefly instead of failing.
     conn.execute("PRAGMA busy_timeout = 2000;")
         .with_context(|| "failed to set busy_timeout")?;

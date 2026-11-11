@@ -22,7 +22,9 @@ use tempfile::TempDir;
 
 const PARENT: &str = "47c09e1e-9b87-401c-bdeb-6c357ab925f9";
 const AGENT: &str = "explore-1";
-const COMPACT_THRESHOLD: u64 = 32 * 1024 * 1024;
+/// The size at which the removed compaction layer used to kick in; sessions
+/// at and above it are the regression guard for "extras stay full".
+const LARGE_SESSION_BYTES: u64 = 32 * 1024 * 1024;
 
 fn row(id: &str, previous: Option<&str>, role: &str, parts: &[Value]) -> Value {
     json!({
@@ -528,11 +530,11 @@ fn usage_only_zero_rounds_remain_explicit_api_observations() {
 }
 
 #[test]
-fn compaction_boundary_preserves_subagent_round_identity_and_exact_usage() {
+fn large_sessions_keep_full_subagent_round_extras_and_exact_usage() {
     for length in [
-        COMPACT_THRESHOLD - 1,
-        COMPACT_THRESHOLD,
-        COMPACT_THRESHOLD + 1,
+        LARGE_SESSION_BYTES - 1,
+        LARGE_SESSION_BYTES,
+        LARGE_SESSION_BYTES + 1,
     ] {
         let fixture = Fixture::new(&basic_records());
         let initial = fs::metadata(&fixture.transcript).unwrap().len();
@@ -548,22 +550,16 @@ fn compaction_boundary_preserves_subagent_round_identity_and_exact_usage() {
         let conversations = fixture.scan();
         assert_eq!(message_ids(&conversations[0]), ["user", "reply"]);
         assert_eq!(api_total(&conversations), 120);
+        // Full extras at any size: the native round identity survives at its
+        // source paths, never rewritten to a `{cass:{…}}` skeleton.
         let extra = &conversations[0].messages[1].extra;
-        if length >= COMPACT_THRESHOLD {
-            assert!(extra.get("message").is_none());
-            assert_eq!(extra["cass"]["session_id"], PARENT);
-            assert_eq!(extra["cass"]["agent_id"], AGENT);
-            assert_eq!(extra["cass"]["is_sidechain"], true);
-            assert_eq!(extra["cass"]["agent_run_id"], "native-run-1");
-            assert_eq!(extra["cass"]["agent_round"], 1);
-            assert!(extra.to_string().len() < 1024);
-        } else {
-            assert_eq!(extra["sessionId"], PARENT);
-            assert_eq!(extra["agentId"], AGENT);
-            assert_eq!(extra["isSidechain"], true);
-            assert_eq!(extra["agentRunId"], "native-run-1");
-            assert_eq!(extra["agentRound"], 1);
-        }
+        assert!(extra.get("cass").is_none());
+        assert_eq!(extra["sessionId"], PARENT);
+        assert_eq!(extra["agentId"], AGENT);
+        assert_eq!(extra["isSidechain"], true);
+        assert_eq!(extra["agentRunId"], "native-run-1");
+        assert_eq!(extra["agentRound"], 1);
+        assert!(extra.get("message").is_some());
         assert_eq!(fs::metadata(&fixture.transcript).unwrap().len(), length);
     }
 }

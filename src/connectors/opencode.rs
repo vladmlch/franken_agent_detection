@@ -8,6 +8,15 @@
 //!   - session/{projectID}/{sessionID}.json  - Session metadata
 //!   - message/{sessionID}/{messageID}.json  - Message metadata
 //!   - part/{messageID}/{partID}.json        - Actual message content
+//!
+//! **Tool part identity and state (cass F14):** every message that has parts
+//! (v2 `content` items, 1.x `part` rows/files) archives the raw part JSONs in
+//! `extra["parts"]` in delivery order, so the host can prove the part
+//! inventory verbatim. A failed run's `state.error` text renders inline as
+//! `[Tool Error]` (it is source text) — a plain string or an object carrying
+//! the text under `message` (the measured real shape is `{message, type}`) —
+//! and a tool part that renders no text still keeps its message alive with
+//! empty content rather than dropping the part's identity and state with it.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -32,10 +41,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
+use frankensqlite::compat::{ParamValue, RowExt};
 use frankensqlite::{Row, SqliteValue, params};
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
 use super::utils::read_capped;
 
 /// Max ids bound into a single `... IN (?, ?, …)` chunk. Kept well under
@@ -539,11 +548,8 @@ impl OpenCodeConnector {
         since_ts: Option<i64>,
         progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open OpenCode db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open OpenCode db: {}", db_path.display()))?;
 
         conn.execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
@@ -762,20 +768,28 @@ impl OpenCodeConnector {
                     continue;
                 }
             };
-            let Some((role, author, mut content)) = v2_message_content(&row.message_type, &data)
-            else {
+            let Some((role, author, content)) = v2_message_content(&row.message_type, &data) else {
                 continue;
             };
             let invocations = v2_message_invocations(&row.message_type, &data);
-            if content.trim().is_empty() {
-                if invocations.is_empty() {
-                    continue;
-                }
-                content = invocations
-                    .iter()
-                    .map(|inv| format!("[Tool: {}]", inv.name))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+            // F14: archive the raw content items so the host can verify the
+            // part inventory (id, name, input, status, results, error) instead
+            // of inferring it from the rendered text. Tool parts are
+            // identity-bearing even when they render no text (file-only
+            // results), so such a row survives with empty content — F13's
+            // codex rule — instead of vanishing with its identity and state.
+            let content_items = data
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .filter(|items| !items.is_empty())
+                .cloned();
+            let row_has_tool_part = content_items.as_deref().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("tool")
+                })
+            });
+            if content.trim().is_empty() && invocations.is_empty() && !row_has_tool_part {
+                continue;
             }
             let col_ts = row
                 .time_created_raw
@@ -787,7 +801,10 @@ impl OpenCodeConnector {
             )
             .or(col_ts);
             let tool_call_count = invocations.len();
-            let extra = build_v2_message_extra(&row, &data, tool_call_count);
+            let mut extra = build_v2_message_extra(&row, &data, tool_call_count);
+            if let Some(items) = content_items {
+                extra["parts"] = serde_json::Value::Array(items);
+            }
             let message = NormalizedMessage {
                 idx: 0,
                 role: role.to_string(),
@@ -889,22 +906,20 @@ impl OpenCodeConnector {
             };
 
             let parts = parts_by_message.remove(&row.id).unwrap_or_default();
-            let invocations = extract_invocations_from_parts(&parts);
-            let mut content_text = if !parts.is_empty() {
-                assemble_content_from_parts(&parts)
+            let infos: Vec<PartInfo> = parts.iter().map(|part| part.info.clone()).collect();
+            let invocations = extract_invocations_from_parts(&infos);
+            let content_text = if !parts.is_empty() {
+                assemble_content_from_parts(&infos)
             } else {
                 String::new()
             };
 
-            if content_text.trim().is_empty() {
-                if invocations.is_empty() {
-                    continue;
-                }
-                content_text = invocations
-                    .iter()
-                    .map(|inv| format!("[Tool: {}]", inv.name))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+            // F13's codex rule, applied to opencode tool parts: a tool part
+            // is identity-bearing even when it renders no text (no output,
+            // no error), so its message survives with empty content instead
+            // of vanishing with the part's identity and state.
+            if content_text.trim().is_empty() && invocations.is_empty() && !has_tool_part(&parts) {
+                continue;
             }
 
             let role = msg_data.role.unwrap_or_else(|| "assistant".to_string());
@@ -928,7 +943,10 @@ impl OpenCodeConnector {
 
             let message_id = row.id;
             let session_id = row.session_id;
-            let extra = build_v1_message_extra(
+            // F14: archive the raw parts in delivery order so the host can
+            // verify the part inventory (identity, input, state) instead of
+            // inferring it from the rendered text.
+            let mut extra = build_v1_message_extra(
                 &message_id,
                 Some(&session_id),
                 resolved_model_id.as_deref(),
@@ -936,6 +954,10 @@ impl OpenCodeConnector {
                 msg_data.tokens.as_ref(),
                 invocations.len(),
             );
+            if !parts.is_empty() {
+                extra["parts"] =
+                    serde_json::Value::Array(parts.iter().map(|part| part.raw.clone()).collect());
+            }
             pending_by_session
                 .entry(session_id.clone())
                 .or_default()
@@ -976,7 +998,7 @@ impl OpenCodeConnector {
         conn: &Connection,
         message_ids: Option<&HashSet<String>>,
         progress_tick: Option<&(dyn Fn() + Send + Sync)>,
-    ) -> Result<HashMap<String, Vec<PartInfo>>> {
+    ) -> Result<HashMap<String, Vec<LoadedPart>>> {
         // No ORDER BY — parts are re-sorted per message below. On an incremental
         // scan only the kept messages' parts are read/decoded (#372: the `part`
         // table is the largest, so this is the dominant saving).
@@ -1006,23 +1028,36 @@ impl OpenCodeConnector {
             }
         };
 
-        let mut parts_by_message: HashMap<String, Vec<PartInfo>> = HashMap::new();
+        let mut parts_by_message: HashMap<String, Vec<LoadedPart>> = HashMap::new();
         for (row_index, (message_id, row)) in rows.into_iter().enumerate() {
             opencode_scan_tick(progress_tick, row_index);
-            match serde_json::from_str::<SqlitePartData>(&row) {
+            // Keep the raw part JSON alongside the decoded fields (F14): the
+            // tool state's identity (`state.id`), status, input, title and
+            // metadata do not fit the decoded view but must survive verbatim.
+            let raw = match serde_json::from_str::<serde_json::Value>(&row) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    tracing::debug!("opencode sqlite: failed to parse part data: {e}");
+                    continue;
+                }
+            };
+            match serde_json::from_value::<SqlitePartData>(raw.clone()) {
                 Ok(part_data) => {
                     parts_by_message
                         .entry(message_id)
                         .or_default()
-                        .push(PartInfo {
-                            id: part_data.id,
-                            index: part_data.index,
-                            message_id: None,
-                            part_type: part_data.part_type,
-                            text: part_data.text,
-                            tool: part_data.tool,
-                            call_id: part_data.call_id,
-                            state: part_data.state,
+                        .push(LoadedPart {
+                            info: PartInfo {
+                                id: part_data.id,
+                                index: part_data.index,
+                                message_id: None,
+                                part_type: part_data.part_type,
+                                text: part_data.text,
+                                tool: part_data.tool,
+                                call_id: part_data.call_id,
+                                state: part_data.state,
+                            },
+                            raw,
                         });
                 }
                 Err(e) => {
@@ -1032,7 +1067,7 @@ impl OpenCodeConnector {
         }
 
         for parts in parts_by_message.values_mut() {
-            sort_parts_for_message(parts);
+            sort_loaded_parts(parts);
         }
 
         Ok(parts_by_message)
@@ -1195,6 +1230,40 @@ struct ToolState {
     input: Option<serde_json::Value>,
     #[serde(default)]
     output: Option<String>,
+    // A failed tool run's error record in `state.error` — source text the
+    // v1 render dropped (F14).
+    #[serde(default)]
+    error: Option<ToolStateError>,
+}
+
+/// A failed tool run's error record. OpenCode writes either a plain string
+/// or an object carrying the failure text under `message` (the measured
+/// real shape is `{message, type}`); any other shape is still kept so the
+/// part never loses its identity over the error's shape (F14).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ToolStateError {
+    Text(String),
+    Object {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    // Any other shape: kept unread (the raw record is archived verbatim in
+    // the message extras anyway) so a part never loses its identity over
+    // the error's shape.
+    Other(#[allow(dead_code)] serde_json::Value),
+}
+
+impl ToolStateError {
+    /// The renderable failure text: the string form, or the object's
+    /// `message`.
+    fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Object { message } => message.as_deref(),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 impl Connector for OpenCodeConnector {
@@ -1282,6 +1351,13 @@ impl Connector for OpenCodeConnector {
         // emitting both double-indexes every conversation. First-wins by
         // candidate priority order (explicit/data_dir before defaults).
         let mut seen_db_session_ids: HashSet<String> = HashSet::new();
+        // Local fix (cass review 2026-11-07, F9): a store that cannot be
+        // read fails the scan instead of hiding behind a warn (F5
+        // semantics) — a BusyRecovery-class store is read through the
+        // snapshot fallback in `open_read_only_with_snapshot_fallback`,
+        // and every other open failure reaches the host; a valid but empty
+        // store is "nothing to read" (the F9 empty-store rule).
+        let mut failures = super::checked_scan::ScanFailures::new("OpenCode");
 
         for db in db_candidates {
             if !db.is_file() || path_is_excluded(&db, &excluded_paths) {
@@ -1291,6 +1367,9 @@ impl Connector for OpenCodeConnector {
             // still deduplicated (e.g. via symlink or `./`-prefixed path).
             let canonical = std::fs::canonicalize(&db).unwrap_or_else(|_| db.clone());
             if path_is_excluded(&canonical, &excluded_paths) || !scanned_dbs.insert(canonical) {
+                continue;
+            }
+            if super::checked_scan::skip_provably_empty_store("OpenCode", &db) {
                 continue;
             }
             match Self::extract_from_sqlite(&db, ctx.since_ts, ctx.progress_tick.as_deref()) {
@@ -1316,11 +1395,7 @@ impl Connector for OpenCodeConnector {
                     // query OpenCode sessions from session") hid the engine
                     // error behind exports failing under a live writer (cass
                     // GH #519).
-                    tracing::warn!(
-                        db = %db.display(),
-                        error = %format_args!("{e:#}"),
-                        "opencode sqlite: failed to read store; conversations from it may be missing"
-                    );
+                    failures.record(&db, &e);
                 }
             }
         }
@@ -1372,7 +1447,9 @@ impl Connector for OpenCodeConnector {
 
         storage_roots.retain(|root| !path_is_excluded(root, &excluded_paths));
         if storage_roots.is_empty() {
-            return Ok(());
+            // No JSONL phase left to run: the F9 sqlite failures still fail
+            // the scan (a healthy run without failures stays Ok).
+            return failures.finish();
         }
 
         storage_roots.sort();
@@ -1488,7 +1565,7 @@ impl Connector for OpenCodeConnector {
             }
         }
 
-        Ok(())
+        failures.finish()
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
@@ -1627,6 +1704,14 @@ fn assemble_v2_assistant_content(data: &serde_json::Value) -> String {
                 let output = output.join("\n");
                 if !output.trim().is_empty() {
                     pieces.push(format!("[Tool Output]\n{output}"));
+                }
+                // A failed run's `state.error` is source text — render it
+                // instead of dropping it (F14): a plain string, or an
+                // object carrying the text under `message` (the measured
+                // real shape is `{message, type}`).
+                let error = error_text_of(item.pointer("/state/error")).unwrap_or("");
+                if !error.trim().is_empty() {
+                    pieces.push(format!("[Tool Error]\n{error}"));
                 }
             }
             _ => {}
@@ -1877,6 +1962,18 @@ fn build_v2_message_extra(
     serde_json::Value::Object(extra)
 }
 
+/// The renderable failure text of a raw `state.error` record: the string
+/// form, or the object's `message` string (F14).
+fn error_text_of(error: Option<&serde_json::Value>) -> Option<&str> {
+    match error? {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        serde_json::Value::Object(record) => {
+            record.get("message").and_then(serde_json::Value::as_str)
+        }
+        _ => None,
+    }
+}
+
 fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
     row.get(index).and_then(|value| {
         if matches!(value, SqliteValue::Null) {
@@ -2062,8 +2159,9 @@ fn load_messages_with_exclusions(
             Err(_) => continue,
         };
 
-        // Load parts for this specific message
-        let mut parts = Vec::new();
+        // Load parts for this specific message, keeping the raw part JSON
+        // alongside the decoded fields (F14) so the whole record survives.
+        let mut parts: Vec<LoadedPart> = Vec::new();
         let msg_part_dir = part_dir.join(&msg_info.id);
 
         if msg_part_dir.exists() && !path_is_excluded(&msg_part_dir, excluded_paths) {
@@ -2082,26 +2180,27 @@ fn load_messages_with_exclusions(
                         .ok()
                         .flatten()
                         .map(|c| c.trim_start_matches('\u{feff}').to_string())
-                    && let Ok(part) = serde_json::from_str::<PartInfo>(&content)
+                    && let Ok(raw) = serde_json::from_str::<serde_json::Value>(&content)
+                    && let Ok(info) = serde_json::from_value::<PartInfo>(raw.clone())
                 {
-                    parts.push(part);
+                    parts.push(LoadedPart { info, raw });
                 }
             }
         }
-        sort_parts_for_message(&mut parts);
+        sort_loaded_parts(&mut parts);
 
         // Assemble message content and invocations from parts
-        let invocations = extract_invocations_from_parts(&parts);
-        let mut content_text = assemble_content_from_parts(&parts);
-        if content_text.trim().is_empty() {
-            if invocations.is_empty() {
-                continue;
-            }
-            content_text = invocations
-                .iter()
-                .map(|inv| format!("[Tool: {}]", inv.name))
-                .collect::<Vec<_>>()
-                .join("\n");
+        let infos: Vec<PartInfo> = parts.iter().map(|part| part.info.clone()).collect();
+        let invocations = extract_invocations_from_parts(&infos);
+        let content_text = if parts.is_empty() {
+            String::new()
+        } else {
+            assemble_content_from_parts(&infos)
+        };
+        // A tool part is identity-bearing even when it renders no text, so
+        // its message survives with empty content (F13's codex rule).
+        if content_text.trim().is_empty() && invocations.is_empty() && !has_tool_part(&parts) {
+            continue;
         }
 
         // Determine role
@@ -2126,7 +2225,8 @@ fn load_messages_with_exclusions(
         };
 
         let message_id = msg_info.id.clone();
-        let extra = build_v1_message_extra(
+        // F14: archive the raw parts in delivery order.
+        let mut extra = build_v1_message_extra(
             &message_id,
             msg_info.session_id.as_deref(),
             resolved_model_id.as_deref(),
@@ -2134,6 +2234,10 @@ fn load_messages_with_exclusions(
             msg_info.tokens.as_ref(),
             invocations.len(),
         );
+        if !parts.is_empty() {
+            extra["parts"] =
+                serde_json::Value::Array(parts.iter().map(|part| part.raw.clone()).collect());
+        }
         pending.push((
             created_at,
             message_id.clone(),
@@ -2162,30 +2266,54 @@ fn load_messages_with_exclusions(
     Ok(messages)
 }
 
-fn sort_parts_for_message(parts: &mut [PartInfo]) {
-    parts.sort_by(|a, b| {
-        let a_idx = a.index.unwrap_or(i64::MAX);
-        let b_idx = b.index.unwrap_or(i64::MAX);
-        a_idx
-            .cmp(&b_idx)
-            .then_with(|| {
-                a.id.as_deref()
-                    .unwrap_or("")
-                    .cmp(b.id.as_deref().unwrap_or(""))
-            })
-            .then_with(|| {
-                a.part_type
-                    .as_deref()
-                    .unwrap_or("")
-                    .cmp(b.part_type.as_deref().unwrap_or(""))
-            })
-            .then_with(|| {
-                a.text
-                    .as_deref()
-                    .unwrap_or("")
-                    .cmp(b.text.as_deref().unwrap_or(""))
-            })
-    });
+/// A decoded part together with its raw source JSON (F14). The raw record is
+/// archived in the message extras so the host can verify the connector
+/// delivered everything — identity, input, state — instead of inferring it
+/// from the rendered text.
+#[derive(Debug, Clone)]
+struct LoadedPart {
+    info: PartInfo,
+    raw: serde_json::Value,
+}
+
+fn part_is_tool(info: &PartInfo) -> bool {
+    info.part_type.as_deref() == Some("tool")
+}
+
+/// Whether any of a message's loaded parts is a tool part — a part that
+/// carries identity and state even when it renders no text at all.
+fn has_tool_part(parts: &[LoadedPart]) -> bool {
+    parts.iter().any(|part| part_is_tool(&part.info))
+}
+
+fn compare_part_infos(a: &PartInfo, b: &PartInfo) -> std::cmp::Ordering {
+    let a_idx = a.index.unwrap_or(i64::MAX);
+    let b_idx = b.index.unwrap_or(i64::MAX);
+    a_idx
+        .cmp(&b_idx)
+        .then_with(|| {
+            a.id.as_deref()
+                .unwrap_or("")
+                .cmp(b.id.as_deref().unwrap_or(""))
+        })
+        .then_with(|| {
+            a.part_type
+                .as_deref()
+                .unwrap_or("")
+                .cmp(b.part_type.as_deref().unwrap_or(""))
+        })
+        .then_with(|| {
+            a.text
+                .as_deref()
+                .unwrap_or("")
+                .cmp(b.text.as_deref().unwrap_or(""))
+        })
+}
+
+/// Sort raw-archived parts into the same order the content renders in, so
+/// `extra["parts"]` mirrors the delivered content piece for piece.
+fn sort_loaded_parts(parts: &mut [LoadedPart]) {
+    parts.sort_by(|a, b| compare_part_infos(&a.info, &b.info));
 }
 
 /// Assemble message content from parts
@@ -2202,12 +2330,20 @@ fn assemble_content_from_parts(parts: &[PartInfo]) -> String {
                 }
             }
             Some("tool") => {
-                // Include tool output if available
-                if let Some(state) = &part.state
-                    && let Some(output) = &state.output
-                    && !output.trim().is_empty()
-                {
-                    content_pieces.push(format!("[Tool Output]\n{}", output));
+                // Include tool output and error text if available. The error
+                // text is source text a failed run carries in `state.error` —
+                // it used to be dropped (F14).
+                if let Some(state) = &part.state {
+                    if let Some(output) = &state.output
+                        && !output.trim().is_empty()
+                    {
+                        content_pieces.push(format!("[Tool Output]\n{}", output));
+                    }
+                    if let Some(error) = state.error.as_ref().and_then(|e| e.text())
+                        && !error.trim().is_empty()
+                    {
+                        content_pieces.push(format!("[Tool Error]\n{}", error));
+                    }
                 }
             }
             Some("reasoning") => {
@@ -2274,6 +2410,7 @@ fn extract_invocations_from_parts(parts: &[PartInfo]) -> Vec<NormalizedInvocatio
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -2469,6 +2606,7 @@ mod tests {
             state: Some(ToolState {
                 input: None,
                 output: Some("Tool executed successfully".into()),
+                error: None,
             }),
             ..PartInfo::default()
         }];
@@ -2591,6 +2729,7 @@ mod tests {
                 state: Some(ToolState {
                     input: None,
                     output: Some("Result: 42".into()),
+                    error: None,
                 }),
                 ..PartInfo::default()
             },
@@ -2602,29 +2741,23 @@ mod tests {
     }
 
     #[test]
-    fn sort_parts_for_message_orders_by_index_then_id() {
-        let mut parts = vec![
-            PartInfo {
-                id: Some("b".into()),
-                index: Some(2),
+    fn sort_loaded_parts_orders_by_index_then_id() {
+        let part = |id: &str, index: i64, text: &str| LoadedPart {
+            info: PartInfo {
+                id: Some(id.into()),
+                index: Some(index),
                 message_id: Some("m1".into()),
                 part_type: Some("text".into()),
-                text: Some("second".into()),
+                text: Some(text.into()),
                 ..PartInfo::default()
             },
-            PartInfo {
-                id: Some("a".into()),
-                index: Some(1),
-                message_id: Some("m1".into()),
-                part_type: Some("text".into()),
-                text: Some("first".into()),
-                ..PartInfo::default()
-            },
-        ];
+            raw: serde_json::json!({}),
+        };
+        let mut parts = vec![part("b", 2, "second"), part("a", 1, "first")];
 
-        sort_parts_for_message(&mut parts);
-        assert_eq!(parts[0].text.as_deref(), Some("first"));
-        assert_eq!(parts[1].text.as_deref(), Some("second"));
+        sort_loaded_parts(&mut parts);
+        assert_eq!(parts[0].info.text.as_deref(), Some("first"));
+        assert_eq!(parts[1].info.text.as_deref(), Some("second"));
     }
 
     // =====================================================
@@ -2712,7 +2845,7 @@ mod tests {
         write_part(&storage, "msg-001", &part);
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -2729,8 +2862,6 @@ mod tests {
 
     #[test]
     fn scan_with_opencode_root_scan_root() {
-        use crate::connectors::scan::ScanRoot;
-
         let dir = TempDir::new().unwrap();
         let storage = create_opencode_storage(&dir);
 
@@ -2766,11 +2897,7 @@ mod tests {
         write_part(&storage, "msg-001", &part);
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::with_roots(
-            PathBuf::new(),
-            vec![ScanRoot::local(dir.path().join("opencode"))],
-            None,
-        );
+        let ctx = remote_scan_context(Path::new(""), &dir.path().join("opencode"));
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -2828,7 +2955,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -2844,7 +2971,7 @@ mod tests {
         let storage = create_opencode_storage(&dir);
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -2864,7 +2991,7 @@ mod tests {
         // Don't create any messages
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -2901,7 +3028,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].title, Some("This is the first line".to_string()));
@@ -2932,7 +3059,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].agent_slug, "opencode");
@@ -2963,7 +3090,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].metadata["session_id"], "sess-meta");
@@ -3009,7 +3136,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].messages.len(), 2);
@@ -3050,7 +3177,7 @@ mod tests {
         }
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].messages[0].idx, 0);
@@ -3079,7 +3206,7 @@ mod tests {
         // Don't create any parts
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         // Session should be skipped because message has no content
@@ -3114,7 +3241,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         // Should only have one conversation (deduplicated)
@@ -3146,7 +3273,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         // Default role should be "assistant"
@@ -3190,7 +3317,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         let content = &convs[0].messages[0].content;
@@ -3228,7 +3355,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].started_at, Some(1_733_000_000_000));
@@ -3261,7 +3388,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(
@@ -3281,7 +3408,7 @@ mod tests {
         fs::write(session_dir.join("invalid.json"), "not valid json").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -3304,7 +3431,7 @@ mod tests {
         fs::write(msg_dir.join("bad.json"), "not valid json").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         // Should skip the session because no valid messages
@@ -3365,7 +3492,7 @@ mod tests {
         fs::write(session_dir.join("sess-empty.json"), "").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -3379,7 +3506,7 @@ mod tests {
         fs::write(session_dir.join("sess-ws.json"), "   \n\t  ").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -3397,7 +3524,7 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -3415,7 +3542,7 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -3432,7 +3559,7 @@ mod tests {
         std::fs::write(session_dir.join("sess-bom.json"), &data).unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         // BOM may cause parse failure; connector should skip gracefully
         let convs = connector.scan(&ctx).unwrap();
         assert!(convs.len() <= 1);
@@ -3448,7 +3575,7 @@ mod tests {
         fs::write(session_dir.join("sess-bad.json"), r#"{"id": 12345}"#).unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         // Should skip since id is not a string (serde will fail)
         assert_eq!(convs.len(), 0);
@@ -3487,7 +3614,7 @@ mod tests {
         fs::write(part_dir.join("p-deep.json"), &nested).unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         // Should not stack overflow
         let result = connector.scan(&ctx);
         assert!(result.is_ok());
@@ -3517,7 +3644,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.len() >= 1_000_000);
@@ -3546,7 +3673,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.contains("hello"));
@@ -3576,7 +3703,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         // Message with only whitespace content should be skipped
         assert_eq!(convs.len(), 0);
@@ -3611,7 +3738,7 @@ mod tests {
         fs::write(msg_dir.join("msg-corrupt.json"), "{{{{not json").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         // Valid message should still be parsed; corrupted one skipped
         assert_eq!(convs.len(), 1);
@@ -3637,7 +3764,7 @@ mod tests {
         // Don't create part directory at all (not even the part/msg-nopartdir/ dir)
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         // Message without parts should be skipped (empty content)
         assert_eq!(convs.len(), 0);
@@ -3667,7 +3794,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         // Part without type is ignored, message has no content, so session skipped
         assert_eq!(convs.len(), 0);
@@ -3707,7 +3834,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         let content = &convs[0].messages[0].content;
@@ -3756,7 +3883,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -3792,7 +3919,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -3823,7 +3950,7 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = remote_scan_context(&storage, &storage);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         // Timestamps should be None
@@ -4548,9 +4675,11 @@ mod tests {
         )
         .unwrap();
 
-        // Pass the parent directory (not the .db file itself).
+        // Pass the parent directory (not the .db file itself). The scan root
+        // is remote so `allow_local_default_dbs` stays false: a local root
+        // would drag this machine's real opencode store into the result.
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+        let ctx = remote_scan_context(dir.path(), dir.path());
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-parent"));
@@ -4562,8 +4691,6 @@ mod tests {
     /// ctx.data_dir-as-parent candidate if one is present.
     #[test]
     fn scan_finds_sqlite_db_via_data_dir_even_with_explicit_scan_roots() {
-        use crate::connectors::scan::ScanRoot;
-
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
@@ -4598,11 +4725,7 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::with_roots(
-            dir.path().to_path_buf(),
-            vec![ScanRoot::local(dir.path().to_path_buf())],
-            None,
-        );
+        let ctx = remote_scan_context(dir.path(), dir.path());
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(
             convs.len(),
@@ -4614,8 +4737,6 @@ mod tests {
 
     #[test]
     fn scan_finds_sqlite_db_with_explicit_config_root() {
-        use crate::connectors::scan::ScanRoot;
-
         let dir = TempDir::new().unwrap();
         let config_root = dir.path().join(".config");
         let opencode_dir = config_root.join("opencode");
@@ -4654,11 +4775,7 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::with_roots(
-            dir.path().to_path_buf(),
-            vec![ScanRoot::local(config_root)],
-            None,
-        );
+        let ctx = remote_scan_context(dir.path(), &config_root);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-config"));
@@ -4705,8 +4822,9 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        // Pass the db file itself as data_dir.
-        let ctx = ScanContext::local_default(db_path.clone(), None);
+        // Pass the db file itself as data_dir; the remote root keeps the
+        // machine's real store out of the scan.
+        let ctx = remote_scan_context(&db_path, dir.path());
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-direct"));
@@ -4723,13 +4841,7 @@ mod tests {
         // No file on disk at `missing`.
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::with_roots(
-            missing,
-            vec![crate::connectors::scan::ScanRoot::local(
-                dir.path().to_path_buf(),
-            )],
-            None,
-        );
+        let ctx = remote_scan_context(&missing, dir.path());
         let convs = connector.scan(&ctx).unwrap();
         assert!(
             convs.is_empty(),
@@ -5438,6 +5550,789 @@ mod tests {
                 .pointer("/cass/tool_call_count")
                 .and_then(serde_json::Value::as_u64),
             Some(1)
+        );
+    }
+
+    // =====================================================
+    // Tool part identity/state kept in extras (cass F14)
+    // =====================================================
+
+    #[test]
+    fn sqlite_v2_tool_part_identity_and_state_archived_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        insert_v2_session(&conn, "ses_tool", "Tool session", 1_700_000_100_000);
+        insert_v2_message(&conn, "ses_tool", 0, "user", r#"{"text":"probe the repo"}"#);
+        insert_v2_message(
+            &conn,
+            "ses_tool",
+            1,
+            "assistant",
+            r#"{"agent":"build","model":{"id":"gpt-5","providerID":"openai"},"time":{"created":1700000002000},
+                "content":[
+                  {"type":"reasoning","text":"plan first","native":{},"time":{}},
+                  {"type":"text","text":"running it now"},
+                  {"type":"tool","executed":false,"id":"prt_1","name":"shell","time":{"created":1,"ran":2,"completed":3},
+                   "state":{"status":"completed","input":{"command":"make check"},"metadata":{"duration":3},
+                     "content":[{"type":"text","text":"ok. 3 passed"}]}},
+                  {"type":"tool","executed":false,"id":"prt_2","name":"edit","time":{"created":4,"ran":5,"completed":6},
+                   "state":{"status":"error","input":{"path":"b.rs","oldString":"x","newString":"y"},
+                     "error":"exit 1: no such file"}}]}"#,
+        );
+        // The no-tool-parts shape (the ses_ebad… blocker): the content
+        // items are still archived so the host can PROVE no tool part
+        // exists instead of treating absence as unverifiable.
+        insert_v2_message(
+            &conn,
+            "ses_tool",
+            2,
+            "assistant",
+            r#"{"agent":"build","model":{"id":"gpt-5","providerID":"openai"},"time":{"created":1700000003000},
+                "content":[
+                  {"type":"reasoning","text":"wrap up","native":{},"time":{}},
+                  {"type":"text","text":"all done"}]}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 3, "user + two assistant rows");
+        let tool_row = &convs[0].messages[1];
+        // Text results render inline; the error state's text renders too
+        // (it is source text — dropping it left the text inventory a gap).
+        assert_eq!(
+            tool_row.content,
+            "[Reasoning]\nplan first\n\nrunning it now\n\n[Tool Output]\nok. 3 passed\n\n[Tool Error]\nexit 1: no such file"
+        );
+        // The raw content items are archived verbatim in the extras.
+        let parts = tool_row.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["type"], "reasoning");
+        assert_eq!(parts[2]["id"], "prt_1");
+        assert_eq!(parts[2]["name"], "shell");
+        assert_eq!(parts[2]["executed"], false);
+        assert_eq!(parts[2]["state"]["status"], "completed");
+        assert_eq!(parts[2]["state"]["input"]["command"], "make check");
+        assert_eq!(parts[2]["state"]["content"][0]["text"], "ok. 3 passed");
+        assert_eq!(parts[3]["id"], "prt_2");
+        assert_eq!(parts[3]["state"]["status"], "error");
+        assert_eq!(parts[3]["state"]["input"]["path"], "b.rs");
+        assert_eq!(parts[3]["state"]["error"], "exit 1: no such file");
+        let plain_row = &convs[0].messages[2];
+        assert_eq!(plain_row.content, "[Reasoning]\nwrap up\n\nall done");
+        let plain_parts = plain_row.extra["parts"].as_array().unwrap();
+        assert_eq!(plain_parts.len(), 2, "no-tool rows archive their parts too");
+        assert!(plain_parts.iter().all(|p| p["type"] != "tool"));
+    }
+
+    #[test]
+    fn sqlite_v2_textless_tool_part_row_is_kept() {
+        // A tool part whose state holds no text at all (file-only results)
+        // used to vanish with its whole row, dropping its identity and
+        // state. The row is kept with empty content — F13's codex rule —
+        // so the host can still prove the part existed.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        insert_v2_session(&conn, "ses_img", "Image session", 1_700_000_100_000);
+        insert_v2_message(&conn, "ses_img", 0, "user", r#"{"text":"draw a cat"}"#);
+        insert_v2_message(
+            &conn,
+            "ses_img",
+            1,
+            "assistant",
+            r#"{"agent":"build","model":{"id":"gpt-5","providerID":"openai"},"time":{"created":1700000002000},
+                "content":[
+                  {"type":"tool","executed":false,"id":"prt_img","name":"generate","time":{},
+                   "state":{"status":"completed","input":{"prompt":"a cat"},
+                     "content":[{"type":"file","uri":"file:///out.png","mime":"image/png"}]}}]}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].messages.len(),
+            2,
+            "the textless tool row must survive"
+        );
+        let row = &convs[0].messages[1];
+        assert_eq!(row.content, "");
+        assert_eq!(row.role, "assistant");
+        let parts = row.extra["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["id"], "prt_img");
+        assert_eq!(parts[0]["state"]["content"][0]["mime"], "image/png");
+    }
+
+    #[test]
+    fn sqlite_v2_error_object_message_renders_and_archives() {
+        // The real failed-run shape: `state.error` is an OBJECT carrying the
+        // failure text under `message` (measured shape: `{message, type}`,
+        // status `error`), not a plain string. The render must deliver that
+        // text and the archive must keep the object verbatim.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        insert_v2_session(&conn, "ses_err", "Error session", 1_700_000_100_000);
+        insert_v2_message(&conn, "ses_err", 0, "user", r#"{"text":"run it"}"#);
+        insert_v2_message(
+            &conn,
+            "ses_err",
+            1,
+            "assistant",
+            r#"{"agent":"build","model":{"id":"gpt-5","providerID":"openai"},"time":{"created":1700000002000},
+                "content":[
+                  {"type":"text","text":"trying now"},
+                  {"type":"tool","executed":false,"id":"prt_err","name":"shell","time":{},
+                   "state":{"status":"error","input":{"command":"make check"},
+                     "error":{"message":"boom: denied","type":"tool_error"}}}]}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        let row = &convs[0].messages[1];
+        assert_eq!(row.content, "trying now\n\n[Tool Error]\nboom: denied");
+        let parts = row.extra["parts"].as_array().unwrap();
+        assert_eq!(parts[1]["id"], "prt_err");
+        assert_eq!(parts[1]["state"]["status"], "error");
+        assert_eq!(parts[1]["state"]["error"]["message"], "boom: denied");
+        assert_eq!(parts[1]["state"]["error"]["type"], "tool_error");
+    }
+
+    #[test]
+    fn sqlite_legacy_tool_part_state_archived_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-lt", "Legacy tools"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["msg-lt", "sess-lt", r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-lt-1",
+                "msg-lt",
+                "sess-lt",
+                r#"{"id":"p-lt-1","messageID":"msg-lt","order":0,"type":"text","text":"checking"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-lt-2",
+                "msg-lt",
+                "sess-lt",
+                r#"{"id":"p-lt-2","messageID":"msg-lt","order":1,"type":"tool",
+                    "state":{"id":"toolu_01","status":"completed","input":{"command":"make"},
+                    "output":"done","title":"Bash","metadata":{"exit":0},"time":{"start":1,"end":2}}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-lt-3",
+                "msg-lt",
+                "sess-lt",
+                r#"{"id":"p-lt-3","messageID":"msg-lt","order":2,"type":"tool",
+                    "state":{"id":"toolu_02","status":"error","input":{"path":"c.rs"},"error":"boom: denied"}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1);
+        let message = &convs[0].messages[0];
+        assert_eq!(
+            message.content,
+            "checking\n\n[Tool Output]\ndone\n\n[Tool Error]\nboom: denied"
+        );
+        let parts = message.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[1]["id"], "p-lt-2");
+        assert_eq!(parts[1]["state"]["id"], "toolu_01");
+        assert_eq!(parts[1]["state"]["status"], "completed");
+        assert_eq!(parts[1]["state"]["input"]["command"], "make");
+        assert_eq!(parts[1]["state"]["title"], "Bash");
+        assert_eq!(parts[2]["state"]["error"], "boom: denied");
+        assert_eq!(parts[2]["state"]["input"]["path"], "c.rs");
+    }
+
+    #[test]
+    fn sqlite_legacy_error_object_part_kept_and_rendered() {
+        // Same failed-run shape on a 1.x part row: the error record is an
+        // object with the text under `message`. The typed view must not drop
+        // the whole part (identity) over the error's shape, and the text
+        // must render.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-eo", "Error object"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["msg-eo", "sess-eo", r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-eo-1",
+                "msg-eo",
+                "sess-eo",
+                r#"{"id":"p-eo-1","messageID":"msg-eo","order":0,"type":"text","text":"checking"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-eo-2",
+                "msg-eo",
+                "sess-eo",
+                r#"{"id":"p-eo-2","messageID":"msg-eo","order":1,"type":"tool",
+                    "state":{"id":"toolu_e1","status":"error","input":{"command":"make"},
+                    "error":{"message":"boom: denied","type":"tool_error"},"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1, "the tool part must survive");
+        let message = &convs[0].messages[0];
+        assert_eq!(message.content, "checking\n\n[Tool Error]\nboom: denied");
+        let parts = message.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "both parts are archived");
+        assert_eq!(parts[1]["state"]["id"], "toolu_e1");
+        assert_eq!(parts[1]["state"]["error"]["message"], "boom: denied");
+        assert_eq!(parts[1]["state"]["error"]["type"], "tool_error");
+    }
+
+    #[test]
+    fn sqlite_legacy_unreadable_error_shape_keeps_identity() {
+        // An error record with no renderable text — an object without a
+        // `message`, or a non-string non-object shape — keeps the part (and
+        // its identity/state) alive; nothing is guessed or dropped.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-odd", "Odd errors"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["msg-odd", "sess-odd", r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-od-1",
+                "msg-odd",
+                "sess-odd",
+                r#"{"id":"p-od-1","messageID":"msg-odd","order":0,"type":"tool",
+                    "state":{"id":"toolu_o1","status":"error","input":{"command":"ls"},
+                    "error":{"type":"no_message"},"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-od-2",
+                "msg-odd",
+                "sess-odd",
+                r#"{"id":"p-od-2","messageID":"msg-odd","order":1,"type":"tool",
+                    "state":{"id":"toolu_o2","status":"error","input":{"command":"pwd"},
+                    "error":42,"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].messages.len(),
+            1,
+            "both identity-bearing tool parts must survive"
+        );
+        let message = &convs[0].messages[0];
+        assert_eq!(message.content, "", "no text to render, row still kept");
+        assert!(!message.content.contains("[Tool Error]"));
+        let parts = message.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["state"]["error"]["type"], "no_message");
+        assert_eq!(parts[1]["state"]["error"], 42);
+    }
+
+    #[test]
+    fn sqlite_legacy_textless_tool_part_message_is_kept() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-lq", "Legacy quiet"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["msg-lq", "sess-lq", r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "p-lq-1",
+                "msg-lq",
+                "sess-lq",
+                r#"{"id":"p-lq-1","messageID":"msg-lq","order":0,"type":"tool",
+                    "state":{"id":"toolu_03","status":"completed","input":{"command":"ls"},"title":"Bash"}}"#,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].messages.len(),
+            1,
+            "the textless tool message survives"
+        );
+        let message = &convs[0].messages[0];
+        assert_eq!(message.content, "");
+        let parts = message.extra["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["state"]["id"], "toolu_03");
+    }
+
+    #[test]
+    fn file_layout_tool_part_state_archived_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_opencode_storage(&dir);
+        let session = json!({"id": "sess-ft", "projectID": "proj-001"});
+        write_session(&storage, "proj-001", &session);
+        let message = json!({
+            "id": "msg-ft", "role": "assistant", "sessionID": "sess-ft",
+            "time": {"created": 1733000000}
+        });
+        write_message(&storage, "sess-ft", &message);
+        write_part(
+            &storage,
+            "msg-ft",
+            &json!({
+                "id": "p-ft-1", "messageID": "msg-ft", "order": 0, "type": "text",
+                "text": "checking files"
+            }),
+        );
+        write_part(
+            &storage,
+            "msg-ft",
+            &json!({
+                "id": "p-ft-2", "messageID": "msg-ft", "order": 1, "type": "tool",
+                "state": {"id": "toolu_04", "status": "completed",
+                    "input": {"path": "d.rs"}, "output": "42 lines", "title": "Read"}
+            }),
+        );
+        // A textless tool part keeps its message alive too.
+        write_message(
+            &storage,
+            "sess-ft",
+            &json!({
+                "id": "msg-ft-2", "role": "assistant", "sessionID": "sess-ft",
+                "time": {"created": 1733000001}
+            }),
+        );
+        write_part(
+            &storage,
+            "msg-ft-2",
+            &json!({
+                "id": "p-ft-3", "messageID": "msg-ft-2", "order": 0, "type": "tool",
+                "state": {"id": "toolu_05", "status": "completed",
+                    "input": {"command": "pwd"}, "title": "Bash"}
+            }),
+        );
+
+        let connector = OpenCodeConnector::new();
+        let ctx = remote_scan_context(&storage, &storage);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        let first = &convs[0].messages[0];
+        assert_eq!(first.content, "checking files\n\n[Tool Output]\n42 lines");
+        let parts = first.extra["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1]["state"]["id"], "toolu_04");
+        assert_eq!(parts[1]["state"]["input"]["path"], "d.rs");
+        let quiet = &convs[0].messages[1];
+        assert_eq!(quiet.content, "");
+        let quiet_parts = quiet.extra["parts"].as_array().unwrap();
+        assert_eq!(quiet_parts[0]["state"]["id"], "toolu_05");
+    }
+
+    #[test]
+    fn assemble_content_from_parts_renders_tool_error() {
+        let parts = vec![PartInfo {
+            id: Some("p-err".into()),
+            index: Some(0),
+            message_id: None,
+            part_type: Some("tool".into()),
+            text: None,
+            tool: None,
+            call_id: None,
+            state: Some(ToolState {
+                input: None,
+                output: Some("partial out".into()),
+                error: Some(ToolStateError::Text("boom: denied".into())),
+            }),
+        }];
+        let content = assemble_content_from_parts(&parts);
+        assert_eq!(
+            content,
+            "[Tool Output]\npartial out\n\n[Tool Error]\nboom: denied"
+        );
+        // The object error shape renders its `message` text; a shape with
+        // no renderable text renders nothing without losing the part.
+        let parts = vec![PartInfo {
+            id: Some("p-err-obj".into()),
+            index: Some(0),
+            message_id: None,
+            part_type: Some("tool".into()),
+            text: None,
+            tool: None,
+            call_id: None,
+            state: Some(ToolState {
+                input: None,
+                output: None,
+                error: Some(ToolStateError::Object {
+                    message: Some("denied again".into()),
+                }),
+            }),
+        }];
+        assert_eq!(
+            assemble_content_from_parts(&parts),
+            "[Tool Error]\ndenied again"
+        );
+        let parts = vec![PartInfo {
+            id: Some("p-err-odd".into()),
+            index: Some(0),
+            message_id: None,
+            part_type: Some("tool".into()),
+            text: None,
+            tool: None,
+            call_id: None,
+            state: Some(ToolState {
+                input: None,
+                output: None,
+                error: Some(ToolStateError::Other(serde_json::json!({"type": "x"}))),
+            }),
+        }];
+        assert_eq!(assemble_content_from_parts(&parts), "");
+    }
+
+    // =====================================================
+    // Unusable WAL-index fallback (cass F9)
+    // =====================================================
+
+    /// Path of a SQLite sidecar file (`<db>-wal`, `<db>-shm`).
+    fn sqlite_sidecar(db: &Path, suffix: &str) -> PathBuf {
+        let mut raw = db.as_os_str().to_owned();
+        raw.push(suffix);
+        PathBuf::from(raw)
+    }
+
+    /// `(bytes, mtime)` of one store file, for never-modify assertions.
+    fn file_state(path: &Path) -> (Option<Vec<u8>>, Option<std::time::SystemTime>) {
+        (
+            fs::read(path).ok(),
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok(),
+        )
+    }
+
+    /// An OpenCode SQLite store in WAL mode with one committed session, closed
+    /// the way a hard-killed OpenCode leaves it: the writer is gone, and a
+    /// checkpointed `-wal` (0 bytes) plus its `-shm` wal-index remain next to
+    /// the db.
+    fn create_wal_mode_sqlite_db(dir: &Path) -> PathBuf {
+        let db_path = dir.join("opencode.db");
+        let conn = open_test_connection(&db_path);
+        let mode: String = conn
+            .query_row_map("PRAGMA journal_mode=wal;", &[], |row| {
+                row.get_typed::<String>(0)
+            })
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT,
+                title TEXT,
+                directory TEXT,
+                time_created TEXT DEFAULT CURRENT_TIMESTAMP,
+                time_updated TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                time_created TEXT DEFAULT CURRENT_TIMESTAMP,
+                time_updated TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                time_created TEXT DEFAULT CURRENT_TIMESTAMP,
+                time_updated TEXT DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+
+        conn.execute_compat(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            params!["sess-1", "proj-1", "Crashed Store", "/home/user/project"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params![
+                "msg-1",
+                "sess-1",
+                r#"{"role":"user","time":{"created":1700000000000}}"#
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part-1",
+                "msg-1",
+                "sess-1",
+                r#"{"type":"text","text":"Hello world"}"#
+            ],
+        )
+        .unwrap();
+
+        // The incident shape: every frame checkpointed into the db, so the
+        // `-wal` remains on disk at 0 bytes after the writer exits.
+        conn.query_row_map::<(i64, i64, i64), _>("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+            Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+        })
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            sqlite_sidecar(&db_path, "-wal").is_file(),
+            "the writer must leave a `-wal` file behind"
+        );
+        assert!(
+            sqlite_sidecar(&db_path, "-shm").is_file(),
+            "the writer must leave a `-shm` wal-index behind"
+        );
+        db_path
+    }
+
+    /// Leave the `-shm` wal-index in one of the states a crashed writer can:
+    /// `garbage` bytes, a `torn` header checksum (one flipped bit), `absent`,
+    /// `zeroed`, or `empty`. A store in any of these states must still be
+    /// read, and the user's db and `-wal` files must never change.
+    fn damage_wal_index(db: &Path, state: &str) {
+        let shm = sqlite_sidecar(db, "-shm");
+        match state {
+            "garbage" => fs::write(&shm, vec![0xA5_u8; 32_768]).unwrap(),
+            "torn" => {
+                let mut bytes = fs::read(&shm).unwrap();
+                assert!(bytes.len() > 24, "the fixture `-shm` must have a header");
+                // One flipped bit inside the wal-index header's checksum word:
+                // a sidecar torn mid-write.
+                bytes[16] ^= 0x01;
+                fs::write(&shm, bytes).unwrap();
+            }
+            "absent" => fs::remove_file(&shm).unwrap(),
+            "zeroed" => fs::write(&shm, vec![0_u8; 32_768]).unwrap(),
+            "empty" => fs::write(&shm, []).unwrap(),
+            other => unreachable!("unknown wal-index state: {other}"),
+        }
+    }
+
+    /// A scan context whose single scan root is remote, so
+    /// `allow_local_default_dbs` is false and this machine's real
+    /// `~/.local/share/opencode` store is never probed: the fixture store is
+    /// the only candidate.
+    fn remote_scan_context(data_dir: &Path, root: &Path) -> crate::connectors::scan::ScanContext {
+        let origin = crate::types::Origin::remote_with_host("testhost", "u@testhost");
+        let scan_root = crate::connectors::scan::ScanRoot::remote(root.to_path_buf(), origin, None);
+        crate::connectors::scan::ScanContext::with_roots(
+            data_dir.to_path_buf(),
+            vec![scan_root],
+            None,
+        )
+    }
+
+    /// A store left with an unusable wal-index (the OpenCode crash shape from
+    /// the 2026-11-07 zero-index incident) must still be read, without
+    /// modifying the user's files. The db and `-wal` are never written by any
+    /// read-only open; the `-shm` is never written whenever the snapshot
+    /// fallback engages, and `garbage`/`torn` wal-indexes refuse the strict
+    /// open on every frankensqlite build, so the fallback always engages for
+    /// them.
+    #[serial]
+    #[test]
+    fn sqlite_scan_reads_a_store_left_with_an_unusable_wal_index() {
+        for state in ["garbage", "torn", "absent", "zeroed", "empty"] {
+            let dir = TempDir::new().unwrap();
+            let db_path = create_wal_mode_sqlite_db(dir.path());
+            damage_wal_index(&db_path, state);
+            let before_db = file_state(&db_path);
+            let before_wal = file_state(&sqlite_sidecar(&db_path, "-wal"));
+            let before_shm = file_state(&sqlite_sidecar(&db_path, "-shm"));
+
+            let ctx = remote_scan_context(dir.path(), dir.path());
+            let convs = OpenCodeConnector::new()
+                .scan(&ctx)
+                .unwrap_or_else(|error| panic!("{state}: scan failed: {error:#}"));
+
+            assert_eq!(
+                convs.len(),
+                1,
+                "{state}: the crashed store must still be read"
+            );
+            assert_eq!(convs[0].external_id.as_deref(), Some("sess-1"), "{state}");
+            assert_eq!(
+                convs[0].messages[0].content, "Hello world",
+                "{state}: the session transcript must be readable"
+            );
+
+            assert_eq!(
+                file_state(&db_path),
+                before_db,
+                "{state}: reading must never modify the db"
+            );
+            assert_eq!(
+                file_state(&sqlite_sidecar(&db_path, "-wal")),
+                before_wal,
+                "{state}: reading must never modify the `-wal`"
+            );
+            if matches!(state, "garbage" | "torn") {
+                assert_eq!(
+                    file_state(&sqlite_sidecar(&db_path, "-shm")),
+                    before_shm,
+                    "{state}: the snapshot fallback must leave the `-shm` untouched"
+                );
+            }
+        }
+    }
+
+    /// A store that fails to open for any other reason must surface as a
+    /// scan error (cass F5 semantics), not a swallowed warn plus an
+    /// Ok(0 conversations) scan.
+    #[serial]
+    #[test]
+    fn sqlite_scan_reports_an_unreadable_store_as_a_scan_error() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("opencode.db"),
+            b"this is not a sqlite database",
+        )
+        .unwrap();
+
+        let ctx = remote_scan_context(dir.path(), dir.path());
+        let error = OpenCodeConnector::new().scan(&ctx).unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("opencode.db"),
+            "the scan error must name the failing store: {chain}"
+        );
+    }
+
+    /// cass follow-up to F9 (2026-11-07): a store that is a *valid but empty*
+    /// database is not a failure. SQLite's own semantics make a 0-byte file an
+    /// empty database, and a fresh install commonly creates the store file
+    /// before its first write; a readable schema with no tables at all holds
+    /// no sessions either way. Both must scan to `Ok` with 0 conversations
+    /// (logged at debug), not a scan error on every index run.
+    #[test]
+    fn sqlite_scan_treats_a_provably_empty_store_as_no_sessions() {
+        for state in ["zero-byte", "no-tables"] {
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("opencode.db");
+            match state {
+                // A fresh install before its first write: the store file
+                // exists but holds nothing.
+                "zero-byte" => fs::write(&db_path, []).unwrap(),
+                // A real database file (valid header, nonzero size) whose
+                // schema holds no tables at all.
+                "no-tables" => {
+                    let conn = open_test_connection(&db_path);
+                    conn.execute("CREATE TABLE schema_marker (x INTEGER);")
+                        .unwrap();
+                    conn.execute("DROP TABLE schema_marker;").unwrap();
+                    drop(conn);
+                    assert!(
+                        fs::metadata(&db_path).unwrap().len() > 0,
+                        "{state}: the fixture must be a real database file, not 0 bytes"
+                    );
+                }
+                other => unreachable!("unknown empty-store state: {other}"),
+            }
+
+            let ctx = remote_scan_context(dir.path(), dir.path());
+            let convs = OpenCodeConnector::new().scan(&ctx).unwrap_or_else(|error| {
+                panic!("{state}: an empty store must not be a scan error: {error:#}")
+            });
+            assert!(
+                convs.is_empty(),
+                "{state}: an empty store holds no conversations"
+            );
+        }
+    }
+
+    /// Schema drift is not emptiness: a database that has *some* tables but
+    /// none of OpenCode's is an app migration or corruption, and must still
+    /// surface as a scan error naming the store (F5 semantics, unchanged).
+    #[test]
+    fn sqlite_scan_reports_schema_drift_as_a_scan_error() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = open_test_connection(&db_path);
+        conn.execute("CREATE TABLE unrelated_table (x INTEGER);")
+            .unwrap();
+        drop(conn);
+
+        let ctx = remote_scan_context(dir.path(), dir.path());
+        let error = OpenCodeConnector::new().scan(&ctx).unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("opencode.db"),
+            "schema drift must name the failing store: {chain}"
         );
     }
 }

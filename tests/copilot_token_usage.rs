@@ -128,7 +128,15 @@ fn native_turn_totals_count_output_without_guessing_input_or_model() {
              "cached_tokens": 60, "output_tokens": 30},
         ])
     );
-    assert_eq!(assistant.extra.as_object().unwrap().len(), 3);
+    // F14 (cass, merged): the raw `response` part array is archived
+    // verbatim as `copilot_response_parts` (non-empty arrays only), so the
+    // assistant extra carries one key more than the pre-merge shape
+    // (request_id, model_id, cass, copilot_response_parts).
+    assert_eq!(assistant.extra.as_object().unwrap().len(), 4);
+    assert_eq!(
+        assistant.extra["copilot_response_parts"],
+        json!([{"value": "Answer text."}])
+    );
     assert!(conversation.messages[0].extra.get("cass").is_none());
     assert_eq!(api_output(&conversation), 50);
 }

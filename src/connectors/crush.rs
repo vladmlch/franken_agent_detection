@@ -17,9 +17,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
+use frankensqlite::compat::{ParamValue, RowExt};
 
-use super::sqlite_sync::{ConnectionExt, open_with_flags};
+use super::sqlite_sync::{ConnectionExt, open_read_only_with_snapshot_fallback};
 use serde::Deserialize;
 
 use super::scan::{
@@ -78,11 +78,8 @@ impl CrushConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Crush db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open Crush db: {}", db_path.display()))?;
 
         conn.execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
@@ -229,12 +226,22 @@ impl Connector for CrushConnector {
         let sources = Self::discover_sources(ctx)?;
         // Track seen session IDs to dedup across global + per-project databases.
         let mut seen_ids: HashSet<String> = HashSet::new();
+        // Local fix (cass review 2026-11-07, F9): a store that cannot be
+        // read fails the scan instead of hiding behind a debug log (F5
+        // semantics) — a BusyRecovery-class store is read through the
+        // snapshot fallback in `open_read_only_with_snapshot_fallback`,
+        // and every other open failure reaches the host; a valid but empty
+        // store is "nothing to read" (the F9 empty-store rule).
+        let mut failures = super::checked_scan::ScanFailures::new("Crush");
 
         for source in sources {
             if !hooks.should_scan(&source) {
                 continue;
             }
             ctx.tick();
+            if super::checked_scan::skip_provably_empty_store("Crush", &source.source_path) {
+                continue;
+            }
             match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
                 Ok(db_convs) => {
                     tracing::debug!(
@@ -259,16 +266,10 @@ impl Connector for CrushConnector {
                         })?;
                     }
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        "crush sqlite: failed to read {}: {e}",
-                        source.source_path.display()
-                    );
-                }
+                Err(e) => failures.record(&source.source_path, &e),
             }
         }
-
-        Ok(())
+        failures.finish()
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {

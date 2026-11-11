@@ -23,10 +23,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, RowExt};
+use frankensqlite::compat::RowExt;
 use frankensqlite::params;
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
 
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
@@ -152,11 +152,8 @@ impl HermesConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Hermes db: {}", db_path.display()))?;
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open Hermes db: {}", db_path.display()))?;
 
         conn.execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
@@ -414,11 +411,21 @@ impl Connector for HermesConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         let sources = Self::discover_sources(ctx)?;
+        // Local fix (cass review 2026-11-07, F9): a store that cannot be
+        // read fails the scan instead of hiding behind a debug log (F5
+        // semantics) — a BusyRecovery-class store is read through the
+        // snapshot fallback in `open_read_only_with_snapshot_fallback`,
+        // and every other open failure reaches the host; a valid but empty
+        // store is "nothing to read" (the F9 empty-store rule).
+        let mut failures = super::checked_scan::ScanFailures::new("Hermes");
         for source in sources {
             if !hooks.should_scan(&source) {
                 continue;
             }
             ctx.tick();
+            if super::checked_scan::skip_provably_empty_store("Hermes", &source.source_path) {
+                continue;
+            }
             match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
                 Ok(db_convs) => {
                     tracing::debug!(
@@ -440,16 +447,10 @@ impl Connector for HermesConnector {
                         })?;
                     }
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        "hermes sqlite: failed to read {}: {e}",
-                        source.source_path.display()
-                    );
-                }
+                Err(e) => failures.record(&source.source_path, &e),
             }
         }
-
-        Ok(())
+        failures.finish()
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {

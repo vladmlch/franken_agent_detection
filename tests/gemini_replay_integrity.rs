@@ -482,28 +482,17 @@ fn replay_stays_correct_across_the_real_metadata_compaction_boundary() {
         assert_eq!(conversation.messages[1].role, "assistant");
         assert_eq!(conversation.messages[1].content, "Final patched answer");
         assert_eq!(conversation.messages[1].extra["model"], "gemini-2.5-pro");
-        if size < COMPACT_THRESHOLD {
-            assert_eq!(ids(&conversation), ["prompt", "reply"]);
-            assert!(
-                conversation.messages[1]
-                    .extra
-                    .get("bulky_provider_payload")
-                    .is_some()
-            );
-        } else {
-            assert!(
-                conversation.messages[1]
-                    .extra
-                    .get("bulky_provider_payload")
-                    .is_none()
-            );
-            assert!(
-                serde_json::to_vec(&conversation.messages[1].extra)
-                    .unwrap()
-                    .len()
-                    < 1024
-            );
-        }
+        assert_eq!(ids(&conversation), ["prompt", "reply"]);
+        // F12 (cass, merged): Gemini's large-session compaction is gone, so
+        // the full raw record — the bulky provider payload included —
+        // survives at every size, including across the former 32 MiB
+        // compaction boundary.
+        assert!(
+            conversation.messages[1]
+                .extra
+                .get("bulky_provider_payload")
+                .is_some()
+        );
     }
 }
 
@@ -761,16 +750,13 @@ fn thought_and_tool_normalization_preserve_compaction_memory_contract() {
             assert_eq!(message.role, "assistant");
             assert_eq!(message.extra["model"], "gemini-2.5-pro");
             assert!(!message.content.contains("BINARY_MARKER"));
-            if size >= COMPACT_THRESHOLD {
-                assert_eq!(message.extra, json!({"model": "gemini-2.5-pro"}));
-                assert!(serde_json::to_vec(&message.extra).unwrap().len() < 1024);
-            }
         }
-        if size < COMPACT_THRESHOLD {
-            assert_eq!(ids(&conversation), ["thoughts", "tools", "plain"]);
-            assert_eq!(conversation.messages[0].extra, records[1]);
-            assert_eq!(conversation.messages[1].extra, records[2]);
-            assert_eq!(conversation.messages[2].extra, records[3]);
-        }
+        // F12 (cass, merged): compaction is gone, so the full-extras
+        // contract — every message extra is the verbatim raw record — now
+        // holds at every size, including the former 32 MiB boundary.
+        assert_eq!(ids(&conversation), ["thoughts", "tools", "plain"]);
+        assert_eq!(conversation.messages[0].extra, records[1]);
+        assert_eq!(conversation.messages[1].extra, records[2]);
+        assert_eq!(conversation.messages[2].extra, records[3]);
     }
 }

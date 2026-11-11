@@ -49,6 +49,18 @@ pub mod qwen;
 pub mod scan;
 #[cfg(feature = "shelley")]
 pub mod shelley;
+// Local fix (cass review 2026-11-02 F5, generalized by F9): store-style
+// SQLite connectors share one checked-scan collector so a store that
+// cannot be read fails the scan instead of hiding.
+#[cfg(any(
+    feature = "cursor",
+    feature = "opencode",
+    feature = "goose",
+    feature = "hermes",
+    feature = "crush",
+    feature = "devin"
+))]
+pub(crate) mod checked_scan;
 #[cfg(any(
     feature = "cursor",
     feature = "opencode",

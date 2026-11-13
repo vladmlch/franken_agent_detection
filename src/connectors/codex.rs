@@ -251,8 +251,8 @@ impl CodexConnector {
             let thread = explicit_file
                 .as_ref()
                 .and_then(|path| segments::SegmentName::of(path));
-            let mut files = match &thread {
-                Some(name) => walked
+            let siblings = thread.as_ref().map(|name| {
+                walked
                     .entry(sessions_dir.clone())
                     .or_insert_with(|| Self::rollout_files(&sessions_dir))
                     .iter()
@@ -261,11 +261,13 @@ impl CodexConnector {
                             .is_some_and(|other| other.thread_id == name.thread_id)
                     })
                     .cloned()
-                    .collect::<Vec<_>>(),
-                None => explicit_file
+                    .collect::<Vec<_>>()
+            });
+            let mut files = siblings.unwrap_or_else(|| {
+                explicit_file
                     .clone()
-                    .map_or_else(|| Self::rollout_files(&home), |path| vec![path]),
-            };
+                    .map_or_else(|| Self::rollout_files(&home), |path| vec![path])
+            });
             if thread.is_some() {
                 // The walk drops a compressed file whose plain twin exists.
                 // Offer the scoped spelling too and let segment ordering pick
@@ -664,24 +666,7 @@ fn scan_codex_with_hooks(
             continue;
         }
 
-        let title = messages
-            .iter()
-            .find(|m| m.role == "user" && !is_injected_context_message(&m.content))
-            .map(|m| {
-                m.content
-                    .lines()
-                    .next()
-                    .unwrap_or(&m.content)
-                    .chars()
-                    .take(100)
-                    .collect::<String>()
-            })
-            .or_else(|| {
-                messages
-                    .first()
-                    .and_then(|m| m.content.lines().next())
-                    .map(|s| s.chars().take(100).collect())
-            });
+        let title = conversation_title(&messages);
 
         let mut conv = NormalizedConversation {
             agent_slug: "codex".to_string(),
@@ -713,6 +698,29 @@ fn scan_codex_with_hooks(
     }
 
     Ok(())
+}
+
+/// The thread's first real user prompt, or its first message when every prompt
+/// is injected context.
+fn conversation_title(messages: &[NormalizedMessage]) -> Option<String> {
+    messages
+        .iter()
+        .find(|m| m.role == "user" && !is_injected_context_message(&m.content))
+        .map(|m| {
+            m.content
+                .lines()
+                .next()
+                .unwrap_or(&m.content)
+                .chars()
+                .take(100)
+                .collect::<String>()
+        })
+        .or_else(|| {
+            messages
+                .first()
+                .and_then(|m| m.content.lines().next())
+                .map(|s| s.chars().take(100).collect())
+        })
 }
 
 /// A single-segment thread keeps today's metadata exactly. A merged thread also

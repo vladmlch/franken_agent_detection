@@ -292,12 +292,17 @@ fn dump_single_file_baseline() {
 }
 
 #[test]
-fn single_file_rollout_output_is_byte_identical() {
+fn single_file_rollout_output_is_unchanged() {
     let (fixture, paths) = single_file_fixture();
     let convs = scan(&fixture.ctx(None));
+    // Compare values, not text: `--all-features` enables serde_json's
+    // `preserve_order`, which changes map key order and nothing else. The
+    // byte-level pin is the `dump_single_file_baseline` diff in the report.
+    let baseline = include_str!("fixtures/codex_paginated/single_file_baseline.json");
+    let expected: Value = serde_json::from_str(baseline).unwrap();
     assert_eq!(
-        serde_json::to_string_pretty(&baseline_value(&convs)).unwrap(),
-        include_str!("fixtures/codex_paginated/single_file_baseline.json").trim_end(),
+        baseline_value(&convs),
+        expected,
         "a thread with no continuation keeps today's exact output"
     );
     assert_eq!(
@@ -454,7 +459,7 @@ fn continuation_only_incremental_scan_emits_the_whole_thread() {
         .unwrap();
     let mut discovered_paths: Vec<_> = discovered.iter().map(|s| s.source_path.clone()).collect();
     discovered_paths.sort();
-    let mut expected = paths.clone();
+    let mut expected = paths;
     expected.sort();
     assert_eq!(discovered_paths, expected);
 

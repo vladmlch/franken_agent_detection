@@ -78,23 +78,18 @@ pub(super) fn group(candidates: Vec<Candidate>) -> Vec<Thread> {
     let mut threads: Vec<Thread> = Vec::new();
     let mut slots: HashMap<(PathBuf, String), usize> = HashMap::new();
     for candidate in candidates {
-        let slot = match SegmentName::of(&candidate.path) {
-            Some(name) => {
-                let key = (candidate.sessions_dir.clone(), name.thread_id);
-                *slots.entry(key).or_insert_with(|| {
-                    threads.push(Thread {
-                        segments: Vec::new(),
-                    });
-                    threads.len() - 1
-                })
-            }
-            None => {
-                threads.push(Thread {
-                    segments: Vec::new(),
-                });
-                threads.len() - 1
-            }
-        };
+        // An ungrouped file keys on its own path with an empty thread id, so it
+        // can never collide with a UUID-keyed thread and stays its own thread.
+        let key = SegmentName::of(&candidate.path).map_or_else(
+            || (candidate.path.clone(), String::new()),
+            |name| (candidate.sessions_dir.clone(), name.thread_id),
+        );
+        let slot = *slots.entry(key).or_insert_with(|| {
+            threads.push(Thread {
+                segments: Vec::new(),
+            });
+            threads.len() - 1
+        });
         threads[slot].segments.push(candidate);
     }
     for thread in &mut threads {

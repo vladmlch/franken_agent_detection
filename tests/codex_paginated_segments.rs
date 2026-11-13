@@ -150,15 +150,33 @@ impl Fixture {
         let cwd = self.workspace();
         let second = self.write(
             &format!("2026/11/12/{}", continuation_name(TS2, B2)),
-            &turn(&cwd, "2026-11-12T22:22:50Z", "2026-11-12T22:22:55Z", "2026-11-12T22:23:30Z", "third"),
+            &turn(
+                &cwd,
+                "2026-11-12T22:22:50Z",
+                "2026-11-12T22:22:55Z",
+                "2026-11-12T22:23:30Z",
+                "third",
+            ),
         );
         let original = self.write(
             &format!("2026/11/12/{}", original_name(TS0)),
-            &turn(&cwd, "2026-11-12T21:40:18Z", "2026-11-12T21:40:20Z", "2026-11-12T21:41:00Z", "first"),
+            &turn(
+                &cwd,
+                "2026-11-12T21:40:18Z",
+                "2026-11-12T21:40:20Z",
+                "2026-11-12T21:41:00Z",
+                "first",
+            ),
         );
         let first = self.write(
             &format!("2026/11/12/{}", continuation_name(TS1, B1)),
-            &turn(&cwd, "2026-11-12T21:47:12Z", "2026-11-12T21:47:20Z", "2026-11-12T21:48:00Z", "second"),
+            &turn(
+                &cwd,
+                "2026-11-12T21:47:12Z",
+                "2026-11-12T21:47:20Z",
+                "2026-11-12T21:48:00Z",
+                "second",
+            ),
         );
         vec![original, first, second]
     }
@@ -265,7 +283,10 @@ fn dump_single_file_baseline() {
     let out = std::env::var("FAD_BASELINE_OUT").expect("set FAD_BASELINE_OUT");
     fs::write(
         out,
-        format!("{}\n", serde_json::to_string_pretty(&baseline_value(&convs)).unwrap()),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&baseline_value(&convs)).unwrap()
+        ),
     )
     .unwrap();
 }
@@ -280,7 +301,10 @@ fn single_file_rollout_output_is_byte_identical() {
         "a thread with no continuation keeps today's exact output"
     );
     assert_eq!(
-        convs.iter().map(|c| c.source_path.clone()).collect::<Vec<_>>(),
+        convs
+            .iter()
+            .map(|c| c.source_path.clone())
+            .collect::<Vec<_>>(),
         paths,
         "source paths stay the rollout files themselves"
     );
@@ -288,7 +312,10 @@ fn single_file_rollout_output_is_byte_identical() {
         convs[0].external_id.as_deref(),
         Some(format!("2026/11/12/rollout-{TS0}-{A}").as_str())
     );
-    assert_eq!(convs[0].workspace.as_deref(), Some(fixture.workspace().as_path()));
+    assert_eq!(
+        convs[0].workspace.as_deref(),
+        Some(fixture.workspace().as_path())
+    );
 }
 
 #[test]
@@ -297,11 +324,23 @@ fn original_and_one_continuation_merge_in_order() {
     let cwd = fixture.workspace();
     let original = fixture.write(
         &format!("2026/11/12/{}", original_name(TS0)),
-        &turn(&cwd, "2026-11-12T21:40:18Z", "2026-11-12T21:40:20Z", "2026-11-12T21:41:00Z", "first"),
+        &turn(
+            &cwd,
+            "2026-11-12T21:40:18Z",
+            "2026-11-12T21:40:20Z",
+            "2026-11-12T21:41:00Z",
+            "first",
+        ),
     );
     let continuation = fixture.write(
         &format!("2026/11/12/{}", continuation_name(TS1, B1)),
-        &turn(&cwd, "2026-11-12T21:47:12Z", "2026-11-12T21:47:20Z", "2026-11-12T21:48:00Z", "second"),
+        &turn(
+            &cwd,
+            "2026-11-12T21:47:12Z",
+            "2026-11-12T21:47:20Z",
+            "2026-11-12T21:48:00Z",
+            "second",
+        ),
     );
 
     let convs = scan(&fixture.ctx(None));
@@ -309,7 +348,12 @@ fn original_and_one_continuation_merge_in_order() {
     let conv = &convs[0];
     assert_eq!(
         contents(conv),
-        ["first question", "first answer", "second question", "second answer"]
+        [
+            "first question",
+            "first answer",
+            "second question",
+            "second answer"
+        ]
     );
     assert_eq!(indices(conv), [0, 1, 2, 3]);
     assert_eq!(conv.source_path, original);
@@ -424,19 +468,40 @@ fn missing_original_still_emits_the_thread() {
     let cwd = fixture.workspace();
     let first = fixture.write(
         &format!("2026/11/12/{}", continuation_name(TS1, B1)),
-        &turn(&cwd, "2026-11-12T21:47:12Z", "2026-11-12T21:47:20Z", "2026-11-12T21:48:00Z", "second"),
+        &turn(
+            &cwd,
+            "2026-11-12T21:47:12Z",
+            "2026-11-12T21:47:20Z",
+            "2026-11-12T21:48:00Z",
+            "second",
+        ),
     );
     let second = fixture.write(
         &format!("2026/11/12/{}", continuation_name(TS2, B2)),
-        &turn(&cwd, "2026-11-12T22:22:50Z", "2026-11-12T22:22:55Z", "2026-11-12T22:23:30Z", "third"),
+        &turn(
+            &cwd,
+            "2026-11-12T22:22:50Z",
+            "2026-11-12T22:22:55Z",
+            "2026-11-12T22:23:30Z",
+            "third",
+        ),
     );
 
     let convs = scan(&fixture.ctx(None));
-    assert_eq!(convs.len(), 1, "a thread without its original is not dropped");
+    assert_eq!(
+        convs.len(),
+        1,
+        "a thread without its original is not dropped"
+    );
     let conv = &convs[0];
     assert_eq!(
         contents(conv),
-        ["second question", "second answer", "third question", "third answer"]
+        [
+            "second question",
+            "second answer",
+            "third question",
+            "third answer"
+        ]
     );
     assert_eq!(conv.source_path, first);
     assert_eq!(
@@ -461,18 +526,38 @@ fn cross_day_continuation_merges_into_the_originals_thread() {
     let cwd = fixture.workspace();
     let original = fixture.write(
         &format!("2026/11/12/{}", original_name(TS0)),
-        &turn(&cwd, "2026-11-12T21:40:18Z", "2026-11-12T21:40:20Z", "2026-11-12T21:41:00Z", "first"),
+        &turn(
+            &cwd,
+            "2026-11-12T21:40:18Z",
+            "2026-11-12T21:40:20Z",
+            "2026-11-12T21:41:00Z",
+            "first",
+        ),
     );
     let next_day = fixture.write(
-        &format!("2026/11/13/{}", continuation_name("2026-11-13T10-00-00", B1)),
-        &turn(&cwd, "2026-11-13T09:00:00Z", "2026-11-13T09:00:10Z", "2026-11-13T09:01:00Z", "next day"),
+        &format!(
+            "2026/11/13/{}",
+            continuation_name("2026-11-13T10-00-00", B1)
+        ),
+        &turn(
+            &cwd,
+            "2026-11-13T09:00:00Z",
+            "2026-11-13T09:00:10Z",
+            "2026-11-13T09:01:00Z",
+            "next day",
+        ),
     );
 
     let convs = scan(&fixture.ctx(None));
     assert_eq!(convs.len(), 1, "day directories do not split a thread");
     assert_eq!(
         contents(&convs[0]),
-        ["first question", "first answer", "next day question", "next day answer"]
+        [
+            "first question",
+            "first answer",
+            "next day question",
+            "next day answer"
+        ]
     );
     assert_eq!(convs[0].source_path, original);
     assert_eq!(
@@ -488,7 +573,13 @@ fn distinct_threads_stay_separate_conversations() {
     let cwd = fixture.workspace();
     fixture.write(
         &format!("2026/11/12/{}", original_name(TS0)),
-        &turn(&cwd, "2026-11-12T21:40:18Z", "2026-11-12T21:40:20Z", "2026-11-12T21:41:00Z", "first"),
+        &turn(
+            &cwd,
+            "2026-11-12T21:40:18Z",
+            "2026-11-12T21:40:20Z",
+            "2026-11-12T21:41:00Z",
+            "first",
+        ),
     );
     let other = fixture.write(
         &format!("2026/11/12/rollout-{TS1}-{OTHER}.jsonl"),
@@ -541,12 +632,18 @@ fn source_boundaries_cover_every_segment_of_the_thread() {
     let mut expected = paths.clone();
     expected.sort();
     visited.sort();
-    assert_eq!(visited, expected, "every segment reaches the pre-parse hook");
+    assert_eq!(
+        visited, expected,
+        "every segment reaches the pre-parse hook"
+    );
     assert_eq!(completions.len(), 1);
     let completion = &completions[0];
     assert_eq!(completion.conversations_emitted, 1);
     assert_eq!(completion.source.source_path, paths[0]);
-    assert_eq!(completion.source.role, DiscoveredSourceRole::PrimarySessionLog);
+    assert_eq!(
+        completion.source.role,
+        DiscoveredSourceRole::PrimarySessionLog
+    );
     assert!(completion.source.required_for_reconstruction);
     let mut sidecars: Vec<_> = completion
         .required_sidecars
@@ -559,7 +656,8 @@ fn source_boundaries_cover_every_segment_of_the_thread() {
         completion
             .required_sidecars
             .iter()
-            .all(|s| s.required_for_reconstruction && s.role == DiscoveredSourceRole::PrimarySessionLog),
+            .all(|s| s.required_for_reconstruction
+                && s.role == DiscoveredSourceRole::PrimarySessionLog),
         "a change to any segment must invalidate the thread's completion"
     );
 }
@@ -659,13 +757,17 @@ fn an_explicit_continuation_root_emits_the_whole_thread() {
 fn a_plain_and_compressed_twin_of_one_segment_is_read_once() {
     let fixture = Fixture::new();
     let cwd = fixture.workspace();
-    let records = turn(&cwd, "2026-11-12T21:40:18Z", "2026-11-12T21:40:20Z", "2026-11-12T21:41:00Z", "first");
+    let records = turn(
+        &cwd,
+        "2026-11-12T21:40:18Z",
+        "2026-11-12T21:40:20Z",
+        "2026-11-12T21:41:00Z",
+        "first",
+    );
     let plain = fixture.write(&format!("2026/11/12/{}", original_name(TS0)), &records);
     #[cfg(feature = "codex-zstd")]
-    let twin = fixture.write_compressed(
-        &format!("2026/11/12/{}.zst", original_name(TS0)),
-        &records,
-    );
+    let twin =
+        fixture.write_compressed(&format!("2026/11/12/{}.zst", original_name(TS0)), &records);
     #[cfg(not(feature = "codex-zstd"))]
     let twin = plain.clone();
 
@@ -687,18 +789,35 @@ fn compressed_segments_merge_like_plain_ones() {
     let cwd = fixture.workspace();
     let original = fixture.write_compressed(
         &format!("2026/11/12/{}.zst", original_name(TS0)),
-        &turn(&cwd, "2026-11-12T21:40:18Z", "2026-11-12T21:40:20Z", "2026-11-12T21:41:00Z", "first"),
+        &turn(
+            &cwd,
+            "2026-11-12T21:40:18Z",
+            "2026-11-12T21:40:20Z",
+            "2026-11-12T21:41:00Z",
+            "first",
+        ),
     );
     let continuation = fixture.write_compressed(
         &format!("2026/11/12/{}.zst", continuation_name(TS1, B1)),
-        &turn(&cwd, "2026-11-12T21:47:12Z", "2026-11-12T21:47:20Z", "2026-11-12T21:48:00Z", "second"),
+        &turn(
+            &cwd,
+            "2026-11-12T21:47:12Z",
+            "2026-11-12T21:47:20Z",
+            "2026-11-12T21:48:00Z",
+            "second",
+        ),
     );
 
     let convs = scan(&fixture.ctx(None));
     assert_eq!(convs.len(), 1);
     assert_eq!(
         contents(&convs[0]),
-        ["first question", "first answer", "second question", "second answer"]
+        [
+            "first question",
+            "first answer",
+            "second question",
+            "second answer"
+        ]
     );
     assert_eq!(convs[0].source_path, original);
     assert_eq!(
@@ -706,7 +825,10 @@ fn compressed_segments_merge_like_plain_ones() {
         Some(format!("2026/11/12/rollout-{TS0}-{A}").as_str()),
         "the compressed form names the same session"
     );
-    assert_eq!(convs[0].metadata["segments"][1]["path"], json!(continuation));
+    assert_eq!(
+        convs[0].metadata["segments"][1]["path"],
+        json!(continuation)
+    );
 }
 
 #[cfg(feature = "codex-zstd")]
@@ -716,11 +838,23 @@ fn a_compressed_continuation_merges_with_a_plain_original() {
     let cwd = fixture.workspace();
     let original = fixture.write(
         &format!("2026/11/12/{}", original_name(TS0)),
-        &turn(&cwd, "2026-11-12T21:40:18Z", "2026-11-12T21:40:20Z", "2026-11-12T21:41:00Z", "first"),
+        &turn(
+            &cwd,
+            "2026-11-12T21:40:18Z",
+            "2026-11-12T21:40:20Z",
+            "2026-11-12T21:41:00Z",
+            "first",
+        ),
     );
     fixture.write_compressed(
         &format!("2026/11/12/{}.zst", continuation_name(TS1, B1)),
-        &turn(&cwd, "2026-11-12T21:47:12Z", "2026-11-12T21:47:20Z", "2026-11-12T21:48:00Z", "second"),
+        &turn(
+            &cwd,
+            "2026-11-12T21:47:12Z",
+            "2026-11-12T21:47:20Z",
+            "2026-11-12T21:48:00Z",
+            "second",
+        ),
     );
 
     let convs = scan(&fixture.ctx(None));

@@ -1,4 +1,5 @@
 mod reader;
+mod segments;
 mod token_usage_accumulation;
 mod user_prompts;
 
@@ -10,7 +11,7 @@ pub use reader::{
 pub use reader::{compressed_rollout_declared_len, decompressed_rollout};
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -220,6 +221,99 @@ impl CodexConnector {
         out
     }
 
+    /// Every rollout file the scan roots offer, in root then filename order,
+    /// before exclusions and freshness. An explicit file naming a thread
+    /// expands to that thread's segments: a continuation scoped on its own
+    /// must still produce the whole conversation under the thread's identity.
+    fn rollout_candidates(ctx: &ScanContext) -> Vec<segments::Candidate> {
+        let mut out = Vec::new();
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+        let mut walked: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+
+        for root in Self::source_roots(ctx) {
+            let explicit_file = root
+                .path
+                .is_file()
+                .then_some(root.path.clone())
+                .filter(|path| Self::is_rollout_file(path));
+            let home = explicit_file
+                .as_ref()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| root.path.clone());
+            if !home.exists() {
+                continue;
+            }
+            let sessions_dir = explicit_file
+                .as_ref()
+                .and_then(|path| Self::sessions_dir_for_explicit_file(path))
+                .unwrap_or_else(|| Self::sessions_dir(&home));
+
+            let thread = explicit_file
+                .as_ref()
+                .and_then(|path| segments::SegmentName::of(path));
+            let mut files = match &thread {
+                Some(name) => walked
+                    .entry(sessions_dir.clone())
+                    .or_insert_with(|| Self::rollout_files(&sessions_dir))
+                    .iter()
+                    .filter(|path| {
+                        segments::SegmentName::of(path)
+                            .is_some_and(|other| other.thread_id == name.thread_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                None => explicit_file
+                    .clone()
+                    .map_or_else(|| Self::rollout_files(&home), |path| vec![path]),
+            };
+            if thread.is_some() {
+                // The walk drops a compressed file whose plain twin exists.
+                // Offer the scoped spelling too and let segment ordering pick
+                // the representation, so an explicit root is never ignored.
+                files.extend(explicit_file);
+            }
+
+            for file in files {
+                if seen_files.insert(dedupe_path_key(&file)) {
+                    out.push(segments::Candidate {
+                        root: root.clone(),
+                        path: file,
+                        sessions_dir: sessions_dir.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// A thread is fresh when ANY of its segments is, so an incremental scan
+    /// admitting only a new continuation still re-reads the whole thread.
+    fn thread_modified_since(thread: &segments::Thread, since_ts: Option<i64>) -> bool {
+        thread.segments.iter().any(|segment| {
+            matches!(
+                Self::file_metadata_if_modified(&segment.path, since_ts),
+                FileScanMetadata::Process
+            )
+        })
+    }
+
+    fn segment_external_id(path: &Path, sessions_dir: &Path) -> Option<String> {
+        path.strip_prefix(sessions_dir)
+            .ok()
+            .and_then(|rel| {
+                rollout_session_path(rel)
+                    .to_str()
+                    .map(std::string::ToString::to_string)
+            })
+            .or_else(|| {
+                path.file_name().and_then(|name| {
+                    rollout_session_path(Path::new(name))
+                        .to_str()
+                        .map(std::string::ToString::to_string)
+                })
+            })
+    }
+
     fn is_token_usage_target_message(message: &NormalizedMessage) -> bool {
         // Attribute token_count usage to concrete assistant turns only.
         // This avoids attaching usage to synthetic reasoning helper
@@ -342,47 +436,27 @@ impl CodexConnector {
 
     fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let excluded_paths = CodexScanExclusions::from_env()?;
-        let roots = Self::source_roots(ctx);
         let mut out = Vec::new();
-        let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
-        for root in roots {
-            let explicit_file = root
-                .path
-                .is_file()
-                .then_some(root.path.clone())
-                .filter(|path| Self::is_rollout_file(path));
-            let home = explicit_file
-                .as_ref()
-                .and_then(|path| path.parent().map(Path::to_path_buf))
-                .unwrap_or_else(|| root.path.clone());
-            if !home.exists() {
+        for thread in segments::group(Self::rollout_candidates(ctx)) {
+            // A thread is reconstructed from every segment, so one excluded
+            // segment withdraws the whole thread instead of a fragment.
+            if thread
+                .segments
+                .iter()
+                .any(|segment| excluded_paths.excludes(&segment.path))
+            {
                 continue;
             }
-
-            let files = explicit_file
-                .clone()
-                .map_or_else(|| Self::rollout_files(&home), |path| vec![path]);
-
-            for file in files {
-                // Explicit-file roots bypass rollout_files(), so filter here.
-                if excluded_paths.excludes(&file) {
-                    continue;
-                }
-                if !seen_files.insert(dedupe_path_key(&file)) {
-                    continue;
-                }
-                if matches!(
-                    Self::file_metadata_if_modified(&file, ctx.since_ts),
-                    FileScanMetadata::Skip
-                ) {
-                    continue;
-                }
+            if !Self::thread_modified_since(&thread, ctx.since_ts) {
+                continue;
+            }
+            for segment in &thread.segments {
                 out.push(
                     DiscoveredSourceFile::new(
                         "codex",
-                        &root,
-                        file,
+                        &segment.root,
+                        segment.path.clone(),
                         DiscoveredSourceRole::PrimarySessionLog,
                         true,
                     )
@@ -504,501 +578,556 @@ fn scan_codex_with_callback(
     scan_codex_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
 }
 
-#[allow(clippy::too_many_lines)]
 fn scan_codex_with_hooks(
     ctx: &ScanContext,
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
     let excluded_paths = CodexScanExclusions::from_env()?;
-    let roots: Vec<ScanRoot> = CodexConnector::source_roots(ctx);
 
-    if roots.is_empty() {
-        return Ok(());
-    }
-
-    let mut seen_files: HashSet<PathBuf> = HashSet::new();
-
-    for root in roots {
-        let explicit_file = root
-            .path
-            .is_file()
-            .then_some(root.path.clone())
-            .filter(|path| CodexConnector::is_rollout_file(path));
-        let home = explicit_file
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| root.path.clone());
-        if !home.exists() {
+    for thread in segments::group(CodexConnector::rollout_candidates(ctx)) {
+        // Excluded sources must not reach pre-parse hooks or completions, and
+        // one excluded segment withdraws the whole thread: a fragment would
+        // replace the complete conversation under the same identity.
+        if thread
+            .segments
+            .iter()
+            .any(|segment| excluded_paths.excludes(&segment.path))
+        {
+            continue;
+        }
+        if !CodexConnector::thread_modified_since(&thread, ctx.since_ts) {
             continue;
         }
 
-        let files = explicit_file
-            .clone()
-            .map_or_else(|| CodexConnector::rollout_files(&home), |path| vec![path]);
-        let sessions_dir = explicit_file
-            .as_ref()
-            .and_then(|path| CodexConnector::sessions_dir_for_explicit_file(path))
-            .unwrap_or_else(|| CodexConnector::sessions_dir(&home));
+        // Pre-parse identity for every segment, mirrored from
+        // discover_sources() (FAD#22). Fingerprints are captured before parsing
+        // so a segment written mid-scan withholds the completion.
+        let discovered: Vec<DiscoveredSourceFile> = thread
+            .segments
+            .iter()
+            .map(|segment| {
+                DiscoveredSourceFile::new(
+                    "codex",
+                    &segment.root,
+                    segment.path.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata()
+            })
+            .collect();
+        // The identity segment is offered LAST: a host binds its most recent
+        // pre-parse observation to the completed source, and a continuation it
+        // has never seen must admit the thread even when the original is
+        // already reusable.
+        let mut admit = false;
+        for source in discovered.iter().skip(1).chain(discovered.first()) {
+            admit |= hooks.should_scan(source);
+        }
+        if !admit {
+            continue;
+        }
+        let Some((identity, sidecars)) = discovered.split_first() else {
+            continue;
+        };
+        let identity_segment = &thread.segments[0];
+        let Some(format) = RolloutFormat::of(&identity_segment.path) else {
+            continue;
+        };
+        let external_id = CodexConnector::segment_external_id(
+            &identity_segment.path,
+            &identity_segment.sessions_dir,
+        );
 
-        for file in files {
-            // Excluded sources must not reach pre-parse hooks or completions.
-            if excluded_paths.excludes(&file) {
-                continue;
-            }
-            if !seen_files.insert(dedupe_path_key(&file)) {
-                continue;
-            }
-            let source_path = file.clone();
-            // Mtime-based incremental skip; the metadata itself is not needed
-            // once the freshness decision is made.
-            match CodexConnector::file_metadata_if_modified(&file, ctx.since_ts) {
-                FileScanMetadata::Process => {}
-                FileScanMetadata::Skip => continue,
-            }
-            // Pre-parse identity, mirrored from discover_sources() (FAD#22).
-            let discovered = DiscoveredSourceFile::new(
-                "codex",
-                &root,
-                file.clone(),
-                DiscoveredSourceRole::PrimarySessionLog,
-                true,
-            )
-            .with_fs_metadata();
-            if !hooks.should_scan(&discovered) {
-                continue;
-            }
-            let Some(format) = RolloutFormat::of(&file) else {
+        let mut messages = Vec::new();
+        let mut started_at = None;
+        let mut ended_at = None;
+        let mut session_cwd: Option<PathBuf> = None;
+        for segment in &thread.segments {
+            let Some(segment_format) = RolloutFormat::of(&segment.path) else {
                 continue;
             };
-            let external_id = source_path
-                .strip_prefix(&sessions_dir)
-                .ok()
-                .and_then(|rel| {
-                    rollout_session_path(rel)
-                        .to_str()
-                        .map(std::string::ToString::to_string)
-                })
-                .or_else(|| {
-                    source_path.file_name().and_then(|name| {
-                        rollout_session_path(Path::new(name))
-                            .to_str()
-                            .map(std::string::ToString::to_string)
-                    })
-                });
-            let mut messages = Vec::new();
-            let mut started_at = None;
-            let mut ended_at = None;
-            let mut session_cwd: Option<PathBuf> = None;
-            // Pair individual records, not all occurrences of prompt text.
-            // Capture stream/turn identity before the records normalize.
-            let mut user_prompts = user_prompts::UserPrompts::default();
-            let mut token_count_tracker = token_usage_accumulation::TokenCountTracker::default();
-
-            if matches!(
-                format,
-                RolloutFormat::Jsonl | RolloutFormat::CompressedJsonl
-            ) {
-                let mut reader = reader::RolloutReader::open(
-                    &file,
-                    format == RolloutFormat::CompressedJsonl,
-                    ctx.progress_tick.as_deref(),
-                )?;
-
-                // Accumulate privately until the complete opened snapshot is validated.
-                while let Some((line_idx, val)) = reader.next_record()? {
-                    let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    let created = val.get("timestamp").and_then(parse_timestamp);
-
-                    match entry_type {
-                        "session_meta" => {
-                            if let Some(payload) = val.get("payload") {
-                                session_cwd = payload
-                                    .get("cwd")
-                                    .and_then(|v| v.as_str())
-                                    .map(PathBuf::from);
-                            }
-                            update_time_bounds(&mut started_at, &mut ended_at, created);
-                        }
-                        "response_item" => {
-                            if let Some(payload) = val.get("payload") {
-                                let payload_type = payload.get("type").and_then(|v| v.as_str());
-
-                                match payload_type {
-                                    // Modern Codex encodes tool calls as
-                                    // `response_item` entries rather than
-                                    // `event_msg`/`tool_call`. `function_call`
-                                    // is a structured tool (e.g. `exec_command`);
-                                    // `custom_tool_call` is a freeform tool
-                                    // (e.g. `apply_patch`). Both lack a `content`
-                                    // field, so without explicit handling they
-                                    // flatten to empty and get dropped.
-                                    Some("function_call" | "custom_tool_call") => {
-                                        let tool_name = payload
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown")
-                                            .to_string();
-                                        let arguments = parse_tool_call_arguments(payload);
-                                        let call_id = payload
-                                            .get("call_id")
-                                            .or_else(|| payload.get("id"))
-                                            .and_then(|v| v.as_str())
-                                            .map(String::from);
-
-                                        let content_text = format!("[Tool: {tool_name}]");
-                                        update_time_bounds(&mut started_at, &mut ended_at, created);
-                                        let mut invocations = vec![NormalizedInvocation {
-                                            kind: "tool".to_string(),
-                                            name: tool_name,
-                                            raw_name: None,
-                                            call_id,
-                                            arguments,
-                                        }];
-                                        unwrap_skill_invocations(&mut invocations);
-                                        messages.push(NormalizedMessage {
-                                            idx: 0,
-                                            role: "assistant".to_string(),
-                                            author: None,
-                                            created_at: created,
-                                            content: content_text,
-                                            extra: val,
-                                            invocations,
-                                            snippets: Vec::new(),
-                                        });
-                                    }
-                                    // Tool results: `output` carries the captured
-                                    // stdout / patch summary. Emit as a
-                                    // first-class `tool` timeline entry; the
-                                    // linking `call_id` is preserved in `extra`.
-                                    // F13: a textless output WITH identity
-                                    // (`call_id`/`id` — image-only results whose
-                                    // `output` is a list of `image_url` parts) is
-                                    // local evidence too: emit it as a `tool`
-                                    // message with EMPTY content and the raw
-                                    // record as `extra`, so call/result linking
-                                    // can pair it — never a fabricated result
-                                    // text. Identity-less textless records stay
-                                    // dropped: there is nothing to link them to.
-                                    Some("function_call_output" | "custom_tool_call_output") => {
-                                        let output_text = tool_output_text(payload);
-                                        let has_identity = payload
-                                            .get("call_id")
-                                            .or_else(|| payload.get("id"))
-                                            .and_then(|v| v.as_str())
-                                            .is_some_and(|id| !id.trim().is_empty());
-                                        if output_text.trim().is_empty() && !has_identity {
-                                            continue;
-                                        }
-                                        update_time_bounds(&mut started_at, &mut ended_at, created);
-                                        messages.push(NormalizedMessage {
-                                            idx: 0,
-                                            role: "tool".to_string(),
-                                            author: None,
-                                            created_at: created,
-                                            content: output_text,
-                                            extra: val,
-                                            invocations: Vec::new(),
-                                            snippets: Vec::new(),
-                                        });
-                                    }
-                                    // Plain messages: assistant `output_text`,
-                                    // user/developer `input_text`, or legacy
-                                    // string content. Encrypted `reasoning`
-                                    // items have no plaintext content and are
-                                    // intentionally skipped here (plaintext
-                                    // reasoning arrives via `event_msg`).
-                                    _ => {
-                                        let role = payload
-                                            .get("role")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("agent");
-
-                                        let content_str = payload
-                                            .get("content")
-                                            .map(flatten_content)
-                                            .unwrap_or_default();
-
-                                        if content_str.trim().is_empty() {
-                                            continue;
-                                        }
-
-                                        update_time_bounds(&mut started_at, &mut ended_at, created);
-                                        if role == "user" {
-                                            user_prompts.observe(
-                                                user_prompts::Stream::Response,
-                                                line_idx,
-                                                messages.len(),
-                                                &content_str,
-                                                created,
-                                                payload.get("turn_id").and_then(Value::as_str),
-                                            );
-                                        }
-                                        let mut invocations = payload.get("content").map_or_else(
-                                            Vec::new,
-                                            extract_invocations_from_content_blocks,
-                                        );
-                                        unwrap_skill_invocations(&mut invocations);
-
-                                        messages.push(NormalizedMessage {
-                                            idx: 0,
-                                            role: role.to_string(),
-                                            author: None,
-                                            created_at: created,
-                                            content: content_str,
-                                            extra: val,
-                                            invocations,
-                                            snippets: Vec::new(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        "event_msg" => {
-                            if let Some(payload) = val.get("payload") {
-                                let event_type = payload.get("type").and_then(|v| v.as_str());
-
-                                match event_type {
-                                    Some("user_message") => {
-                                        let text = payload
-                                            .get("message")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        if !text.is_empty() {
-                                            update_time_bounds(
-                                                &mut started_at,
-                                                &mut ended_at,
-                                                created,
-                                            );
-                                            user_prompts.observe(
-                                                user_prompts::Stream::Event,
-                                                line_idx,
-                                                messages.len(),
-                                                text,
-                                                created,
-                                                payload.get("turn_id").and_then(Value::as_str),
-                                            );
-                                            messages.push(NormalizedMessage {
-                                                idx: 0,
-                                                role: "user".to_string(),
-                                                author: None,
-                                                created_at: created,
-                                                content: text.to_string(),
-                                                extra: val,
-                                                invocations: Vec::new(),
-                                                snippets: Vec::new(),
-                                            });
-                                        }
-                                    }
-                                    Some("agent_reasoning") => {
-                                        let text = payload
-                                            .get("text")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        if !text.is_empty() {
-                                            update_time_bounds(
-                                                &mut started_at,
-                                                &mut ended_at,
-                                                created,
-                                            );
-                                            messages.push(NormalizedMessage {
-                                                idx: 0,
-                                                role: "assistant".to_string(),
-                                                author: Some("reasoning".to_string()),
-                                                created_at: created,
-                                                content: text.to_string(),
-                                                extra: val,
-                                                invocations: Vec::new(),
-                                                snippets: Vec::new(),
-                                            });
-                                        }
-                                    }
-                                    Some("tool_call") => {
-                                        // Codex event_msg/tool_call events carry structured
-                                        // tool data that should produce invocations.
-                                        let tool_name = payload
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown")
-                                            .to_string();
-                                        let arguments = payload
-                                            .get("input")
-                                            .or_else(|| payload.get("arguments"))
-                                            .cloned();
-                                        let call_id = payload
-                                            .get("call_id")
-                                            .or_else(|| payload.get("id"))
-                                            .and_then(|v| v.as_str())
-                                            .map(String::from);
-
-                                        let content_text = format!("[Tool: {tool_name}]");
-                                        update_time_bounds(&mut started_at, &mut ended_at, created);
-                                        let mut invocations = vec![NormalizedInvocation {
-                                            kind: "tool".to_string(),
-                                            name: tool_name,
-                                            raw_name: None,
-                                            call_id,
-                                            arguments,
-                                        }];
-                                        unwrap_skill_invocations(&mut invocations);
-                                        messages.push(NormalizedMessage {
-                                            idx: 0,
-                                            role: "assistant".to_string(),
-                                            author: None,
-                                            created_at: created,
-                                            content: content_text,
-                                            extra: val,
-                                            invocations,
-                                            snippets: Vec::new(),
-                                        });
-                                    }
-                                    Some("token_count") => {
-                                        if let Some(token_usage) =
-                                            CodexConnector::token_usage_from_payload(payload)
-                                        {
-                                            match token_count_tracker.classify(payload) {
-                                                token_usage_accumulation::TokenCountKind::Repeat => {}
-                                                token_usage_accumulation::TokenCountKind::NewRequest => {
-                                                    CodexConnector::accumulate_token_usage_on_latest_assistant(
-                                                        &mut messages, token_usage, &source_path, line_idx + 1,
-                                                    );
-                                                }
-                                                token_usage_accumulation::TokenCountKind::Legacy => {
-                                                    CodexConnector::attach_token_usage_to_latest_assistant(
-                                                        &mut messages, token_usage, &source_path, line_idx + 1,
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            tracing::debug!(
-                                                path = %source_path.display(),
-                                                line_number = line_idx + 1,
-                                                "codex token_count event missing token fields; skipping"
-                                            );
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                user_prompts.finish(&mut messages);
-                crate::types::reindex_messages(&mut messages);
-            } else {
-                // Legacy single-file rollouts can be huge; enforce the
-                // project's 100MB scan cap (chatgpt policy).
-                let content = match read_capped(&file) {
-                    Ok(Some(content)) => content,
-                    Ok(None) => {
-                        tracing::warn!(
-                            file = %file.display(),
-                            "codex: legacy rollout exceeds the scan size cap; skipping"
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(file = %file.display(), error = %e, "codex: unreadable legacy rollout");
-                        continue;
-                    }
-                };
-                ctx.tick();
-                let content = content.trim_start_matches('\u{feff}');
-                let val: Value = match serde_json::from_str(content) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                session_cwd = val
-                    .get("session")
-                    .and_then(|s| s.get("cwd"))
-                    .and_then(|v| v.as_str())
-                    .map(PathBuf::from);
-
-                if let Some(items) = val.get("items").and_then(|v| v.as_array()) {
-                    for item in items {
-                        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("agent");
-                        let content_str =
-                            item.get("content").map(flatten_content).unwrap_or_default();
-
-                        if content_str.trim().is_empty() {
-                            continue;
-                        }
-
-                        let created = item.get("timestamp").and_then(parse_timestamp);
-                        update_time_bounds(&mut started_at, &mut ended_at, created);
-
-                        let mut invocations = item
-                            .get("content")
-                            .map_or_else(Vec::new, extract_invocations_from_content_blocks);
-                        unwrap_skill_invocations(&mut invocations);
-
-                        messages.push(NormalizedMessage {
-                            idx: 0,
-                            role: role.to_string(),
-                            author: None,
-                            created_at: created,
-                            content: content_str,
-                            extra: item.clone(),
-                            invocations,
-                            snippets: Vec::new(),
-                        });
-                    }
-                }
-                crate::types::reindex_messages(&mut messages);
-            }
-
-            if messages.is_empty() {
+            let Some(parsed) = parse_rollout_segment(&segment.path, segment_format, ctx)? else {
                 continue;
+            };
+            messages.extend(parsed.messages);
+            update_time_bounds(&mut started_at, &mut ended_at, parsed.started_at);
+            update_time_bounds(&mut started_at, &mut ended_at, parsed.ended_at);
+            if session_cwd.is_none() {
+                session_cwd = parsed.cwd;
             }
+        }
+        crate::types::reindex_messages(&mut messages);
 
-            let title = messages
+        if messages.is_empty() {
+            continue;
+        }
+
+        let title = messages
+            .iter()
+            .find(|m| m.role == "user" && !is_injected_context_message(&m.content))
+            .map(|m| {
+                m.content
+                    .lines()
+                    .next()
+                    .unwrap_or(&m.content)
+                    .chars()
+                    .take(100)
+                    .collect::<String>()
+            })
+            .or_else(|| {
+                messages
+                    .first()
+                    .and_then(|m| m.content.lines().next())
+                    .map(|s| s.chars().take(100).collect())
+            });
+
+        let mut conv = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id,
+            title,
+            workspace: session_cwd,
+            source_path: identity_segment.path.clone(),
+            started_at,
+            ended_at,
+            metadata: thread_metadata(&thread, format),
+            messages,
+        };
+        identity_segment.root.apply_workspace_rewrite(&mut conv);
+        on_conversation(conv)?;
+
+        // Source complete: the thread's conversation was delivered. Withheld
+        // when any of its segments changed while being parsed.
+        if !identity.fs_metadata_changed()
+            && sidecars
                 .iter()
-                .find(|m| m.role == "user" && !is_injected_context_message(&m.content))
-                .map(|m| {
-                    m.content
-                        .lines()
-                        .next()
-                        .unwrap_or(&m.content)
-                        .chars()
-                        .take(100)
-                        .collect::<String>()
-                })
-                .or_else(|| {
-                    messages
-                        .first()
-                        .and_then(|m| m.content.lines().next())
-                        .map(|s| s.chars().take(100).collect())
-                });
-
-            let mut conv = NormalizedConversation {
-                agent_slug: "codex".to_string(),
-                external_id,
-                title,
-                workspace: session_cwd,
-                source_path: source_path.clone(),
-                started_at,
-                ended_at,
-                metadata: serde_json::json!({"source": if format == RolloutFormat::Json { "rollout_json" } else { "rollout" }}),
-                messages,
-            };
-            root.apply_workspace_rewrite(&mut conv);
-            on_conversation(conv)?;
-
-            // Source complete: the rollout's conversation was delivered.
-            // Withheld when the file changed while being parsed.
-            if !discovered.fs_metadata_changed() {
-                hooks.complete(&SourceCompletion {
-                    source: discovered,
-                    required_sidecars: Vec::new(),
-                    conversations_emitted: 1,
-                })?;
-            }
+                .all(|sidecar| !sidecar.fs_metadata_changed())
+        {
+            hooks.complete(&SourceCompletion {
+                source: identity.clone(),
+                required_sidecars: sidecars.to_vec(),
+                conversations_emitted: 1,
+            })?;
         }
     }
 
     Ok(())
+}
+
+/// A single-segment thread keeps today's metadata exactly. A merged thread also
+/// records every segment path and the external id each segment used to own, so
+/// a host can retire the per-segment rows those files produced on their own.
+fn thread_metadata(thread: &segments::Thread, format: RolloutFormat) -> Value {
+    let mut metadata = serde_json::json!({
+        "source": if format == RolloutFormat::Json { "rollout_json" } else { "rollout" }
+    });
+    if thread.segments.len() < 2 {
+        return metadata;
+    }
+    let Some(name) = segments::SegmentName::of(&thread.segments[0].path) else {
+        return metadata;
+    };
+    let entries: Vec<Value> = thread
+        .segments
+        .iter()
+        .map(|segment| {
+            let continuation =
+                segments::SegmentName::of(&segment.path).is_some_and(|name| name.continuation);
+            serde_json::json!({
+                "path": segment.path,
+                "external_id": CodexConnector::segment_external_id(
+                    &segment.path,
+                    &segment.sessions_dir,
+                ),
+                "kind": if continuation { "continuation" } else { "original" },
+            })
+        })
+        .collect();
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("thread_id".to_string(), Value::String(name.thread_id));
+        object.insert(
+            "segment_count".to_string(),
+            serde_json::json!(thread.segments.len()),
+        );
+        object.insert("segments".to_string(), Value::Array(entries));
+    }
+    metadata
+}
+
+/// One segment's records, parsed with its own prompt-pairing and token state:
+/// both pair adjacent physical records, which never span two files.
+struct ParsedSegment {
+    messages: Vec<NormalizedMessage>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    cwd: Option<PathBuf>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_rollout_segment(
+    path: &Path,
+    format: RolloutFormat,
+    ctx: &ScanContext,
+) -> Result<Option<ParsedSegment>> {
+    let mut messages = Vec::new();
+    let mut started_at = None;
+    let mut ended_at = None;
+    let mut session_cwd: Option<PathBuf> = None;
+    // Pair individual records, not all occurrences of prompt text.
+    // Capture stream/turn identity before the records normalize.
+    let mut user_prompts = user_prompts::UserPrompts::default();
+    let mut token_count_tracker = token_usage_accumulation::TokenCountTracker::default();
+
+    if matches!(
+        format,
+        RolloutFormat::Jsonl | RolloutFormat::CompressedJsonl
+    ) {
+        let mut reader = reader::RolloutReader::open(
+            path,
+            format == RolloutFormat::CompressedJsonl,
+            ctx.progress_tick.as_deref(),
+        )?;
+
+        // Accumulate privately until the complete opened snapshot is validated.
+        while let Some((line_idx, val)) = reader.next_record()? {
+            let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let created = val.get("timestamp").and_then(parse_timestamp);
+
+            match entry_type {
+                "session_meta" => {
+                    if let Some(payload) = val.get("payload") {
+                        session_cwd = payload
+                            .get("cwd")
+                            .and_then(|v| v.as_str())
+                            .map(PathBuf::from);
+                    }
+                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                }
+                "response_item" => {
+                    if let Some(payload) = val.get("payload") {
+                        let payload_type = payload.get("type").and_then(|v| v.as_str());
+
+                        match payload_type {
+                            // Modern Codex encodes tool calls as
+                            // `response_item` entries rather than
+                            // `event_msg`/`tool_call`. `function_call`
+                            // is a structured tool (e.g. `exec_command`);
+                            // `custom_tool_call` is a freeform tool
+                            // (e.g. `apply_patch`). Both lack a `content`
+                            // field, so without explicit handling they
+                            // flatten to empty and get dropped.
+                            Some("function_call" | "custom_tool_call") => {
+                                let tool_name = payload
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let arguments = parse_tool_call_arguments(payload);
+                                let call_id = payload
+                                    .get("call_id")
+                                    .or_else(|| payload.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
+
+                                let content_text = format!("[Tool: {tool_name}]");
+                                update_time_bounds(&mut started_at, &mut ended_at, created);
+                                let mut invocations = vec![NormalizedInvocation {
+                                    kind: "tool".to_string(),
+                                    name: tool_name,
+                                    raw_name: None,
+                                    call_id,
+                                    arguments,
+                                }];
+                                unwrap_skill_invocations(&mut invocations);
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: "assistant".to_string(),
+                                    author: None,
+                                    created_at: created,
+                                    content: content_text,
+                                    extra: val,
+                                    invocations,
+                                    snippets: Vec::new(),
+                                });
+                            }
+                            // Tool results: `output` carries the captured
+                            // stdout / patch summary. Emit as a
+                            // first-class `tool` timeline entry; the
+                            // linking `call_id` is preserved in `extra`.
+                            // F13: a textless output WITH identity
+                            // (`call_id`/`id` — image-only results whose
+                            // `output` is a list of `image_url` parts) is
+                            // local evidence too: emit it as a `tool`
+                            // message with EMPTY content and the raw
+                            // record as `extra`, so call/result linking
+                            // can pair it — never a fabricated result
+                            // text. Identity-less textless records stay
+                            // dropped: there is nothing to link them to.
+                            Some("function_call_output" | "custom_tool_call_output") => {
+                                let output_text = tool_output_text(payload);
+                                let has_identity = payload
+                                    .get("call_id")
+                                    .or_else(|| payload.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|id| !id.trim().is_empty());
+                                if output_text.trim().is_empty() && !has_identity {
+                                    continue;
+                                }
+                                update_time_bounds(&mut started_at, &mut ended_at, created);
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: "tool".to_string(),
+                                    author: None,
+                                    created_at: created,
+                                    content: output_text,
+                                    extra: val,
+                                    invocations: Vec::new(),
+                                    snippets: Vec::new(),
+                                });
+                            }
+                            // Plain messages: assistant `output_text`,
+                            // user/developer `input_text`, or legacy
+                            // string content. Encrypted `reasoning`
+                            // items have no plaintext content and are
+                            // intentionally skipped here (plaintext
+                            // reasoning arrives via `event_msg`).
+                            _ => {
+                                let role = payload
+                                    .get("role")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("agent");
+
+                                let content_str = payload
+                                    .get("content")
+                                    .map(flatten_content)
+                                    .unwrap_or_default();
+
+                                if content_str.trim().is_empty() {
+                                    continue;
+                                }
+
+                                update_time_bounds(&mut started_at, &mut ended_at, created);
+                                if role == "user" {
+                                    user_prompts.observe(
+                                        user_prompts::Stream::Response,
+                                        line_idx,
+                                        messages.len(),
+                                        &content_str,
+                                        created,
+                                        payload.get("turn_id").and_then(Value::as_str),
+                                    );
+                                }
+                                let mut invocations = payload
+                                    .get("content")
+                                    .map_or_else(Vec::new, extract_invocations_from_content_blocks);
+                                unwrap_skill_invocations(&mut invocations);
+
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: role.to_string(),
+                                    author: None,
+                                    created_at: created,
+                                    content: content_str,
+                                    extra: val,
+                                    invocations,
+                                    snippets: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                }
+                "event_msg" => {
+                    if let Some(payload) = val.get("payload") {
+                        let event_type = payload.get("type").and_then(|v| v.as_str());
+
+                        match event_type {
+                            Some("user_message") => {
+                                let text = payload
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if !text.is_empty() {
+                                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                                    user_prompts.observe(
+                                        user_prompts::Stream::Event,
+                                        line_idx,
+                                        messages.len(),
+                                        text,
+                                        created,
+                                        payload.get("turn_id").and_then(Value::as_str),
+                                    );
+                                    messages.push(NormalizedMessage {
+                                        idx: 0,
+                                        role: "user".to_string(),
+                                        author: None,
+                                        created_at: created,
+                                        content: text.to_string(),
+                                        extra: val,
+                                        invocations: Vec::new(),
+                                        snippets: Vec::new(),
+                                    });
+                                }
+                            }
+                            Some("agent_reasoning") => {
+                                let text =
+                                    payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                if !text.is_empty() {
+                                    update_time_bounds(&mut started_at, &mut ended_at, created);
+                                    messages.push(NormalizedMessage {
+                                        idx: 0,
+                                        role: "assistant".to_string(),
+                                        author: Some("reasoning".to_string()),
+                                        created_at: created,
+                                        content: text.to_string(),
+                                        extra: val,
+                                        invocations: Vec::new(),
+                                        snippets: Vec::new(),
+                                    });
+                                }
+                            }
+                            Some("tool_call") => {
+                                // Codex event_msg/tool_call events carry structured
+                                // tool data that should produce invocations.
+                                let tool_name = payload
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let arguments = payload
+                                    .get("input")
+                                    .or_else(|| payload.get("arguments"))
+                                    .cloned();
+                                let call_id = payload
+                                    .get("call_id")
+                                    .or_else(|| payload.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
+
+                                let content_text = format!("[Tool: {tool_name}]");
+                                update_time_bounds(&mut started_at, &mut ended_at, created);
+                                let mut invocations = vec![NormalizedInvocation {
+                                    kind: "tool".to_string(),
+                                    name: tool_name,
+                                    raw_name: None,
+                                    call_id,
+                                    arguments,
+                                }];
+                                unwrap_skill_invocations(&mut invocations);
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: "assistant".to_string(),
+                                    author: None,
+                                    created_at: created,
+                                    content: content_text,
+                                    extra: val,
+                                    invocations,
+                                    snippets: Vec::new(),
+                                });
+                            }
+                            Some("token_count") => {
+                                if let Some(token_usage) =
+                                    CodexConnector::token_usage_from_payload(payload)
+                                {
+                                    match token_count_tracker.classify(payload) {
+                                        token_usage_accumulation::TokenCountKind::Repeat => {}
+                                        token_usage_accumulation::TokenCountKind::NewRequest => {
+                                            CodexConnector::accumulate_token_usage_on_latest_assistant(
+                                                        &mut messages, token_usage, path, line_idx + 1,
+                                                    );
+                                        }
+                                        token_usage_accumulation::TokenCountKind::Legacy => {
+                                            CodexConnector::attach_token_usage_to_latest_assistant(
+                                                &mut messages,
+                                                token_usage,
+                                                path,
+                                                line_idx + 1,
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    tracing::debug!(
+                                        path = %path.display(),
+                                        line_number = line_idx + 1,
+                                        "codex token_count event missing token fields; skipping"
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        user_prompts.finish(&mut messages);
+    } else {
+        // Legacy single-file rollouts can be huge; enforce the
+        // project's 100MB scan cap (chatgpt policy).
+        let content = match read_capped(path) {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                tracing::warn!(
+                    file = %path.display(),
+                    "codex: legacy rollout exceeds the scan size cap; skipping"
+                );
+                return Ok(None);
+            }
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %e, "codex: unreadable legacy rollout");
+                return Ok(None);
+            }
+        };
+        ctx.tick();
+        let content = content.trim_start_matches('\u{feff}');
+        let val: Value = match serde_json::from_str(content) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+
+        session_cwd = val
+            .get("session")
+            .and_then(|s| s.get("cwd"))
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+
+        if let Some(items) = val.get("items").and_then(|v| v.as_array()) {
+            for item in items {
+                let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("agent");
+                let content_str = item.get("content").map(flatten_content).unwrap_or_default();
+
+                if content_str.trim().is_empty() {
+                    continue;
+                }
+
+                let created = item.get("timestamp").and_then(parse_timestamp);
+                update_time_bounds(&mut started_at, &mut ended_at, created);
+
+                let mut invocations = item
+                    .get("content")
+                    .map_or_else(Vec::new, extract_invocations_from_content_blocks);
+                unwrap_skill_invocations(&mut invocations);
+
+                messages.push(NormalizedMessage {
+                    idx: 0,
+                    role: role.to_string(),
+                    author: None,
+                    created_at: created,
+                    content: content_str,
+                    extra: item.clone(),
+                    invocations,
+                    snippets: Vec::new(),
+                });
+            }
+        }
+    }
+
+    Ok(Some(ParsedSegment {
+        messages,
+        started_at,
+        ended_at,
+        cwd: session_cwd,
+    }))
 }
 
 impl Connector for CodexConnector {

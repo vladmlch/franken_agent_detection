@@ -1,0 +1,176 @@
+[
+  {
+    "agent_slug": "codex",
+    "ended_at": 1794519690000,
+    "external_id": "2026/11/12/rollout-2026-11-12T22-40-18-01a1d1b4-5529-7cd3-97db-d52326514bc2",
+    "messages": [
+      {
+        "author": null,
+        "content": "first question",
+        "created_at": 1794519620000,
+        "extra": {
+          "payload": {
+            "content": "first question",
+            "role": "user",
+            "type": "message"
+          },
+          "timestamp": "2026-11-12T21:40:20Z",
+          "type": "response_item"
+        },
+        "idx": 0,
+        "role": "user",
+        "snippets": []
+      },
+      {
+        "author": null,
+        "content": "first answer",
+        "created_at": 1794519660000,
+        "extra": {
+          "cass": {
+            "token_usage": {
+              "data_source": "api",
+              "input_tokens": 120,
+              "output_tokens": 45
+            }
+          },
+          "payload": {
+            "content": "first answer",
+            "role": "assistant",
+            "type": "message"
+          },
+          "timestamp": "2026-11-12T21:41:00Z",
+          "type": "response_item"
+        },
+        "idx": 1,
+        "role": "assistant",
+        "snippets": []
+      },
+      {
+        "author": "reasoning",
+        "content": "thinking about ls",
+        "created_at": 1794519670000,
+        "extra": {
+          "payload": {
+            "text": "thinking about ls",
+            "type": "agent_reasoning"
+          },
+          "timestamp": "2026-11-12T21:41:10Z",
+          "type": "event_msg"
+        },
+        "idx": 2,
+        "role": "assistant",
+        "snippets": []
+      },
+      {
+        "author": null,
+        "content": "[Tool: exec_command]",
+        "created_at": 1794519680000,
+        "extra": {
+          "payload": {
+            "arguments": "{\"cmd\":\"ls\"}",
+            "call_id": "call-1",
+            "name": "exec_command",
+            "type": "function_call"
+          },
+          "timestamp": "2026-11-12T21:41:20Z",
+          "type": "response_item"
+        },
+        "idx": 3,
+        "invocations": [
+          {
+            "arguments": {
+              "cmd": "ls"
+            },
+            "call_id": "call-1",
+            "kind": "tool",
+            "name": "exec_command"
+          }
+        ],
+        "role": "assistant",
+        "snippets": []
+      },
+      {
+        "author": null,
+        "content": "file.txt",
+        "created_at": 1794519690000,
+        "extra": {
+          "payload": {
+            "call_id": "call-1",
+            "output": "file.txt",
+            "type": "function_call_output"
+          },
+          "timestamp": "2026-11-12T21:41:30Z",
+          "type": "response_item"
+        },
+        "idx": 4,
+        "role": "tool",
+        "snippets": []
+      }
+    ],
+    "metadata": {
+      "source": "rollout"
+    },
+    "source_path": "rollout-2026-11-12T22-40-18-01a1d1b4-5529-7cd3-97db-d52326514bc2.jsonl",
+    "started_at": 1794519618000,
+    "title": "first question",
+    "workspace": "workspace"
+  },
+  {
+    "agent_slug": "codex",
+    "ended_at": 1794513600000,
+    "external_id": "rollout-legacy-name",
+    "messages": [
+      {
+        "author": null,
+        "content": "legacy name question",
+        "created_at": 1794513600000,
+        "extra": {
+          "payload": {
+            "content": "legacy name question",
+            "role": "user",
+            "type": "message"
+          },
+          "timestamp": "2026-11-12T20:00:00Z",
+          "type": "response_item"
+        },
+        "idx": 0,
+        "role": "user",
+        "snippets": []
+      }
+    ],
+    "metadata": {
+      "source": "rollout"
+    },
+    "source_path": "rollout-legacy-name.jsonl",
+    "started_at": 1794513600000,
+    "title": "legacy name question",
+    "workspace": null
+  },
+  {
+    "agent_slug": "codex",
+    "ended_at": 1794510000000,
+    "external_id": "rollout-legacy",
+    "messages": [
+      {
+        "author": null,
+        "content": "legacy doc question",
+        "created_at": 1794510000000,
+        "extra": {
+          "content": "legacy doc question",
+          "role": "user",
+          "timestamp": "2026-11-12T19:00:00Z"
+        },
+        "idx": 0,
+        "role": "user",
+        "snippets": []
+      }
+    ],
+    "metadata": {
+      "source": "rollout_json"
+    },
+    "source_path": "rollout-legacy.json",
+    "started_at": 1794510000000,
+    "title": "legacy doc question",
+    "workspace": "workspace"
+  }
+]

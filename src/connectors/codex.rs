@@ -763,8 +763,9 @@ fn thread_metadata(thread: &segments::Thread, format: RolloutFormat) -> Value {
     metadata
 }
 
-/// One segment's records, parsed with its own prompt-pairing and token state:
-/// both pair adjacent physical records, which never span two files.
+/// One segment's records, parsed with its own prompt-dedup and token state:
+/// the first keys on adjacent physical record positions, the second on a
+/// per-file cumulative total, so neither can carry across a file boundary.
 struct ParsedSegment {
     messages: Vec<NormalizedMessage>,
     started_at: Option<i64>,

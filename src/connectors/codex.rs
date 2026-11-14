@@ -580,6 +580,56 @@ fn scan_codex_with_callback(
     scan_codex_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
 }
 
+struct MergedThread {
+    messages: Vec<NormalizedMessage>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    session_cwd: Option<PathBuf>,
+    subagent: Option<SubagentEvidence>,
+}
+
+fn merge_thread_segments(thread: &segments::Thread, ctx: &ScanContext) -> Result<MergedThread> {
+    let mut messages = Vec::new();
+    let mut started_at = None;
+    let mut ended_at = None;
+    let mut session_cwd: Option<PathBuf> = None;
+    // The verdict comes from the earliest non-continuation segment carrying a
+    // session_meta header (the original when present); a continuation header
+    // cannot establish is_subagent=false because paginated continuations carry
+    // history_base/forked_from_id rather than repeating spawn metadata.
+    let mut subagent: Option<SubagentEvidence> = None;
+    for segment in &thread.segments {
+        let Some(segment_format) = RolloutFormat::of(&segment.path) else {
+            continue;
+        };
+        let Some(parsed) = parse_rollout_segment(&segment.path, segment_format, ctx)? else {
+            continue;
+        };
+        messages.extend(parsed.messages);
+        update_time_bounds(&mut started_at, &mut ended_at, parsed.started_at);
+        update_time_bounds(&mut started_at, &mut ended_at, parsed.ended_at);
+        if session_cwd.is_none() {
+            session_cwd = parsed.cwd;
+        }
+        let is_continuation =
+            segments::SegmentName::of(&segment.path).is_some_and(|name| name.continuation);
+        if subagent.is_none()
+            && let Some(ev) = parsed.subagent
+            && (!is_continuation || ev.is_subagent)
+        {
+            subagent = Some(ev);
+        }
+    }
+    crate::types::reindex_messages(&mut messages);
+    Ok(MergedThread {
+        messages,
+        started_at,
+        ended_at,
+        session_cwd,
+        subagent,
+    })
+}
+
 fn scan_codex_with_hooks(
     ctx: &ScanContext,
     hooks: &mut SourceScanHooks<'_>,
@@ -642,49 +692,23 @@ fn scan_codex_with_hooks(
             &identity_segment.sessions_dir,
         );
 
-        let mut messages = Vec::new();
-        let mut started_at = None;
-        let mut ended_at = None;
-        let mut session_cwd: Option<PathBuf> = None;
-        // The verdict comes from the earliest segment carrying a session_meta
-        // header (the original when present); a later continuation header never
-        // overrides it.
-        let mut subagent: Option<SubagentEvidence> = None;
-        for segment in &thread.segments {
-            let Some(segment_format) = RolloutFormat::of(&segment.path) else {
-                continue;
-            };
-            let Some(parsed) = parse_rollout_segment(&segment.path, segment_format, ctx)? else {
-                continue;
-            };
-            messages.extend(parsed.messages);
-            update_time_bounds(&mut started_at, &mut ended_at, parsed.started_at);
-            update_time_bounds(&mut started_at, &mut ended_at, parsed.ended_at);
-            if session_cwd.is_none() {
-                session_cwd = parsed.cwd;
-            }
-            if subagent.is_none() {
-                subagent = parsed.subagent;
-            }
-        }
-        crate::types::reindex_messages(&mut messages);
-
-        if messages.is_empty() {
+        let merged = merge_thread_segments(&thread, ctx)?;
+        if merged.messages.is_empty() {
             continue;
         }
 
-        let title = conversation_title(&messages);
+        let title = conversation_title(&merged.messages);
 
         let mut conv = NormalizedConversation {
             agent_slug: "codex".to_string(),
             external_id,
             title,
-            workspace: session_cwd,
+            workspace: merged.session_cwd,
             source_path: identity_segment.path.clone(),
-            started_at,
-            ended_at,
-            metadata: thread_metadata(&thread, format, subagent.as_ref()),
-            messages,
+            started_at: merged.started_at,
+            ended_at: merged.ended_at,
+            metadata: thread_metadata(&thread, format, merged.subagent.as_ref()),
+            messages: merged.messages,
         };
         identity_segment.root.apply_workspace_rewrite(&mut conv);
         on_conversation(conv)?;
@@ -757,28 +781,49 @@ fn json_truthy(value: &Value) -> bool {
     }
 }
 
+fn non_empty_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+fn is_ascii_uuid(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+/// Extract a canonical lowercase 36-char UUID from `text`, matching native
+/// `extract_uuid_from_string`.
+fn extract_uuid_from_string(text: &str) -> Option<String> {
+    text.as_bytes()
+        .windows(36)
+        .filter_map(|w| std::str::from_utf8(w).ok())
+        .find(|s| is_ascii_uuid(s))
+        .map(str::to_ascii_lowercase)
+}
+
+fn canonical_codex_parent_id(raw: &str) -> String {
+    extract_uuid_from_string(raw).unwrap_or_else(|| raw.to_string())
+}
+
 fn classify_session_meta(payload: &Value) -> SubagentEvidence {
     let mut ev = SubagentEvidence::default();
-    let parent_top = payload
-        .get("parent_thread_id")
-        .and_then(Value::as_str)
-        .or_else(|| payload.get("parent_id").and_then(Value::as_str))
-        .filter(|s| !s.is_empty());
+    let parent_top =
+        non_empty_str(payload, "parent_thread_id").or_else(|| non_empty_str(payload, "parent_id"));
     if let Some(parent) = parent_top {
         ev.is_subagent = true;
-        ev.parent_id = Some(parent.to_string());
+        ev.parent_id = Some(canonical_codex_parent_id(parent));
     }
     if payload.get("thread_source").and_then(Value::as_str) == Some("subagent") {
         ev.is_subagent = true;
     }
-    ev.role = payload
-        .get("agent_role")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    ev.nickname = payload
-        .get("agent_nickname")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    ev.role = non_empty_str(payload, "agent_role").map(str::to_string);
+    ev.nickname = non_empty_str(payload, "agent_nickname").map(str::to_string);
 
     match payload.get("source") {
         Some(Value::String(s)) if s == "subagent" => ev.is_subagent = true,
@@ -794,21 +839,27 @@ fn classify_session_meta(payload: &Value) -> SubagentEvidence {
                             ev.parent_id = ts
                                 .get("parent_thread_id")
                                 .and_then(Value::as_str)
-                                .or_else(|| ts.get("parent_id").and_then(Value::as_str))
                                 .filter(|s| !s.is_empty())
-                                .map(str::to_string);
+                                .or_else(|| {
+                                    ts.get("parent_id")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                })
+                                .map(canonical_codex_parent_id);
                         }
                         ev.role = Some(
                             ts.get("agent_role")
                                 .and_then(Value::as_str)
-                                .or_else(|| payload.get("agent_role").and_then(Value::as_str))
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| non_empty_str(payload, "agent_role"))
                                 .unwrap_or("worker")
                                 .to_string(),
                         );
                         ev.nickname = ts
                             .get("agent_nickname")
                             .and_then(Value::as_str)
-                            .or_else(|| payload.get("agent_nickname").and_then(Value::as_str))
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| non_empty_str(payload, "agent_nickname"))
                             .map(str::to_string);
                         ev.depth = Some(ts.get("depth").and_then(Value::as_i64).unwrap_or(1));
                     } else if let Some(other) = sub_obj.get("other") {
@@ -950,7 +1001,7 @@ fn parse_rollout_segment(
 
             match entry_type {
                 "session_meta" => {
-                    if let Some(payload) = val.get("payload") {
+                    if let Some(payload) = val.get("payload").filter(|v| v.is_object()) {
                         session_cwd = payload
                             .get("cwd")
                             .and_then(|v| v.as_str())
@@ -3556,5 +3607,93 @@ not valid json at all
         let m = &convs[0].metadata;
         assert_eq!(m["is_subagent"], json!(false));
         assert!(m.get("parent_id").is_none());
+    }
+
+    #[test]
+    fn orphaned_continuation_main_header_withholds_verdict() {
+        let a = "01a1781c-0000-4000-8000-00000000000e";
+        let b = "01a1781c-0000-4000-8000-00000000000f";
+        // Paginated continuations carry history_base/forked_from_id rather than
+        // repeating subagent spawn fields, so an orphaned continuation cannot prove main.
+        let cont_meta = format!(
+            "{{\"type\":\"session_meta\",\"timestamp\":\"2026-11-12T00:01:00Z\",\"payload\":{{\"cwd\":\"/p\",\"forked_from_id\":\"{a}\"}}}}\n"
+        );
+        let continuation = format!("{cont_meta}{}", user_record("orphaned continuation"));
+        let cont_name = format!("rollout-2026-11-12T00-01-00-{a}_{b}.jsonl");
+        let convs = scan_codex_rollouts(&[(cont_name.as_str(), continuation.as_str())]);
+        assert_eq!(convs.len(), 1);
+        assert!(
+            convs[0].metadata.get("is_subagent").is_none(),
+            "orphaned continuation without subagent fields must withhold verdict"
+        );
+    }
+
+    #[test]
+    fn headerless_original_with_main_continuation_withholds_verdict() {
+        let a = "01a1781c-0000-4000-8000-000000000010";
+        let b = "01a1781c-0000-4000-8000-000000000011";
+        let original = user_record("original without header");
+        let cont_meta = "{\"type\":\"session_meta\",\"timestamp\":\"2026-11-12T00:01:00Z\",\"payload\":{\"cwd\":\"/p\"}}\n";
+        let continuation = format!("{cont_meta}{}", user_record("continuation"));
+        let orig_name = format!("rollout-2026-11-12T00-00-00-{a}.jsonl");
+        let cont_name = format!("rollout-2026-11-12T00-01-00-{a}_{b}.jsonl");
+        let convs = scan_codex_rollouts(&[
+            (orig_name.as_str(), original.as_str()),
+            (cont_name.as_str(), continuation.as_str()),
+        ]);
+        assert_eq!(convs.len(), 1);
+        assert!(
+            convs[0].metadata.get("is_subagent").is_none(),
+            "headerless original must not inherit false from continuation"
+        );
+    }
+
+    #[test]
+    fn empty_parent_thread_id_falls_back_to_parent_id_and_role_fields() {
+        let meta = format!(
+            "{{\"type\":\"session_meta\",\"timestamp\":\"2026-11-12T00:00:00Z\",\"payload\":{{\"cwd\":\"/p\",\"parent_thread_id\":\"\",\"parent_id\":\"{SUB_PARENT}\",\"agent_role\":\"explorer\",\"agent_nickname\":\"Euler\",\"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"\",\"parent_id\":\"{SUB_PARENT}\",\"agent_role\":\"\",\"agent_nickname\":\"\"}}}}}}}}}}\n"
+        );
+        let content = format!("{meta}{}", user_record("worker"));
+        let convs = scan_codex_rollouts(&[("rollout-2026-11-12T00-00-00-empty.jsonl", &content)]);
+        let m = &convs[0].metadata;
+        assert_eq!(m["is_subagent"], json!(true));
+        assert_eq!(m["parent_id"], json!(SUB_PARENT));
+        assert_eq!(m["subagent_role"], json!("explorer"));
+        assert_eq!(m["subagent_nickname"], json!("Euler"));
+    }
+
+    #[test]
+    fn non_object_session_meta_payload_is_ignored() {
+        let null_then_sub = format!(
+            "{{\"type\":\"session_meta\",\"timestamp\":\"2026-11-12T00:00:00Z\",\"payload\":null}}\n{{\"type\":\"session_meta\",\"timestamp\":\"2026-11-12T00:00:00Z\",\"payload\":{{\"cwd\":\"/p\",\"parent_thread_id\":\"{SUB_PARENT}\"}}}}\n{}",
+            user_record("after null payload")
+        );
+        let convs =
+            scan_codex_rollouts(&[("rollout-2026-11-12T00-00-00-nullsub.jsonl", &null_then_sub)]);
+        assert_eq!(convs[0].metadata["is_subagent"], json!(true));
+        assert_eq!(convs[0].metadata["parent_id"], json!(SUB_PARENT));
+
+        let null_only = format!(
+            "{{\"type\":\"session_meta\",\"timestamp\":\"2026-11-12T00:00:00Z\",\"payload\":null}}\n{}",
+            user_record("only null payload")
+        );
+        let convs =
+            scan_codex_rollouts(&[("rollout-2026-11-12T00-00-00-nullonly.jsonl", &null_only)]);
+        assert!(
+            convs[0].metadata.get("is_subagent").is_none(),
+            "non-object payload must not prove main"
+        );
+    }
+
+    #[test]
+    fn parent_id_is_canonicalized_to_lowercase_uuid() {
+        let upper = "01A1781C-0000-4000-8000-000000000001";
+        let meta = format!(
+            "{{\"type\":\"session_meta\",\"timestamp\":\"2026-11-12T00:00:00Z\",\"payload\":{{\"cwd\":\"/p\",\"parent_thread_id\":\"thread-{upper}\"}}}}\n"
+        );
+        let content = format!("{meta}{}", user_record("upper uuid"));
+        let convs = scan_codex_rollouts(&[("rollout-2026-11-12T00-00-00-upper.jsonl", &content)]);
+        assert_eq!(convs[0].metadata["is_subagent"], json!(true));
+        assert_eq!(convs[0].metadata["parent_id"], json!(SUB_PARENT));
     }
 }

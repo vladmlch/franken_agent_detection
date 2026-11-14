@@ -117,7 +117,7 @@ struct ComposerEvidenceJson {
 }
 
 /// Subagent evidence gathered for one or more Cursor stores before composers parse.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ComposerSubagentEvidence {
     /// child composerId -> parent composerId, from `subagentComposerIds`.
     child_to_parent: HashMap<String, String>,
@@ -1082,17 +1082,30 @@ impl CursorConnector {
                 continue;
             }
             let db_ev = Self::composer_subagent_evidence_from_conn(&conn, tick);
-            for (child, parent) in db_ev.child_to_parent {
-                merged.child_to_parent.insert(child, parent);
-            }
-            for (id, flag) in db_ev.own {
-                Self::merge_flag(&mut merged.own, id, flag);
-            }
-            for (id, flag) in db_ev.headers {
-                Self::merge_flag(&mut merged.headers, id, flag);
-            }
+            Self::extend_subagent_evidence(&mut merged, &db_ev);
         }
         merged
+    }
+
+    /// Fold `extra` into `merged`, keeping the positive-dominance invariants of
+    /// [`Self::merge_flag`]. Round-7 N6: the positive/parent evidence of the
+    /// exact composer rows and headers being emitted is combined with any
+    /// earlier (cached cross-store) evidence before resolving a verdict — a
+    /// cached pass that ran before those rows were committed must not hide
+    /// their parent links or true flags.
+    fn extend_subagent_evidence(
+        merged: &mut ComposerSubagentEvidence,
+        extra: &ComposerSubagentEvidence,
+    ) {
+        for (child, parent) in &extra.child_to_parent {
+            merged.child_to_parent.insert(child.clone(), parent.clone());
+        }
+        for (id, flag) in &extra.own {
+            Self::merge_flag(&mut merged.own, id.clone(), flag.clone());
+        }
+        for (id, flag) in &extra.headers {
+            Self::merge_flag(&mut merged.headers, id.clone(), flag.clone());
+        }
     }
 
     /// Resolve one composer's verdict. Positive evidence (a parent link or an
@@ -1100,6 +1113,12 @@ impl CursorConnector {
     /// false is returned only when the composer's OWN header record, read in the
     /// same snapshot as the composer, cleanly decodes to an explicit false
     /// (own_header_false, round-6 ruling). Everything else is absent (None).
+    ///
+    /// Round-7 B1 ruling: a false verdict means "Cursor's own header for this
+    /// composer explicitly says not-subagent, and no contradicting evidence was
+    /// observed in this scan". A parent listing in a store this scan did not
+    /// read can still exist — that is the accepted, documented limit of the
+    /// rule, not something inventory or completeness gating could soundly fix.
     fn subagent_verdict(
         composer_id: &str,
         ev: &ComposerSubagentEvidence,
@@ -1185,31 +1204,50 @@ impl CursorConnector {
         let composer_limit = Self::prefix_upper_bound(composer_prefix);
         // Surface query errors at warn level: a corrupted page or missing
         // table must not be indistinguishable from a legitimately empty DB.
-        match conn.query_map_collect(
+        //
+        // The composerData rows, this store's header records, and the local
+        // evidence derived from them are read inside ONE deferred read
+        // transaction (round-7 N7): every statement observes the same committed
+        // snapshot, so a writer cannot commit between a composer row and the
+        // own header that certifies its verdict.
+        let snapshot = conn.read_transaction(|conn| {
             // Skip NULL-value rows: Cursor inserts internal markers with no
             // chat payload, and `row.get_typed::<String>(1)?` on NULL aborts the
             // whole query_map_collect — silently turning every row into zero
             // conversations. Not in SQL (see `CURSOR_DISK_KV_RANGE_SQL`).
-            CURSOR_DISK_KV_RANGE_SQL,
-            params![composer_prefix, composer_limit.as_str()],
-            |row| {
-                tick();
-                let key: String = row.get_typed(0)?;
-                let value: Option<String> = row.get_typed(1)?;
-                Ok((key, value))
-            },
-        ) {
-            Ok(rows) => {
-                let owned_evidence;
+            let rows = conn.query_map_collect(
+                CURSOR_DISK_KV_RANGE_SQL,
+                params![composer_prefix, composer_limit.as_str()],
+                |row| {
+                    tick();
+                    let key: String = row.get_typed(0)?;
+                    let value: Option<String> = row.get_typed(1)?;
+                    Ok((key, value))
+                },
+            )?;
+            let evidence = Self::composer_subagent_evidence(&rows, conn, tick);
+            Ok::<_, frankensqlite::FrankenError>((rows, evidence))
+        });
+        match snapshot {
+            Ok((rows, local_evidence)) => {
+                // Round-7 N6: the evidence of the exact rows and headers being
+                // emitted is merged into any earlier cross-store evidence
+                // before resolving verdicts — the earlier pass may have run
+                // before these rows were committed, and the current data can
+                // still prove a subagent it missed (an own header that says
+                // isSubagent=false but carries a parent id is a subagent with
+                // that parent, never a main).
+                let mut merged;
                 let evidence = if let Some(ev) = external_evidence {
-                    ev
+                    merged = ev.clone();
+                    Self::extend_subagent_evidence(&mut merged, &local_evidence);
+                    &merged
                 } else {
-                    owned_evidence = Self::composer_subagent_evidence(&rows, &conn, tick);
-                    &owned_evidence
+                    &local_evidence
                 };
-                // Own-header read for the false verdict, on the same connection /
-                // read epoch as the composerData rows above (round-6 ruling).
-                let own_headers = Self::read_composer_headers(&conn, tick);
+                // Own-header records for the false verdict, from the same read
+                // snapshot as the composerData rows above (round-6/7 rulings).
+                let own_headers = &local_evidence.headers;
                 for (key, value) in rows {
                     let Some(value) = value else {
                         continue;
@@ -1240,7 +1278,7 @@ impl CursorConnector {
                 }
             }
             Err(e) => {
-                tracing::warn!(db = %db_path.display(), error = %e, "cursor: composerData query failed; conversations from this store may be missing");
+                tracing::warn!(db = %db_path.display(), error = %e, "cursor: composerData snapshot read failed; conversations from this store may be missing");
             }
         }
 
@@ -2816,58 +2854,85 @@ impl CursorConnector {
                 ));
                 continue;
             }
-            let owned_evidence;
-            let evidence = if let Some(ev) = external_evidence {
-                ev
-            } else {
-                owned_evidence = Self::composer_subagent_evidence_from_conn(&conn, tick);
-                &owned_evidence
-            };
-            // Own-header read for the false verdict, same connection as the lookup.
-            let own_headers = Self::read_composer_headers(&conn, tick);
-            let mut still_pending: Vec<String> = Vec::new();
-            for sid in &pending {
-                tick();
-                match Self::composer_row_for_sid(&conn, sid) {
-                    Ok(Some(value)) => {
-                        let key = format!("composerData:{sid}");
-                        let parsed = Self::parse_composer_data(
-                            &key,
-                            &value,
-                            db_path,
-                            None,
-                            &mut HashSet::new(),
-                            Some(&conn),
-                        );
-                        if let Some(mut composer_conv) = parsed {
-                            let own_header_false = own_headers
-                                .get(sid)
-                                .is_some_and(|f| f.is_subagent == Some(false) && !f.flag_unknown);
-                            Self::apply_subagent_verdict(
-                                &mut composer_conv,
-                                sid,
-                                evidence,
-                                own_header_false,
+            // Round-7 N7: this store's local evidence (its composerData rows
+            // and header records) and the per-sid composerData row being
+            // emitted are read inside ONE deferred read transaction — the own
+            // header that may certify false comes from the same committed
+            // snapshot as the composer it certifies, so a writer cannot land
+            // a new subagent between the header read and the row read.
+            let snapshot = conn.read_transaction(|conn| {
+                let local_evidence = Self::composer_subagent_evidence_from_conn(conn, tick);
+                let mut hits: Vec<(String, String)> = Vec::new();
+                let mut still_pending: Vec<String> = Vec::new();
+                for sid in &pending {
+                    tick();
+                    match Self::composer_row_for_sid(conn, sid) {
+                        Ok(Some(value)) => hits.push((sid.clone(), value)),
+                        Ok(None) => still_pending.push(sid.clone()),
+                        Err(error) => {
+                            tracing::warn!(
+                                db = %db_path.display(),
+                                session = %sid,
+                                error = %error,
+                                "cursor: targeted composerData lookup failed; a stale Composer row may be missed"
                             );
-                            root.apply_workspace_rewrite(&mut composer_conv);
-                            found.insert(sid.clone(), Some(composer_conv));
-                        } else {
-                            // Parses to nothing here; a later store may
-                            // still resolve it, exactly like the full
-                            // scan's cross-store dedupe.
                             still_pending.push(sid.clone());
                         }
                     }
-                    Ok(None) => still_pending.push(sid.clone()),
-                    Err(error) => {
-                        tracing::warn!(
-                            db = %db_path.display(),
-                            session = %sid,
-                            error = %error,
-                            "cursor: targeted composerData lookup failed; a stale Composer row may be missed"
-                        );
-                        still_pending.push(sid.clone());
-                    }
+                }
+                Ok::<_, frankensqlite::FrankenError>((local_evidence, hits, still_pending))
+            });
+            let (local_evidence, hits, mut still_pending) = match snapshot {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    failures.push(format!(
+                        "{}: cursor store read transaction failed: {error:#}",
+                        db_path.display()
+                    ));
+                    continue;
+                }
+            };
+            // Round-7 N6: merge this store's current positive/parent evidence
+            // into the earlier cross-store evidence before resolving verdicts —
+            // the cached pass may predate the very rows being emitted.
+            let mut merged;
+            let evidence = if let Some(ev) = external_evidence {
+                merged = ev.clone();
+                Self::extend_subagent_evidence(&mut merged, &local_evidence);
+                &merged
+            } else {
+                &local_evidence
+            };
+            // Own-header records for the false verdict, from the same read
+            // snapshot as the composerData rows above (round-6/7 rulings).
+            let own_headers = &local_evidence.headers;
+            for (sid, value) in hits {
+                let key = format!("composerData:{sid}");
+                let parsed = Self::parse_composer_data(
+                    &key,
+                    &value,
+                    db_path,
+                    None,
+                    &mut HashSet::new(),
+                    Some(&conn),
+                );
+                if let Some(mut composer_conv) = parsed {
+                    let own_header_false = own_headers
+                        .get(&sid)
+                        .is_some_and(|f| f.is_subagent == Some(false) && !f.flag_unknown);
+                    Self::apply_subagent_verdict(
+                        &mut composer_conv,
+                        &sid,
+                        evidence,
+                        own_header_false,
+                    );
+                    root.apply_workspace_rewrite(&mut composer_conv);
+                    found.insert(sid, Some(composer_conv));
+                } else {
+                    // Parses to nothing here; a later store may
+                    // still resolve it, exactly like the full
+                    // scan's cross-store dedupe.
+                    still_pending.push(sid);
                 }
             }
             pending = still_pending;
@@ -6511,28 +6576,50 @@ mod cursor_fragment_merge_tests {
     }
 
     #[test]
-    fn unreadable_composer_value_withholds_false_verdict() {
+    fn unreadable_composer_value_does_not_block_verdicts() {
+        // Round-7 M1 migration: the completeness gate this test pinned is
+        // gone; what remains meaningful is that a malformed sibling row does
+        // not poison its neighbours — an own-header false still emits and a
+        // flagless composer still gets no verdict.
         let good = "77777777-7777-4777-8777-777777777777";
+        let noflag = "77777777-7777-4777-8777-77777777aaab";
         let val = json!({"text": "hello", "createdAt": "2026-11-12T00:00:00Z"});
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("state.vscdb");
         let conn = verdict_test_db(&db);
-        let key = format!("composerData:{good}");
-        let body = val.to_string();
-        conn.execute_compat(
-            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            params![key.as_str(), body.as_str()],
-        )
-        .unwrap();
+        for id in [good, noflag] {
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    val.to_string().as_str()
+                ],
+            )
+            .unwrap();
+        }
         conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:broken", "{not json"],
         )
         .unwrap();
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![good, 0i64],
+        )
+        .unwrap();
         drop(conn);
         let v = cursor_verdicts(&db, None);
+        assert_eq!(
+            v[good]["is_subagent"],
+            json!(false),
+            "a broken sibling row must not withhold an own-header false"
+        );
         assert!(
-            v[good].get("is_subagent").is_none(),
+            v[noflag].get("is_subagent").is_none(),
             "a composer with no own-header flag must not guess false"
         );
     }
@@ -7983,21 +8070,26 @@ mod cursor_fragment_merge_tests {
     #[test]
     fn value_json_non_string_identity_leaves_verdict_absent() {
         let good = "bbbbbbbb-0000-4000-8007-000000000001";
+        let main = "bbbbbbbb-0000-4000-8007-0000000000ff";
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("state.vscdb");
         let conn = verdict_test_db(&db);
-        conn.execute_compat(
-            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            params![
-                format!("composerData:{good}").as_str(),
-                json!({"text": "t", "createdAt": "2026-11-12T00:00:00Z"})
-                    .to_string()
-                    .as_str()
-            ],
+        for id in [good, main] {
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    json!({"text": "t", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER, value TEXT)",
         )
         .unwrap();
-        conn.execute("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, value TEXT)")
-            .unwrap();
         // SQL key is valid, but the value JSON carries a non-string identity.
         let hj = json!({"composerId": 123}).to_string();
         conn.execute_compat(
@@ -8005,13 +8097,20 @@ mod cursor_fragment_merge_tests {
             params![good, hj.as_str()],
         )
         .unwrap();
+        // Round-7 M1 contrast: a clean own-header false in the same store
+        // still emits, so the absence above is pinned to the bad identity.
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![main, 0i64],
+        )
+        .unwrap();
         drop(conn);
+        let v = cursor_verdicts(&db, None);
         assert!(
-            cursor_verdicts(&db, None)[good]
-                .get("is_subagent")
-                .is_none(),
+            v[good].get("is_subagent").is_none(),
             "non-string value-JSON identity leaves the verdict absent"
         );
+        assert_eq!(v[main]["is_subagent"], json!(false));
     }
 
     #[test]
@@ -8529,8 +8628,12 @@ mod cursor_fragment_merge_tests {
 
     #[cfg(unix)]
     #[test]
-    fn inaccessible_workspace_enumeration_withholds_false() {
+    fn unreadable_workspace_dir_does_not_block_own_header_false() {
         use std::os::unix::fs::PermissionsExt;
+        // Round-7 M1 migration: the enumeration-completeness gate this test
+        // pinned is gone; the denied directory still blocks ws1's discovery
+        // (root = base, so the workspace store IS on the scan path), but an
+        // own-header false in the global store no longer needs it.
         let c = "dddddddd-0000-4000-8000-000000000001";
         let p = "dddddddd-0000-4000-8000-000000000002";
         let dir = TempDir::new().unwrap();
@@ -8551,6 +8654,13 @@ mod cursor_fragment_merge_tests {
             ],
         )
         .unwrap();
+        g.execute("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)")
+            .unwrap();
+        g.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![c, 0i64],
+        )
+        .unwrap();
         drop(g);
         let w = verdict_test_db(&ws_db);
         w.execute_compat(
@@ -8564,11 +8674,13 @@ mod cursor_fragment_merge_tests {
         )
         .unwrap();
         drop(w);
-        // Deny enumeration of the workspace directory.
+        // Deny enumeration of the workspace directory — it stays on the scan
+        // path (the root covers the whole installation), so the ws store is
+        // discovered-then-skipped every run.
         fs::set_permissions(&ws_dir, fs::Permissions::from_mode(0o000)).unwrap();
         let ctx = ScanContext::with_roots(
             base.to_path_buf(),
-            vec![ScanRoot::local(global_db.parent().unwrap().to_path_buf())],
+            vec![ScanRoot::local(base.to_path_buf())],
             None,
         );
         let convs = CursorConnector::new().scan(&ctx).unwrap();
@@ -8577,14 +8689,17 @@ mod cursor_fragment_merge_tests {
             .iter()
             .find(|x| x.external_id.as_deref() == Some(c))
             .unwrap();
-        assert!(
-            cc.metadata.get("is_subagent").is_none(),
-            "denied workspace enumeration must not certify main"
+        assert_eq!(
+            cc.metadata["is_subagent"],
+            json!(false),
+            "an unreadable sibling workspace dir cannot withhold an own-header false"
         );
     }
 
     #[test]
-    fn missing_global_store_withholds_false() {
+    fn missing_global_store_does_not_block_own_header_false() {
+        // Round-7 M1 migration: a missing global store used to gate false via
+        // completeness; now only the composer's own header matters.
         let c = "dddddddd-0000-4000-8001-000000000001";
         let dir = TempDir::new().unwrap();
         let base = dir.path();
@@ -8604,6 +8719,13 @@ mod cursor_fragment_merge_tests {
             ],
         )
         .unwrap();
+        w.execute("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)")
+            .unwrap();
+        w.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![c, 0i64],
+        )
+        .unwrap();
         drop(w);
         // No globalStorage/state.vscdb exists at all.
         let ctx = ScanContext::with_roots(
@@ -8616,16 +8738,19 @@ mod cursor_fragment_merge_tests {
             .iter()
             .find(|x| x.external_id.as_deref() == Some(c))
             .unwrap();
-        assert!(
-            cc.metadata.get("is_subagent").is_none(),
-            "a missing global store must not certify main"
+        assert_eq!(
+            cc.metadata["is_subagent"],
+            json!(false),
+            "a missing global store cannot withhold an own-header false"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn inaccessible_global_store_withholds_false() {
+    fn unreadable_global_store_does_not_block_own_header_false() {
         use std::os::unix::fs::PermissionsExt;
+        // Round-7 M1 migration: an unreadable global store used to gate false
+        // via completeness; now only the composer's own header matters.
         let c = "dddddddd-0000-4000-8002-000000000001";
         let dir = TempDir::new().unwrap();
         let base = dir.path();
@@ -8649,6 +8774,13 @@ mod cursor_fragment_merge_tests {
             ],
         )
         .unwrap();
+        w.execute("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)")
+            .unwrap();
+        w.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![c, 0i64],
+        )
+        .unwrap();
         drop(w);
         // Global exists but its directory is unreadable (metadata probe fails).
         fs::set_permissions(&global_dir, fs::Permissions::from_mode(0o000)).unwrap();
@@ -8663,16 +8795,23 @@ mod cursor_fragment_merge_tests {
             .iter()
             .find(|x| x.external_id.as_deref() == Some(c))
             .unwrap();
-        assert!(
-            cc.metadata.get("is_subagent").is_none(),
-            "an unreadable global store must not certify main"
+        assert_eq!(
+            cc.metadata["is_subagent"],
+            json!(false),
+            "an unreadable global store cannot withhold an own-header false"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn local_alias_to_workspace_db_with_unread_installation_withholds_false() {
+    fn standalone_alias_store_emits_own_header_false() {
         use std::os::unix::fs::symlink;
+        // Round-7 M1 migration: the old test pinned installation-completeness —
+        // a workspace DB alias whose installation's global was unread withheld
+        // false. Inventory no longer enters the verdict: the alias is scanned
+        // as a standalone store and its own-header false emits as-is. (The
+        // unread parent's P->C listing in the sibling global store is the
+        // documented B1 limit, not something the verdict consults.)
         let child = "dddddddd-0000-4000-8003-000000000001";
         let parent = "dddddddd-0000-4000-8003-000000000002";
         let dir = TempDir::new().unwrap();
@@ -8709,6 +8848,17 @@ mod cursor_fragment_merge_tests {
                 ],
             )
             .unwrap();
+        wconn
+            .execute(
+                "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
+            )
+            .unwrap();
+        wconn
+            .execute_compat(
+                "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+                params![child, 0i64],
+            )
+            .unwrap();
         drop(wconn);
         // A standalone-named alias pointing at one workspace DB of installation U.
         let alias_dir = base.join("alias");
@@ -8725,9 +8875,11 @@ mod cursor_fragment_merge_tests {
             .iter()
             .find(|x| x.external_id.as_deref() == Some(child))
             .unwrap();
-        assert!(
-            conv.metadata.get("is_subagent").is_none(),
-            "an alias must not certify main when its installation's global is unread"
+        assert_eq!(
+            conv.metadata["is_subagent"],
+            json!(false),
+            "a standalone symlinked store emits its own-header false without \
+             resolving the rest of its installation"
         );
     }
 
@@ -8788,6 +8940,494 @@ mod cursor_fragment_merge_tests {
                 json!(false),
                 "{id}: an unrelated uninterpretable remote store cannot suppress \
                  the local store's own-header false"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Round 7: emitted-row evidence merge (N6) / one read snapshot (N7)
+    // ------------------------------------------------------------------
+
+    /// Tick-driven writer injection for the round-7 interleaving tests. Every
+    /// tick at or after `trigger_at`, `write` is attempted until one attempt
+    /// commits; the counters report the number of write attempts and the tick
+    /// at which a commit landed (0 = blocked or never reached). The injected
+    /// commit always targets the store the connector is currently reading, so
+    /// a pre-snapshot commit is visible to every later statement while an
+    /// in-snapshot attempt is not.
+    struct TickInjection {
+        tick: Box<dyn Fn()>,
+        attempts: std::rc::Rc<std::cell::Cell<u64>>,
+        committed: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    fn inject_on_tick(trigger_at: u64, write: impl Fn() -> bool + 'static) -> TickInjection {
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+        let committed = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+        let (count, a2, d2) = (
+            std::cell::Cell::new(0_u64),
+            attempts.clone(),
+            committed.clone(),
+        );
+        let tick = move || {
+            count.set(count.get() + 1);
+            if count.get() >= trigger_at && d2.get() == 0 {
+                a2.set(a2.get() + 1);
+                if write() {
+                    d2.set(count.get());
+                }
+            }
+        };
+        TickInjection {
+            tick: Box::new(tick),
+            attempts,
+            committed,
+        }
+    }
+
+    /// N6 regression (extraction path): the cross-store evidence pass ran
+    /// before the writer committed P, C and the header rows — a stale cached
+    /// map must not let the fresh own-header false win. The emitting store's
+    /// own rows and headers are merged in first, so `child` is proven by P's
+    /// `subagentComposerIds` and `header_only` by the own header's
+    /// `parentComposerId` (a false-plus-parent header is a subagent with that
+    /// parent, never a main).
+    #[test]
+    fn emitted_rows_merge_with_stale_cached_evidence_extraction() {
+        let parent = "eeeeeeee-0000-4000-8003-00000000000a";
+        let child = "eeeeeeee-0000-4000-8003-00000000000b";
+        let header_only = "eeeeeeee-0000-4000-8003-00000000000c";
+        let header_parent = "eeeeeeee-0000-4000-8003-00000000000d";
+        let other = "eeeeeeee-0000-4000-8003-00000000000e";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{other}").as_str(),
+                json!({"text": "other", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let dbs = vec![(ScanRoot::local(dir.path().to_path_buf()), db.clone())];
+        // The cached pass predates the commit — exactly what a scan's earlier
+        // evidence pass returns for a store whose rows arrived afterwards.
+        let cached = CursorConnector::collect_cross_db_evidence(&dbs, &|| {});
+        assert!(
+            !cached.child_to_parent.contains_key(child),
+            "fixture: the cached pass must predate the commit"
+        );
+        // One atomic writer commit: text-bearing P and C, P's
+        // subagentComposerIds listing, a second composer whose only proof is
+        // its own header's parentComposerId, and both own headers as
+        // isSubagent=0 + parentComposerId.
+        let w = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        w.execute("BEGIN").unwrap();
+        for (id, val) in [
+            (
+                parent,
+                json!({"text": "p", "subagentComposerIds": [child], "createdAt": "2026-11-12T00:00:00Z"}),
+            ),
+            (
+                child,
+                json!({"text": "c", "createdAt": "2026-11-12T00:00:00Z"}),
+            ),
+            (
+                header_only,
+                json!({"text": "h", "createdAt": "2026-11-12T00:00:00Z"}),
+            ),
+        ] {
+            w.execute_compat(
+                "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    val.to_string().as_str()
+                ],
+            )
+            .unwrap();
+        }
+        w.execute(
+            "CREATE TABLE IF NOT EXISTS composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER, parentComposerId TEXT)",
+        )
+        .unwrap();
+        for (id, par) in [(child, parent), (header_only, header_parent)] {
+            w.execute_compat(
+                "INSERT OR REPLACE INTO composerHeaders (composerId, isSubagent, parentComposerId) VALUES (?, ?, ?)",
+                params![id, 0i64, par],
+            )
+            .unwrap();
+        }
+        w.execute("COMMIT").unwrap();
+        drop(w);
+        let convs =
+            CursorConnector::extract_from_db_with_evidence(&db, None, &|| {}, Some(&cached))
+                .unwrap();
+        let c = convs
+            .iter()
+            .find(|cv| cv.external_id.as_deref() == Some(child))
+            .unwrap();
+        assert_eq!(
+            c.metadata["is_subagent"],
+            json!(true),
+            "the committed P->C listing the cached pass missed must prove the subagent"
+        );
+        assert_eq!(c.metadata["parent_id"], json!(parent));
+        let h = convs
+            .iter()
+            .find(|cv| cv.external_id.as_deref() == Some(header_only))
+            .unwrap();
+        assert_eq!(
+            h.metadata["is_subagent"],
+            json!(true),
+            "an own header that says false but carries a parent id is a subagent"
+        );
+        assert_eq!(h.metadata["parent_id"], json!(header_parent));
+    }
+
+    /// N6 regression (targeted lookup): same stale-cached-evidence witness on
+    /// the lookup path — the sid row, local evidence and own headers are read
+    /// now, so the committed parent wins over the stale map.
+    #[test]
+    fn emitted_rows_merge_with_stale_cached_evidence_lookup() {
+        let parent = "eeeeeeee-0000-4000-8004-00000000000a";
+        let child = "eeeeeeee-0000-4000-8004-00000000000b";
+        let other = "eeeeeeee-0000-4000-8004-00000000000e";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{other}").as_str(),
+                json!({"text": "other", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let dbs = vec![(ScanRoot::local(dir.path().to_path_buf()), db.clone())];
+        let cached = CursorConnector::collect_cross_db_evidence(&dbs, &|| {});
+        let w = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        w.execute("BEGIN").unwrap();
+        for (id, val) in [
+            (
+                parent,
+                json!({"text": "p", "subagentComposerIds": [child], "createdAt": "2026-11-12T00:00:00Z"}),
+            ),
+            (
+                child,
+                json!({"text": "c", "createdAt": "2026-11-12T00:00:00Z"}),
+            ),
+        ] {
+            w.execute_compat(
+                "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    val.to_string().as_str()
+                ],
+            )
+            .unwrap();
+        }
+        w.execute(
+            "CREATE TABLE IF NOT EXISTS composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER, parentComposerId TEXT)",
+        )
+        .unwrap();
+        w.execute_compat(
+            "INSERT OR REPLACE INTO composerHeaders (composerId, isSubagent, parentComposerId) VALUES (?, ?, ?)",
+            params![child, 0i64, parent],
+        )
+        .unwrap();
+        w.execute("COMMIT").unwrap();
+        drop(w);
+        let (found, failures) = CursorConnector::lookup_composer_conversations_with_evidence(
+            &dbs,
+            &[child.to_string()],
+            &|| {},
+            Some(&cached),
+        );
+        assert!(failures.is_empty());
+        let resolved = found[child].as_ref().unwrap();
+        assert_eq!(
+            resolved.metadata["is_subagent"],
+            json!(true),
+            "the committed P->C listing the cached pass missed must prove the subagent"
+        );
+        assert_eq!(resolved.metadata["parent_id"], json!(parent));
+    }
+
+    /// N7 regression (targeted lookup): the own-header read and the per-sid
+    /// composerData row read share one snapshot. A writer that commits
+    /// text-bearing P and C, P's listing, and C's header flip BETWEEN the
+    /// header read and the row read must not let the stale false header reach
+    /// the new composer — no committed snapshot ever held C as a main.
+    #[test]
+    fn lookup_binds_own_header_and_sid_row_to_one_snapshot() {
+        let c = "eeeeeeee-0000-4000-8005-00000000000b";
+        let p = "eeeeeeee-0000-4000-8005-00000000000a";
+        let other = "eeeeeeee-0000-4000-8005-00000000000e";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{other}").as_str(),
+                json!({"text": "other", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![c, 0i64],
+        )
+        .unwrap();
+        drop(conn);
+        let db_str = db.to_string_lossy().to_string();
+        // Fires on the tick of the own-header read (old code) / inside the
+        // read transaction (new code): one atomic commit — text-bearing P and
+        // C, P lists C, and C's header flips to true.
+        let inj = inject_on_tick(4, move || {
+            let Ok(w) = Connection::open(&db_str) else {
+                return false;
+            };
+            let ok = w.execute("BEGIN").is_ok()
+                && w
+                    .execute_compat(
+                        "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                        params![
+                            format!("composerData:{p}").as_str(),
+                            json!({"text": "p", "subagentComposerIds": [c], "createdAt": "2026-11-12T00:00:00Z"})
+                                .to_string()
+                                .as_str()
+                        ],
+                    )
+                    .is_ok()
+                && w
+                    .execute_compat(
+                        "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                        params![
+                            format!("composerData:{c}").as_str(),
+                            json!({"text": "c", "createdAt": "2026-11-12T00:00:00Z"})
+                                .to_string()
+                                .as_str()
+                        ],
+                    )
+                    .is_ok()
+                && w
+                    .execute_compat(
+                        "UPDATE composerHeaders SET isSubagent = ? WHERE composerId = ?",
+                        params![1i64, c],
+                    )
+                    .is_ok()
+                && w.execute("COMMIT").is_ok();
+            if !ok {
+                let _ = w.execute("ROLLBACK");
+            }
+            ok
+        });
+        let (found, failures) = CursorConnector::lookup_composer_conversations(
+            &[(ScanRoot::local(dir.path().to_path_buf()), db)],
+            &[c.to_string()],
+            inj.tick.as_ref(),
+        );
+        assert!(failures.is_empty());
+        assert!(
+            inj.attempts.get() > 0,
+            "the interleaved write must have been attempted during the read"
+        );
+        let verdict = found
+            .get(c)
+            .and_then(|entry| entry.as_ref())
+            .and_then(|cv| cv.metadata.get("is_subagent"));
+        assert_ne!(
+            verdict,
+            Some(&json!(false)),
+            "a stale false header must not reach a composer row committed after \
+             the header read (writer committed_at_tick={})",
+            inj.committed.get()
+        );
+    }
+
+    /// N7 regression (extraction): the composerData rows and the own-header
+    /// read share one snapshot. A writer landing a C=false header and a P->C
+    /// listing between the two reads must not let C emit false — no committed
+    /// snapshot held C as a main composer.
+    #[test]
+    fn extraction_binds_own_header_and_composer_rows_to_one_snapshot() {
+        let c = "eeeeeeee-0000-4000-8006-00000000000b";
+        let p = "eeeeeeee-0000-4000-8006-00000000000a";
+        let other = "eeeeeeee-0000-4000-8006-00000000000e";
+        let unrelated = "eeeeeeee-0000-4000-8006-00000000ffff";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        for id in [c, other] {
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    json!({"text": "t", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
+        )
+        .unwrap();
+        // An unrelated header row: it gives the evidence build a tick inside
+        // the header read without touching C's verdict.
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![unrelated, 0i64],
+        )
+        .unwrap();
+        drop(conn);
+        let db_str = db.to_string_lossy().to_string();
+        // Fires inside the header read: one atomic commit — a new parent P
+        // listing C plus a C=false header (in the old code the second header
+        // read sees it and emits false for a composer that was never a main
+        // in any committed snapshot).
+        let inj = inject_on_tick(3, move || {
+            let Ok(w) = Connection::open(&db_str) else {
+                return false;
+            };
+            let ok = w.execute("BEGIN").is_ok()
+                && w
+                    .execute_compat(
+                        "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                        params![
+                            format!("composerData:{p}").as_str(),
+                            json!({"text": "p", "subagentComposerIds": [c], "createdAt": "2026-11-12T00:00:00Z"})
+                                .to_string()
+                                .as_str()
+                        ],
+                    )
+                    .is_ok()
+                && w
+                    .execute_compat(
+                        "INSERT OR REPLACE INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+                        params![c, 0i64],
+                    )
+                    .is_ok()
+                && w.execute("COMMIT").is_ok();
+            if !ok {
+                let _ = w.execute("ROLLBACK");
+            }
+            ok
+        });
+        let convs = CursorConnector::extract_from_db(&db, None, inj.tick.as_ref()).unwrap();
+        assert!(
+            inj.attempts.get() > 0,
+            "the interleaved write must have been attempted during the read"
+        );
+        let cv = convs
+            .iter()
+            .find(|cv| cv.external_id.as_deref() == Some(c))
+            .expect("C's composerData row was committed before the scan");
+        assert_ne!(
+            cv.metadata.get("is_subagent"),
+            Some(&json!(false)),
+            "a header committed after the composerData read must not certify \
+             false for a row from an earlier snapshot (writer \
+             committed_at_tick={})",
+            inj.committed.get()
+        );
+    }
+
+    /// M2 (round-7): an uninterpretable `isSubagent` component vetoes an
+    /// otherwise cleanly decoded own-header false. Every absent case pairs a
+    /// proven SQL false with a null/unknown sibling component for the same
+    /// composer; clean-false controls in the same store still emit, so the
+    /// veto is pinned to the unknown component, not to the fixtures.
+    #[test]
+    fn uninterpretable_component_vetoes_own_header_false() {
+        let v_null = "eeeeeeee-0000-4000-8007-000000000001";
+        let v_bogus = "eeeeeeee-0000-4000-8007-000000000002";
+        let v_item = "eeeeeeee-0000-4000-8007-000000000003";
+        let ok_sql = "eeeeeeee-0000-4000-8007-000000000004";
+        let ok_item = "eeeeeeee-0000-4000-8007-000000000005";
+        let noflag = "eeeeeeee-0000-4000-8007-000000000006";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        for id in [v_null, v_bogus, v_item, ok_sql, ok_item, noflag] {
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    json!({"text": "t", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent, value TEXT)",
+        )
+        .unwrap();
+        // A proven SQL false paired with an uninterpretable value-JSON flag.
+        for (id, enc) in [(v_null, json!(null)), (v_bogus, json!("bogus"))] {
+            let hj = json!({"composerId": id, "isSubagent": enc}).to_string();
+            conn.execute_compat(
+                "INSERT INTO composerHeaders (composerId, isSubagent, value) VALUES (?, ?, ?)",
+                params![id, 0i64, hj.as_str()],
+            )
+            .unwrap();
+        }
+        // Proven SQL false with no value-JSON flag: the ItemTable carries the
+        // vetoing null for `v_item` and a confirming false for `ok_item`.
+        for id in [v_item, ok_item] {
+            conn.execute_compat(
+                "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+                params![id, 0i64],
+            )
+            .unwrap();
+        }
+        // Clean-false control through the value JSON.
+        let ok_sql_hj = json!({"composerId": ok_sql, "isSubagent": false}).to_string();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent, value) VALUES (?, ?, ?)",
+            params![ok_sql, 0i64, ok_sql_hj.as_str()],
+        )
+        .unwrap();
+        let items = json!([
+            {"composerId": v_item, "isSubagent": null},
+            {"composerId": ok_item, "isSubagent": false}
+        ])
+        .to_string();
+        conn.execute_compat(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            params!["composer.composerHeaders", items.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        for id in [v_null, v_bogus, v_item, noflag] {
+            assert!(
+                v[id].get("is_subagent").is_none(),
+                "{id}: an unknown isSubagent component must veto the SQL false"
+            );
+        }
+        for id in [ok_sql, ok_item] {
+            assert_eq!(
+                v[id]["is_subagent"],
+                json!(false),
+                "{id}: a clean own-header false still emits"
             );
         }
     }

@@ -84,6 +84,29 @@ impl Default for CursorConnector {
     }
 }
 
+/// Per-composer subagent flag/parent from a header row or the composer's own
+/// JSON (`isSubagent` / `parentComposerId`).
+#[derive(Clone, Debug, Default)]
+struct ComposerSubagentFlag {
+    is_subagent: Option<bool>,
+    parent_id: Option<String>,
+}
+
+/// Subagent evidence gathered for one Cursor store before composers parse.
+struct ComposerSubagentEvidence {
+    /// child composerId -> parent composerId, from `subagentComposerIds`.
+    child_to_parent: HashMap<String, String>,
+    /// composerId -> its own JSON `isSubagent`/`parentComposerId`.
+    own: HashMap<String, ComposerSubagentFlag>,
+    /// composerId -> `composerHeaders` flag/parent.
+    headers: HashMap<String, ComposerSubagentFlag>,
+    /// Every composerData row was read and parsed, so an unlisted composer is
+    /// provably not a child of any composer in this store.
+    composer_map_complete: bool,
+    /// The composerHeaders table was fully read (or is absent).
+    headers_complete: bool,
+}
+
 impl CursorConnector {
     pub fn new() -> Self {
         Self
@@ -506,6 +529,210 @@ impl CursorConnector {
         None
     }
 
+    /// Build the child->parent map from the composerData rows already read,
+    /// plus the composerHeaders flags. `rows` is the full key-range result, so
+    /// the map spans the whole store even on an incremental scan: `since_ts`
+    /// filters which conversations are emitted, not which rows are read here.
+    fn composer_subagent_evidence(
+        rows: &[(String, Option<String>)],
+        conn: &Connection,
+    ) -> ComposerSubagentEvidence {
+        let mut child_to_parent = HashMap::new();
+        let mut own = HashMap::new();
+        let mut complete = true;
+        for (key, value) in rows {
+            let Some(id) = key.strip_prefix("composerData:") else {
+                continue;
+            };
+            let Some(value) = value else {
+                continue; // a NULL marker carries no children
+            };
+            match serde_json::from_str::<Value>(value) {
+                Ok(val) => {
+                    if let Some(children) = val.get("subagentComposerIds") {
+                        if let Some(arr) = children.as_array() {
+                            for child in arr {
+                                if let Some(cid) = child.as_str() {
+                                    child_to_parent.insert(cid.to_string(), id.to_string());
+                                }
+                            }
+                        } else {
+                            // A malformed child list could hide a parent link.
+                            complete = false;
+                        }
+                    }
+                    let parent_id = val
+                        .get("parentComposerId")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let is_subagent = val.get("isSubagent").and_then(Value::as_bool);
+                    if parent_id.is_some() || is_subagent.is_some() {
+                        own.insert(
+                            id.to_string(),
+                            ComposerSubagentFlag {
+                                is_subagent,
+                                parent_id,
+                            },
+                        );
+                    }
+                }
+                Err(_) => complete = false,
+            }
+        }
+        let (headers, headers_complete) = Self::read_composer_headers(conn);
+        ComposerSubagentEvidence {
+            child_to_parent,
+            own,
+            headers,
+            composer_map_complete: complete,
+            headers_complete,
+        }
+    }
+
+    /// The same evidence, reading the composerData key range itself: the
+    /// targeted lookup path opens a store without a prior full read.
+    fn composer_subagent_evidence_from_conn(conn: &Connection) -> ComposerSubagentEvidence {
+        let prefix = "composerData:";
+        let limit = Self::prefix_upper_bound(prefix);
+        match conn.query_map_collect(
+            CURSOR_DISK_KV_RANGE_SQL,
+            params![prefix, limit.as_str()],
+            |row| {
+                let key: String = row.get_typed(0)?;
+                let value: Option<String> = row.get_typed(1)?;
+                Ok((key, value))
+            },
+        ) {
+            Ok(rows) => Self::composer_subagent_evidence(&rows, conn),
+            Err(_) => ComposerSubagentEvidence {
+                child_to_parent: HashMap::new(),
+                own: HashMap::new(),
+                headers: HashMap::new(),
+                composer_map_complete: false,
+                headers_complete: false,
+            },
+        }
+    }
+
+    /// Read `composerHeaders.isSubagent` (and `parentComposerId` when the
+    /// column exists), probing the table and columns so older schemas stay
+    /// readable. An absent table is vacuously complete; a failed read is not.
+    fn read_composer_headers(conn: &Connection) -> (HashMap<String, ComposerSubagentFlag>, bool) {
+        let exists = conn
+            .query_map_collect(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='composerHeaders'",
+                params![],
+                |row| row.get_typed::<String>(0),
+            )
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false);
+        if !exists {
+            return (HashMap::new(), true);
+        }
+        let cols = conn
+            .query_map_collect("PRAGMA table_info(composerHeaders)", params![], |row| {
+                row.get_typed::<String>(1)
+            })
+            .unwrap_or_default();
+        let has_sub = cols.iter().any(|c| c == "isSubagent");
+        let has_parent = cols.iter().any(|c| c == "parentComposerId");
+        let (sql, sub_idx, parent_idx) = match (has_sub, has_parent) {
+            (true, true) => (
+                "SELECT composerId, isSubagent, parentComposerId FROM composerHeaders",
+                Some(1),
+                Some(2),
+            ),
+            (true, false) => (
+                "SELECT composerId, isSubagent FROM composerHeaders",
+                Some(1),
+                None,
+            ),
+            (false, true) => (
+                "SELECT composerId, parentComposerId FROM composerHeaders",
+                None,
+                Some(1),
+            ),
+            (false, false) => return (HashMap::new(), true),
+        };
+        let rows = conn.query_map_collect(sql, params![], |row| {
+            let id: Option<String> = row.get_typed(0)?;
+            let is_subagent = match sub_idx {
+                Some(i) => row.get_typed::<Option<i64>>(i)?.map(|v| v != 0),
+                None => None,
+            };
+            let parent_id = match parent_idx {
+                Some(i) => row
+                    .get_typed::<Option<String>>(i)?
+                    .filter(|s| !s.is_empty()),
+                None => None,
+            };
+            Ok((
+                id.unwrap_or_default(),
+                ComposerSubagentFlag {
+                    is_subagent,
+                    parent_id,
+                },
+            ))
+        });
+        match rows {
+            Ok(rows) => (
+                rows.into_iter().filter(|(id, _)| !id.is_empty()).collect(),
+                true,
+            ),
+            Err(_) => (HashMap::new(), false),
+        }
+    }
+
+    /// Resolve one composer's verdict from the store evidence. `None` means
+    /// the source proves no verdict; false is returned only when the store
+    /// evidence is complete, never guessed from a partial read.
+    fn subagent_verdict(
+        composer_id: &str,
+        ev: &ComposerSubagentEvidence,
+    ) -> Option<(bool, Option<String>)> {
+        if let Some(parent) = ev.child_to_parent.get(composer_id) {
+            return Some((true, Some(parent.clone())));
+        }
+        if let Some(own) = ev.own.get(composer_id) {
+            if let Some(parent) = &own.parent_id {
+                return Some((true, Some(parent.clone())));
+            }
+            if own.is_subagent == Some(true) {
+                return Some((true, None));
+            }
+        }
+        if let Some(header) = ev.headers.get(composer_id)
+            && header.is_subagent == Some(true)
+        {
+            return Some((true, header.parent_id.clone()));
+        }
+        if ev.composer_map_complete && ev.headers_complete {
+            return Some((false, None));
+        }
+        None
+    }
+
+    /// Lift the verdict into a parsed composer conversation's metadata.
+    fn apply_subagent_verdict(
+        conv: &mut NormalizedConversation,
+        composer_id: &str,
+        ev: &ComposerSubagentEvidence,
+    ) {
+        let Some((is_subagent, parent)) = Self::subagent_verdict(composer_id, ev) else {
+            return;
+        };
+        if !conv.metadata.is_object() {
+            conv.metadata = Value::Object(Map::new());
+        }
+        if let Some(obj) = conv.metadata.as_object_mut() {
+            obj.insert("is_subagent".to_string(), Value::Bool(is_subagent));
+            if let Some(parent) = parent {
+                obj.insert("parent_id".to_string(), Value::String(parent));
+            }
+        }
+    }
+
     /// Extract chat sessions from a SQLite database.
     ///
     /// `tick` is called for every row the queries read and before every
@@ -547,13 +774,14 @@ impl CursorConnector {
             },
         ) {
             Ok(rows) => {
+                let evidence = Self::composer_subagent_evidence(&rows, &conn);
                 for (key, value) in rows {
                     let Some(value) = value else {
                         continue;
                     };
                     // Each composer runs its own bubble range query.
                     tick();
-                    if let Some(conv) = Self::parse_composer_data(
+                    if let Some(mut conv) = Self::parse_composer_data(
                         &key,
                         &value,
                         db_path,
@@ -561,6 +789,9 @@ impl CursorConnector {
                         &mut seen_ids,
                         Some(&conn),
                     ) {
+                        if let Some(id) = conv.external_id.clone() {
+                            Self::apply_subagent_verdict(&mut conv, &id, &evidence);
+                        }
                         convs.push(conv);
                     }
                 }
@@ -2132,6 +2363,7 @@ impl CursorConnector {
                 ));
                 continue;
             }
+            let evidence = Self::composer_subagent_evidence_from_conn(&conn);
             let mut still_pending: Vec<String> = Vec::new();
             for sid in &pending {
                 tick();
@@ -2147,6 +2379,7 @@ impl CursorConnector {
                             Some(&conn),
                         );
                         if let Some(mut composer_conv) = parsed {
+                            Self::apply_subagent_verdict(&mut composer_conv, sid, &evidence);
                             root.apply_workspace_rewrite(&mut composer_conv);
                             found.insert(sid.clone(), Some(composer_conv));
                         } else {
@@ -5636,5 +5869,162 @@ mod cursor_fragment_merge_tests {
             .scan(&ctx_since(tmp.path(), i64::MAX))
             .unwrap();
         assert!(convs.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Subagent verdict metadata (metadata.is_subagent / metadata.parent_id)
+    // -----------------------------------------------------------------
+
+    /// Build a synthetic state.vscdb with composerData rows and an optional
+    /// minimal composerHeaders(composerId, isSubagent) table.
+    /// Local synthetic store builder (this test module has no create_test_db).
+    fn verdict_test_db(path: &Path) -> Connection {
+        let conn = Connection::open(path.to_string_lossy().as_ref()).unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn
+    }
+
+    fn cursor_store(
+        composers: &[(&str, &Value)],
+        headers: Option<&[(&str, i64)]>,
+    ) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db_path);
+        for (id, val) in composers {
+            let key = format!("composerData:{id}");
+            let body = val.to_string();
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![key.as_str(), body.as_str()],
+            )
+            .unwrap();
+        }
+        if let Some(rows) = headers {
+            conn.execute(
+                "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
+            )
+            .unwrap();
+            for (id, flag) in rows {
+                conn.execute_compat(
+                    "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+                    params![*id, *flag],
+                )
+                .unwrap();
+            }
+        }
+        drop(conn);
+        (dir, db_path)
+    }
+
+    fn cursor_verdicts(db_path: &Path, since: Option<i64>) -> HashMap<String, Value> {
+        let convs = CursorConnector::extract_from_db(db_path, since, &|| {}).unwrap();
+        convs
+            .into_iter()
+            .filter_map(|c| c.external_id.map(|id| (id, c.metadata)))
+            .collect()
+    }
+
+    #[test]
+    fn composer_listed_as_subagent_gets_verdict_and_parent() {
+        let parent = "11111111-1111-4111-8111-111111111111";
+        let child = "22222222-2222-4222-8222-222222222222";
+        let parent_val = json!({
+            "text": "parent prompt",
+            "subagentComposerIds": [child],
+            "createdAt": "2026-11-12T00:00:00Z",
+            "lastUpdatedAt": "2026-11-12T00:00:00Z"
+        });
+        let child_val = json!({
+            "text": "child prompt",
+            "createdAt": "2026-11-12T00:00:00Z",
+            "lastUpdatedAt": "2026-11-12T00:00:00Z"
+        });
+        let (_dir, db) = cursor_store(&[(parent, &parent_val), (child, &child_val)], None);
+        let v = cursor_verdicts(&db, None);
+        assert_eq!(v[child]["is_subagent"], json!(true));
+        assert_eq!(v[child]["parent_id"], json!(parent));
+        assert_eq!(v[parent]["is_subagent"], json!(false));
+        assert!(v[parent].get("parent_id").is_none());
+    }
+
+    #[test]
+    fn composer_with_complete_evidence_and_no_parent_is_main() {
+        let id = "33333333-3333-4333-8333-333333333333";
+        let val = json!({"text": "hello", "createdAt": "2026-11-12T00:00:00Z"});
+        let (_dir, db) = cursor_store(&[(id, &val)], None);
+        let v = cursor_verdicts(&db, None);
+        assert_eq!(v[id]["is_subagent"], json!(false));
+        assert!(v[id].get("parent_id").is_none());
+    }
+
+    #[test]
+    fn composer_headers_is_subagent_flag_proves_subagent() {
+        let id = "44444444-4444-4444-8444-444444444444";
+        let val = json!({"text": "hello", "createdAt": "2026-11-12T00:00:00Z"});
+        let (_dir, db) = cursor_store(&[(id, &val)], Some(&[(id, 1)]));
+        let v = cursor_verdicts(&db, None);
+        assert_eq!(v[id]["is_subagent"], json!(true));
+        assert!(v[id].get("parent_id").is_none());
+    }
+
+    #[test]
+    fn incremental_scan_keeps_subagent_verdict_stable() {
+        let parent = "55555555-5555-4555-8555-555555555555";
+        let child = "66666666-6666-4666-8666-666666666666";
+        let parent_val = json!({
+            "text": "p",
+            "subagentComposerIds": [child],
+            "createdAt": "2026-11-12T00:00:00Z",
+            "lastUpdatedAt": "2026-11-12T00:00:00Z"
+        });
+        let child_val = json!({
+            "text": "c",
+            "createdAt": "2026-11-12T01:00:00Z",
+            "lastUpdatedAt": "2026-11-12T01:00:00Z"
+        });
+        let (_dir, db) = cursor_store(&[(parent, &parent_val), (child, &child_val)], None);
+        let full = cursor_verdicts(&db, None);
+        // A cutoff between the stale parent and the fresh child: only the
+        // child is emitted, but the child->parent map still spans the whole
+        // store, so the verdict must equal the full scan's.
+        let since = parse_timestamp(&json!("2026-11-12T00:30:00Z")).unwrap();
+        let incr = cursor_verdicts(&db, Some(since));
+        assert!(incr.contains_key(child));
+        assert!(!incr.contains_key(parent), "stale parent is not emitted");
+        assert_eq!(incr[child]["is_subagent"], json!(true));
+        assert_eq!(incr[child]["parent_id"], json!(parent));
+        assert_eq!(incr[child]["is_subagent"], full[child]["is_subagent"]);
+        assert_eq!(incr[child]["parent_id"], full[child]["parent_id"]);
+    }
+
+    #[test]
+    fn unreadable_composer_value_withholds_false_verdict() {
+        let good = "77777777-7777-4777-8777-777777777777";
+        let val = json!({"text": "hello", "createdAt": "2026-11-12T00:00:00Z"});
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        let key = format!("composerData:{good}");
+        let body = val.to_string();
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![key.as_str(), body.as_str()],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params!["composerData:broken", "{not json"],
+        )
+        .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        assert!(
+            v[good].get("is_subagent").is_none(),
+            "incomplete store evidence must not guess false"
+        );
     }
 }

@@ -94,6 +94,20 @@ struct ComposerSubagentFlag {
     last_updated_at: Option<i64>,
 }
 
+/// Distinguish an absent field from an explicit JSON null for isSubagent:
+/// absent -> None (serde default), present null -> Some(None), present value
+/// -> Some(Some(v)). A plain Option<Value> conflates null with absence, which
+/// would let an explicit null bypass incomplete-store handling (round-4 O2).
+#[allow(clippy::option_option)] // three states are required: absent / null / value
+fn deserialize_present_option<'de, D>(deserializer: D) -> Result<Option<Option<Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(<Option<Value> as serde::Deserialize>::deserialize(
+        deserializer,
+    )?))
+}
+
 /// Lightweight partial deserialization of `composerData:*` JSON for subagent
 /// evidence, avoiding full DOM tree allocation for `tabs` / `bubbles`.
 #[derive(serde::Deserialize, Default)]
@@ -105,8 +119,9 @@ struct ComposerEvidenceJson {
     parent_composer_id: Option<Value>,
     #[serde(default)]
     parent_id: Option<Value>,
-    #[serde(default)]
-    is_subagent: Option<Value>,
+    #[allow(clippy::option_option)] // absent vs explicit null vs value (round-4 O2)
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    is_subagent: Option<Option<Value>>,
 }
 
 /// Subagent evidence gathered for one or more Cursor stores before composers parse.
@@ -609,10 +624,15 @@ impl CursorConnector {
     }
 
     /// `isSubagent` from a header JSON object with explicit decoding. A present
-    /// non-null value FAD cannot interpret marks the store incomplete.
+    /// value FAD cannot interpret — including an explicit `null` — marks the
+    /// store incomplete (round-4 O2: a present null is not an absent field).
     fn header_bool_field(obj: &Map<String, Value>, complete: &mut bool) -> Option<bool> {
         match obj.get("isSubagent") {
-            None | Some(Value::Null) => None,
+            None => None,
+            Some(Value::Null) => {
+                *complete = false;
+                None
+            }
             Some(v) => {
                 let parsed = Self::decode_is_subagent(v);
                 if parsed.is_none() {
@@ -632,6 +652,25 @@ impl CursorConnector {
             Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
             Some(Value::String(_)) => None,
             Some(_) => {
+                *complete = false;
+                None
+            }
+        }
+    }
+
+    /// A header identity (`composerId` / `id`). Unlike a parent reference, an
+    /// identity that is present but unusable — explicit `null`, empty, or a
+    /// non-string — makes the row unidentifiable: mark the store incomplete
+    /// (round-4 I2/O2). Only a genuinely absent field is ordinary absence.
+    fn header_identity_field(
+        obj: &Map<String, Value>,
+        key: &str,
+        complete: &mut bool,
+    ) -> Option<String> {
+        match obj.get(key) {
+            None => None,
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => {
                 *complete = false;
                 None
             }
@@ -859,8 +898,12 @@ impl CursorConnector {
             let parent_fallback = parse_parent(parsed.parent_id, &mut complete);
             let parent_id = parent_primary.or(parent_fallback);
             let is_subagent = match parsed.is_subagent {
-                None | Some(Value::Null) => None,
-                Some(ref v) => {
+                None => None,
+                Some(None) => {
+                    complete = false;
+                    None
+                }
+                Some(Some(ref v)) => {
                     let parsed_bool = Self::decode_is_subagent(v);
                     if parsed_bool.is_none() {
                         complete = false;
@@ -999,6 +1042,9 @@ impl CursorConnector {
                                     parent_id: hr.parent_id.clone(),
                                     last_updated_at: hr.last_updated_at,
                                 };
+                                // Identity recoverable from the value JSON, used to keep
+                                // positive/parent evidence when the SQL identity is empty.
+                                let mut val_id: Option<String> = None;
                                 // Validate the value JSON even when the SQL identity
                                 // is empty: a malformed or unidentifiable header must
                                 // mark the store incomplete, not be skipped silently.
@@ -1019,18 +1065,19 @@ impl CursorConnector {
                                                 "parentId",
                                                 &mut headers_complete,
                                             );
-                                            // The value JSON's own identity must be
-                                            // interpretable too (non-string => incomplete).
-                                            Self::header_id_field(
+                                            // The value JSON's own identity must be interpretable;
+                                            // both shapes are validated independently (round-4 I2).
+                                            let json_composer_id = Self::header_identity_field(
                                                 &obj,
                                                 "composerId",
                                                 &mut headers_complete,
                                             );
-                                            Self::header_id_field(
+                                            let json_id = Self::header_identity_field(
                                                 &obj,
                                                 "id",
                                                 &mut headers_complete,
                                             );
+                                            val_id = json_composer_id.or(json_id);
                                             let val_updated =
                                                 obj.get("lastUpdatedAt").and_then(parse_timestamp);
                                             // Same-row positive-dominates merge: a decoded
@@ -1051,10 +1098,18 @@ impl CursorConnector {
                                         _ => headers_complete = false,
                                     }
                                 }
-                                if hr.id.is_empty() {
-                                    continue;
+                                // An empty SQL identity is uninterpretable: invalidate negative
+                                // completeness, but keep any positive/parent evidence under the
+                                // value-JSON identity when one is recoverable (round-4 I2).
+                                let id = if hr.id.is_empty() {
+                                    headers_complete = false;
+                                    val_id
+                                } else {
+                                    Some(hr.id)
+                                };
+                                if let Some(id) = id {
+                                    Self::merge_flag(&mut headers, id, flag);
                                 }
-                                Self::merge_flag(&mut headers, hr.id, flag);
                             }
                         }
                         Err(_) => headers_complete = false,
@@ -1087,15 +1142,19 @@ impl CursorConnector {
                                             headers_complete = false;
                                             continue;
                                         };
-                                        let id = Self::header_id_field(
+                                        // Validate both identity shapes independently of the
+                                        // fallback selection (round-4 I2).
+                                        let cid = Self::header_identity_field(
                                             obj,
                                             "composerId",
                                             &mut headers_complete,
-                                        )
-                                        .or_else(|| {
-                                            Self::header_id_field(obj, "id", &mut headers_complete)
-                                        });
-                                        let Some(id) = id else {
+                                        );
+                                        let iid = Self::header_identity_field(
+                                            obj,
+                                            "id",
+                                            &mut headers_complete,
+                                        );
+                                        let Some(id) = cid.or(iid) else {
                                             // An unidentifiable header is not ordinary
                                             // absence: it may hide subagent evidence, so
                                             // the store can no longer certify main.
@@ -1139,102 +1198,45 @@ impl CursorConnector {
         (headers, headers_complete)
     }
 
-    /// True if `db_path` sits in a `workspaceStorage` subtree and a sibling
-    /// `globalStorage/state.vscdb` exists on disk that is absent from `included`.
-    fn has_unfolded_global_sibling(db_path: &Path, included: &HashSet<PathBuf>) -> bool {
+    /// Whether the LOCAL Cursor installation that db_path belongs to was fully
+    /// read in this scan: the installation root's globalStorage/state.vscdb and
+    /// every on-disk workspaceStorage/*/state.vscdb are all in included. A
+    /// standalone store (no globalStorage/workspaceStorage layout) is its own
+    /// single-store installation. This is the only coverage gate for a false
+    /// verdict; remote mirrors never emit false and are gated by origin at the
+    /// call site (round-4 ruling). Replaces the round-2/3 remote-coverage and
+    /// unfolded-sibling special cases.
+    fn local_installation_fully_read(db_path: &Path, included: &HashSet<PathBuf>) -> bool {
         let Some(parent) = db_path.parent() else {
             return false;
         };
-        let storage_root = if parent.file_name().is_some_and(|n| n == "workspaceStorage") {
-            parent.parent()
-        } else if parent
+        let parent_name = parent.file_name().and_then(|n| n.to_str());
+        let grand_name = parent
             .parent()
             .and_then(Path::file_name)
-            .is_some_and(|n| n == "workspaceStorage")
-        {
-            parent.parent().and_then(Path::parent)
-        } else {
-            None
-        };
-        let Some(base) = storage_root else {
+            .and_then(|n| n.to_str());
+        let root =
+            if parent_name == Some("globalStorage") || parent_name == Some("workspaceStorage") {
+                parent.parent()
+            } else if grand_name == Some("workspaceStorage") {
+                parent.parent().and_then(Path::parent)
+            } else {
+                // Standalone store: its installation is just itself.
+                return included.contains(&dedupe_path_key(db_path));
+            };
+        let Some(root) = root else {
             return false;
         };
-        let global_db = base.join("globalStorage").join("state.vscdb");
-        global_db.is_file() && !included.contains(&dedupe_path_key(&global_db))
-    }
-
-    /// True when `root` mirrors a remote Cursor `workspaceStorage` store (the
-    /// whole directory or a single workspace) and no `globalStorage` database
-    /// from the same transport container was read in this scan. The remote
-    /// host's `globalStorage/state.vscdb` can hold the parent/header evidence
-    /// for these composers, and `storage_roots::mirrored_db_files` copies only
-    /// the requested store, so verdicts from the mirror alone must withhold
-    /// `false`. The local-path check in `has_unfolded_global_sibling` cannot see
-    /// this: a leaf workspace mirror omits the `workspaceStorage` directory name
-    /// and the remote `globalStorage` is not present on the local filesystem.
-    fn remote_workspace_mirror_missing_global(
-        root: &ScanRoot,
-        db_paths: &[(ScanRoot, PathBuf)],
-        original_roots: &[ScanRoot],
-    ) -> bool {
-        if !root.origin.is_remote() {
+        let global_db = root.join("globalStorage").join("state.vscdb");
+        if global_db.is_file() && !included.contains(&dedupe_path_key(&global_db)) {
             return false;
         }
-        let Some(source) = root.mirrored_source_path.as_deref() else {
-            return false;
-        };
-        let parts: Vec<&str> = source
-            .split(['/', '\\'])
-            .filter(|p| !p.is_empty())
-            .collect();
-        let Some(user_start) = parts.windows(2).rposition(|w| w == ["Cursor", "User"]) else {
-            return false;
-        };
-        let suffix = &parts[user_start + 2..];
-        if !matches!(suffix, ["workspaceStorage"] | ["workspaceStorage", _]) {
-            return false;
+        for ws_db in storage_roots::workspace_db_files(&root.join("workspaceStorage")) {
+            if !included.contains(&dedupe_path_key(&ws_db)) {
+                return false;
+            }
         }
-        // A mirror that contributed no store has no composers to withhold for;
-        // do not let an empty/missing mirror root poison unrelated complete stores.
-        if !db_paths.iter().any(|(_, p)| p.starts_with(&root.path)) {
-            return false;
-        }
-        // The mirror's globalStorage counts as read only when a global-store DB
-        // exists *relative to this container* AND an original root for the same
-        // container actually requested the global store. An ancestor of the
-        // container named globalStorage proves nothing about the remote host
-        // (round-3 Important #3). Provenance must come from the original scan
-        // roots: source_roots derives per-DB roots via with_path, which clears
-        // mirrored_source_path.
-        let global_db_present = db_paths.iter().any(|(_, p)| {
-            p.strip_prefix(&root.path)
-                .is_ok_and(|rel| rel.ends_with("globalStorage/state.vscdb"))
-        });
-        let global_requested = original_roots.iter().any(|r| {
-            r.path == root.path
-                && r.origin.is_remote()
-                && r.mirrored_source_path
-                    .as_deref()
-                    .is_some_and(Self::mirror_source_includes_global_store)
-        });
-        !(global_db_present && global_requested)
-    }
-
-    /// True when a mirror source's suffix after `Cursor/User` denotes a store
-    /// set that includes `globalStorage` (the whole User tree, the Cursor home,
-    /// or globalStorage itself).
-    fn mirror_source_includes_global_store(source: &str) -> bool {
-        let parts: Vec<&str> = source
-            .split(['/', '\\'])
-            .filter(|p| !p.is_empty())
-            .collect();
-        let Some(user_start) = parts.windows(2).rposition(|w| w == ["Cursor", "User"]) else {
-            return false;
-        };
-        matches!(
-            &parts[user_start + 2..],
-            [] | ["globalStorage"] | ["globalStorage", ..]
-        )
+        true
     }
 
     /// Aggregate subagent evidence across all discovered Cursor DBs so an
@@ -1285,12 +1287,15 @@ impl CursorConnector {
         merged
     }
 
-    /// Resolve one composer's verdict from the store evidence. `None` means
-    /// the source proves no verdict; false is returned only when the store
-    /// evidence is complete, never guessed from a partial read.
+    /// Resolve one composer's verdict from the store evidence. None means the
+    /// source proves no verdict. false is returned only when the emitting store
+    /// may certify main (false_allowed: a fully-read LOCAL installation) AND the
+    /// evidence is complete; it is never guessed from a partial read, and never
+    /// emitted for a remote/mirrored store (round-4 ruling).
     fn subagent_verdict(
         composer_id: &str,
         ev: &ComposerSubagentEvidence,
+        false_allowed: bool,
     ) -> Option<(bool, Option<String>)> {
         if let Some(parent) = ev.child_to_parent.get(composer_id) {
             return Some((true, Some(parent.clone())));
@@ -1308,7 +1313,7 @@ impl CursorConnector {
         {
             return Some((true, None));
         }
-        if ev.composer_map_complete && ev.headers_complete {
+        if false_allowed && ev.composer_map_complete && ev.headers_complete {
             return Some((false, None));
         }
         None
@@ -1319,8 +1324,10 @@ impl CursorConnector {
         conv: &mut NormalizedConversation,
         composer_id: &str,
         ev: &ComposerSubagentEvidence,
+        false_allowed: bool,
     ) {
-        let Some((is_subagent, parent)) = Self::subagent_verdict(composer_id, ev) else {
+        let Some((is_subagent, parent)) = Self::subagent_verdict(composer_id, ev, false_allowed)
+        else {
             return;
         };
         if !conv.metadata.is_object() {
@@ -1346,7 +1353,9 @@ impl CursorConnector {
         since_ts: Option<i64>,
         tick: &dyn Fn(),
     ) -> Result<Vec<NormalizedConversation>> {
-        Self::extract_from_db_with_evidence(db_path, since_ts, tick, None)
+        let included = HashSet::from([dedupe_path_key(db_path)]);
+        let false_allowed = Self::local_installation_fully_read(db_path, &included);
+        Self::extract_from_db_with_evidence(db_path, since_ts, tick, None, false_allowed)
     }
 
     fn extract_from_db_with_evidence(
@@ -1354,6 +1363,7 @@ impl CursorConnector {
         since_ts: Option<i64>,
         tick: &dyn Fn(),
         external_evidence: Option<&ComposerSubagentEvidence>,
+        false_allowed: bool,
     ) -> Result<Vec<NormalizedConversation>> {
         let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
             .with_context(|| format!("failed to open Cursor db: {}", db_path.display()))?;
@@ -1389,13 +1399,7 @@ impl CursorConnector {
                 let evidence = if let Some(ev) = external_evidence {
                     ev
                 } else {
-                    let mut ev = Self::composer_subagent_evidence(&rows, &conn, tick);
-                    let included = HashSet::from([dedupe_path_key(db_path)]);
-                    if Self::has_unfolded_global_sibling(db_path, &included) {
-                        ev.composer_map_complete = false;
-                        ev.headers_complete = false;
-                    }
-                    owned_evidence = ev;
+                    owned_evidence = Self::composer_subagent_evidence(&rows, &conn, tick);
                     &owned_evidence
                 };
                 for (key, value) in rows {
@@ -1413,7 +1417,7 @@ impl CursorConnector {
                         Some(&conn),
                     ) {
                         if let Some(id) = conv.external_id.clone() {
-                            Self::apply_subagent_verdict(&mut conv, &id, evidence);
+                            Self::apply_subagent_verdict(&mut conv, &id, evidence, false_allowed);
                         }
                         convs.push(conv);
                     }
@@ -3001,14 +3005,11 @@ impl CursorConnector {
             let evidence = if let Some(ev) = external_evidence {
                 ev
             } else {
-                let mut ev = Self::composer_subagent_evidence_from_conn(&conn, tick);
-                if Self::has_unfolded_global_sibling(db_path, &included) {
-                    ev.composer_map_complete = false;
-                    ev.headers_complete = false;
-                }
-                owned_evidence = ev;
+                owned_evidence = Self::composer_subagent_evidence_from_conn(&conn, tick);
                 &owned_evidence
             };
+            let false_allowed =
+                !root.origin.is_remote() && Self::local_installation_fully_read(db_path, &included);
             let mut still_pending: Vec<String> = Vec::new();
             for sid in &pending {
                 tick();
@@ -3024,7 +3025,12 @@ impl CursorConnector {
                             Some(&conn),
                         );
                         if let Some(mut composer_conv) = parsed {
-                            Self::apply_subagent_verdict(&mut composer_conv, sid, evidence);
+                            Self::apply_subagent_verdict(
+                                &mut composer_conv,
+                                sid,
+                                evidence,
+                                false_allowed,
+                            );
                             root.apply_workspace_rewrite(&mut composer_conv);
                             found.insert(sid.clone(), Some(composer_conv));
                         } else {
@@ -3137,13 +3143,10 @@ impl CursorConnector {
             .iter()
             .map(|(_, p)| dedupe_path_key(p))
             .collect();
-        let unfolded_global = all_db_paths
-            .iter()
-            .any(|(_, p)| Self::has_unfolded_global_sibling(p, &included_db_keys))
-            || ctx.scan_roots.iter().any(|r| {
-                Self::remote_workspace_mirror_missing_global(r, &all_db_paths, &ctx.scan_roots)
-            });
-        let needs_cross_db_evidence = all_db_paths.len() > 1 || any_db_excluded || unfolded_global;
+        // Coverage for a false verdict is decided per emitting store via
+        // local_installation_fully_read + origin (round-4 ruling); cross-DB
+        // evidence is only needed to resolve parents across multiple stores.
+        let needs_cross_db_evidence = all_db_paths.len() > 1 || any_db_excluded;
         let mut cross_db_evidence: Option<ComposerSubagentEvidence> = None;
 
         for (root, db_path) in &all_db_paths {
@@ -3158,16 +3161,19 @@ impl CursorConnector {
             if needs_cross_db_evidence && cross_db_evidence.is_none() {
                 cross_db_evidence = Some(Self::collect_cross_db_evidence(
                     &all_db_paths,
-                    any_db_excluded || unfolded_global,
+                    any_db_excluded,
                     &tick,
                 ));
             }
 
+            let false_allowed = !root.origin.is_remote()
+                && Self::local_installation_fully_read(db_path, &included_db_keys);
             match Self::extract_from_db_with_evidence(
                 db_path,
                 ctx.since_ts,
                 &tick,
                 cross_db_evidence.as_ref(),
+                false_allowed,
             ) {
                 Ok(convs) => {
                     let mut kept = 0;
@@ -3228,7 +3234,7 @@ impl CursorConnector {
         if !need_lookup.is_empty() && needs_cross_db_evidence && cross_db_evidence.is_none() {
             cross_db_evidence = Some(Self::collect_cross_db_evidence(
                 &all_db_paths,
-                any_db_excluded || unfolded_global,
+                any_db_excluded,
                 &tick,
             ));
         }
@@ -7574,7 +7580,7 @@ mod cursor_fragment_merge_tests {
     }
 
     #[test]
-    fn remote_workspace_mirror_with_read_global_emits_false() {
+    fn remote_workspace_mirror_with_read_global_still_withholds_false() {
         let tmp = TempDir::new().unwrap();
         let container = tmp.path().join("mirror_0123456789abcdef");
         let ws_db = container.join("ws1").join("state.vscdb");
@@ -7617,7 +7623,9 @@ mod cursor_fragment_merge_tests {
             .iter()
             .find(|c| c.external_id.as_deref() == Some(main))
             .unwrap();
-        assert_eq!(c.metadata["is_subagent"], json!(false));
+        // Round-4 ruling: a remote/mirrored installation never emits false,
+        // even when its global store was read alongside the workspace.
+        assert!(c.metadata.get("is_subagent").is_none());
     }
 
     #[test]
@@ -8306,5 +8314,365 @@ mod cursor_fragment_merge_tests {
             .expect("workspace child is emitted");
         assert_eq!(c.metadata["is_subagent"], json!(true));
         assert_eq!(c.metadata["parent_id"], json!(parent));
+    }
+
+    #[test]
+    fn empty_sql_identity_withholds_false_and_keeps_parent() {
+        let main = "cccccccc-0000-4000-8000-000000000001";
+        let c = "cccccccc-0000-4000-8000-000000000002";
+        let parent = "cccccccc-0000-4000-8000-000000000003";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        for id in [main, c] {
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    json!({"text": "t", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT, isSubagent INTEGER, parentComposerId TEXT, value TEXT)",
+        )
+        .unwrap();
+        // NULL SQL identity, but a fully readable value JSON naming C.
+        let hj =
+            json!({"composerId": c, "isSubagent": true, "parentComposerId": parent}).to_string();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent, parentComposerId, value) VALUES (?, ?, ?, ?)",
+            params![None::<&str>, 1i64, parent, hj.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        assert_eq!(
+            v[c]["is_subagent"],
+            json!(true),
+            "positive evidence must be kept"
+        );
+        assert_eq!(
+            v[c]["parent_id"],
+            json!(parent),
+            "parent evidence must be kept"
+        );
+        assert!(
+            v[main].get("is_subagent").is_none(),
+            "an unidentifiable header row must invalidate negative completeness"
+        );
+    }
+
+    #[test]
+    fn item_table_validates_id_fallback_shape_independently() {
+        let main = "cccccccc-0000-4000-8001-000000000001";
+        let c = "cccccccc-0000-4000-8001-000000000002";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        for id in [main, c] {
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    json!({"text": "t", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        }
+        // composerId is usable, but id is a non-string: it must still be validated.
+        let item = json!([{"composerId": c, "id": 123, "isSubagent": false}]).to_string();
+        conn.execute_compat(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            params!["composer.composerHeaders", item.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        assert!(
+            v[c].get("is_subagent").is_none(),
+            "non-string id must withhold"
+        );
+        assert!(
+            v[main].get("is_subagent").is_none(),
+            "store must be incomplete"
+        );
+    }
+
+    #[test]
+    fn remote_global_from_other_installation_never_certifies_false() {
+        let tmp = TempDir::new().unwrap();
+        let container = tmp.path().join("mirror_0123456789abcdef");
+        let ws_db = container.join("ws1").join("state.vscdb");
+        let global_db = container.join("globalStorage").join("state.vscdb");
+        fs::create_dir_all(ws_db.parent().unwrap()).unwrap();
+        fs::create_dir_all(global_db.parent().unwrap()).unwrap();
+        let main = "cccccccc-0000-4000-8002-000000000001";
+        let w = verdict_test_db(&ws_db);
+        w.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{main}").as_str(),
+                json!({"text": "m", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(w);
+        drop(verdict_test_db(&global_db));
+        let origin = crate::types::Origin::remote("laptop");
+        // Same destination container, but the global root is a DIFFERENT remote
+        // Cursor/User installation than the workspace root.
+        let ws_root = ScanRoot::remote(container.clone(), origin.clone(), None)
+            .with_mirrored_source_path("~/.config/Cursor/User/workspaceStorage/ws1");
+        let g_root = ScanRoot::remote(container.clone(), origin, None)
+            .with_mirrored_source_path("/opt/secondary/Cursor/User/globalStorage");
+        let ctx = ScanContext::with_roots(tmp.path().join("state"), vec![ws_root, g_root], None);
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        let c = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some(main))
+            .unwrap();
+        assert!(
+            c.metadata.get("is_subagent").is_none(),
+            "a remote mirror must never emit false, regardless of a foreign global store"
+        );
+    }
+
+    #[test]
+    fn whole_cursor_remote_mirror_withholds_false_and_keeps_positive() {
+        let tmp = TempDir::new().unwrap();
+        let container = tmp.path().join("mirror_0123456789abcdef");
+        let ws_db = container.join("ws1").join("state.vscdb");
+        let global_db = container
+            .join("Cursor/User/globalStorage")
+            .join("state.vscdb");
+        fs::create_dir_all(ws_db.parent().unwrap()).unwrap();
+        fs::create_dir_all(global_db.parent().unwrap()).unwrap();
+        let main = "cccccccc-0000-4000-8003-000000000001";
+        let parent = "cccccccc-0000-4000-8003-000000000002";
+        let child = "cccccccc-0000-4000-8003-000000000003";
+        let w = verdict_test_db(&ws_db);
+        for (id, v) in [
+            (
+                main,
+                json!({"text": "m", "createdAt": "2026-11-12T00:00:00Z"}),
+            ),
+            (
+                parent,
+                json!({"text": "p", "subagentComposerIds": [child], "createdAt": "2026-11-12T00:00:00Z"}),
+            ),
+            (
+                child,
+                json!({"text": "c", "createdAt": "2026-11-12T00:00:00Z"}),
+            ),
+        ] {
+            w.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    v.to_string().as_str()
+                ],
+            )
+            .unwrap();
+        }
+        drop(w);
+        drop(verdict_test_db(&global_db));
+        let origin = crate::types::Origin::remote("laptop");
+        let ws_root = ScanRoot::remote(container.clone(), origin.clone(), None)
+            .with_mirrored_source_path("~/.config/Cursor/User/workspaceStorage/ws1");
+        // Application-home source (whole Cursor), supported by storage_roots.
+        let home_root = ScanRoot::remote(container.clone(), origin, None)
+            .with_mirrored_source_path("~/.config/Cursor");
+        let ctx = ScanContext::with_roots(tmp.path().join("state"), vec![ws_root, home_root], None);
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        let by_id: HashMap<String, Value> = convs
+            .into_iter()
+            .filter_map(|c| c.external_id.map(|id| (id, c.metadata)))
+            .collect();
+        assert!(
+            by_id[main].get("is_subagent").is_none(),
+            "remote never emits false"
+        );
+        assert_eq!(by_id[child]["is_subagent"], json!(true));
+        assert_eq!(by_id[child]["parent_id"], json!(parent));
+    }
+
+    #[test]
+    fn explicit_null_is_subagent_withholds_false() {
+        let main = "cccccccc-0000-4000-8004-000000000001";
+        let c = "cccccccc-0000-4000-8004-000000000002";
+        let val = json!({"text": "t", "createdAt": "2026-11-12T00:00:00Z"});
+
+        // ItemTable header with explicit null flag.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        for id in [main, c] {
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    val.to_string().as_str()
+                ],
+            )
+            .unwrap();
+        }
+        let item = json!([{"composerId": c, "isSubagent": null}]).to_string();
+        conn.execute_compat(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            params!["composer.composerHeaders", item.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        assert!(v[c].get("is_subagent").is_none(), "null flag must withhold");
+        assert!(
+            v[main].get("is_subagent").is_none(),
+            "store must be incomplete"
+        );
+
+        // composerData own evidence with explicit null flag.
+        let dir2 = TempDir::new().unwrap();
+        let db2 = dir2.path().join("state.vscdb");
+        let conn2 = verdict_test_db(&db2);
+        conn2
+            .execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{c}").as_str(),
+                    json!({"text": "t", "isSubagent": null, "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        drop(conn2);
+        assert!(
+            cursor_verdicts(&db2, None)[c].get("is_subagent").is_none(),
+            "own null flag must withhold"
+        );
+
+        // composerHeaders.value JSON with explicit null flag.
+        let dir3 = TempDir::new().unwrap();
+        let db3 = dir3.path().join("state.vscdb");
+        let conn3 = verdict_test_db(&db3);
+        for id in [main, c] {
+            conn3
+                .execute_compat(
+                    "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                    params![
+                        format!("composerData:{id}").as_str(),
+                        val.to_string().as_str()
+                    ],
+                )
+                .unwrap();
+        }
+        conn3
+            .execute("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        let hj = json!({"composerId": c, "isSubagent": null}).to_string();
+        conn3
+            .execute_compat(
+                "INSERT INTO composerHeaders (composerId, value) VALUES (?, ?)",
+                params![c, hj.as_str()],
+            )
+            .unwrap();
+        drop(conn3);
+        let v3 = cursor_verdicts(&db3, None);
+        assert!(
+            v3[c].get("is_subagent").is_none(),
+            "value-JSON null flag must withhold"
+        );
+        assert!(
+            v3[main].get("is_subagent").is_none(),
+            "store must be incomplete"
+        );
+    }
+
+    #[test]
+    fn local_global_store_with_unread_workspaces_withholds_false() {
+        let main = "cccccccc-0000-4000-8005-000000000001";
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let global_db = base.join("globalStorage").join("state.vscdb");
+        let ws_db = base
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("state.vscdb");
+        fs::create_dir_all(global_db.parent().unwrap()).unwrap();
+        fs::create_dir_all(ws_db.parent().unwrap()).unwrap();
+        let g = verdict_test_db(&global_db);
+        g.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{main}").as_str(),
+                json!({"text": "m", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(g);
+        drop(verdict_test_db(&ws_db));
+        // Scan only the global store; the workspace sibling exists but is unread.
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(global_db.parent().unwrap().to_path_buf())],
+            None,
+        );
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        let c = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some(main))
+            .unwrap();
+        assert!(
+            c.metadata.get("is_subagent").is_none(),
+            "a local installation with unread workspace stores must not certify main"
+        );
+    }
+
+    #[test]
+    fn local_full_installation_emits_false() {
+        let main = "cccccccc-0000-4000-8006-000000000001";
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let global_db = base.join("globalStorage").join("state.vscdb");
+        let ws_db = base
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("state.vscdb");
+        fs::create_dir_all(global_db.parent().unwrap()).unwrap();
+        fs::create_dir_all(ws_db.parent().unwrap()).unwrap();
+        let g = verdict_test_db(&global_db);
+        g.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{main}").as_str(),
+                json!({"text": "m", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(g);
+        drop(verdict_test_db(&ws_db));
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            None,
+        );
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        let c = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some(main))
+            .unwrap();
+        assert_eq!(c.metadata["is_subagent"], json!(false));
     }
 }

@@ -28,6 +28,7 @@
 mod storage_roots;
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -138,6 +139,11 @@ struct ComposerSubagentEvidence {
     composer_map_complete: bool,
     /// Every header source (`composerHeaders` / `ItemTable`) was fully read (or absent).
     headers_complete: bool,
+    /// Per-installation evidence completeness keyed by canonical installation
+    /// root (round-5 O3). A false verdict requires the emitting store's
+    /// installation to be complete, so an unrelated incomplete or remote store
+    /// cannot suppress a fully read local installation's main verdicts.
+    installation_complete: HashMap<PathBuf, bool>,
 }
 
 /// One `composerHeaders` SQL cell. SQLite columns are dynamically typed, so a
@@ -341,7 +347,7 @@ impl CursorConnector {
         } else {
             base.join("workspaceStorage")
         };
-        dbs.extend(storage_roots::workspace_db_files(&workspace_storage));
+        dbs.extend(storage_roots::workspace_db_files(&workspace_storage).0);
 
         // Keep connector traversal deterministic across filesystems/runs.
         dbs.sort();
@@ -929,6 +935,7 @@ impl CursorConnector {
             headers,
             composer_map_complete: complete,
             headers_complete,
+            installation_complete: HashMap::new(),
         }
     }
 
@@ -964,6 +971,7 @@ impl CursorConnector {
                 headers,
                 composer_map_complete: false,
                 headers_complete,
+                installation_complete: HashMap::new(),
             }
         }
     }
@@ -1198,41 +1206,59 @@ impl CursorConnector {
         (headers, headers_complete)
     }
 
-    /// Whether the LOCAL Cursor installation that db_path belongs to was fully
-    /// read in this scan: the installation root's globalStorage/state.vscdb and
-    /// every on-disk workspaceStorage/*/state.vscdb are all in included. A
-    /// standalone store (no globalStorage/workspaceStorage layout) is its own
-    /// single-store installation. This is the only coverage gate for a false
-    /// verdict; remote mirrors never emit false and are gated by origin at the
-    /// call site (round-4 ruling). Replaces the round-2/3 remote-coverage and
-    /// unfolded-sibling special cases.
+    /// Canonical path for coverage-set membership: resolves symlinks so an alias
+    /// and its target compare equal. Falls back to the literal path when it
+    /// cannot be canonicalized (e.g. it no longer exists).
+    fn canon_path(path: &Path) -> PathBuf {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// The canonical installation root for a local Cursor store, or None for an
+    /// unrecognized layout (standalone file, remote mirror, etc.). Canonicalizing
+    /// resolves leaf and parent symlinks so an alias is judged by the installation
+    /// it really points into, not by the alias's own parent (round-5 N4).
+    fn installation_root(db_path: &Path) -> Option<PathBuf> {
+        let real = fs::canonicalize(db_path).ok()?;
+        let parent = real.parent()?;
+        let parent_name = parent.file_name()?.to_str()?;
+        if parent_name == "globalStorage" || parent_name == "workspaceStorage" {
+            return parent.parent().map(Path::to_path_buf);
+        }
+        let grand = parent.parent()?;
+        if grand.file_name()?.to_str()? == "workspaceStorage" {
+            return grand.parent().map(Path::to_path_buf);
+        }
+        None
+    }
+
+    /// Whether the LOCAL installation that db_path belongs to was fully read in
+    /// this scan: a recognized layout whose globalStorage/state.vscdb exists and
+    /// was read, and whose every on-disk workspaceStorage store was enumerated
+    /// without error and read. A standalone/aliased/unrecognized store, a missing
+    /// or unreadable global, or a failed workspace enumeration is NOT a fully read
+    /// installation (round-5 N4: no standalone or missing-global exemptions).
+    /// Remote mirrors never emit false and are gated by origin at the call site.
     fn local_installation_fully_read(db_path: &Path, included: &HashSet<PathBuf>) -> bool {
-        let Some(parent) = db_path.parent() else {
+        let Some(root) = Self::installation_root(db_path) else {
             return false;
         };
-        let parent_name = parent.file_name().and_then(|n| n.to_str());
-        let grand_name = parent
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|n| n.to_str());
-        let root =
-            if parent_name == Some("globalStorage") || parent_name == Some("workspaceStorage") {
-                parent.parent()
-            } else if grand_name == Some("workspaceStorage") {
-                parent.parent().and_then(Path::parent)
-            } else {
-                // Standalone store: its installation is just itself.
-                return included.contains(&dedupe_path_key(db_path));
-            };
-        let Some(root) = root else {
-            return false;
-        };
+        // The global store must exist (metadata errors fail closed) and be read.
         let global_db = root.join("globalStorage").join("state.vscdb");
-        if global_db.is_file() && !included.contains(&dedupe_path_key(&global_db)) {
+        match fs::metadata(&global_db) {
+            Ok(meta) if meta.is_file() => {}
+            _ => return false,
+        }
+        if !included.contains(&Self::canon_path(&global_db)) {
             return false;
         }
-        for ws_db in storage_roots::workspace_db_files(&root.join("workspaceStorage")) {
-            if !included.contains(&dedupe_path_key(&ws_db)) {
+        // Every workspace store must be enumerated reliably and read.
+        let (ws_files, ws_complete) =
+            storage_roots::workspace_db_files(&root.join("workspaceStorage"));
+        if !ws_complete {
+            return false;
+        }
+        for ws_db in ws_files {
+            if !included.contains(&Self::canon_path(&ws_db)) {
                 return false;
             }
         }
@@ -1253,27 +1279,39 @@ impl CursorConnector {
             headers: HashMap::new(),
             composer_map_complete: !any_missing_db,
             headers_complete: !any_missing_db,
+            installation_complete: HashMap::new(),
         };
         for (_, db_path) in db_paths {
             if store_is_provably_empty(db_path) {
                 continue;
             }
+            let inst = Self::installation_root(db_path);
             tick();
             let Ok(conn) =
                 open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
             else {
                 merged.composer_map_complete = false;
                 merged.headers_complete = false;
+                if let Some(root) = inst {
+                    merged.installation_complete.insert(root, false);
+                }
                 continue;
             };
             if conn.execute("PRAGMA busy_timeout = 5000;").is_err() {
                 merged.composer_map_complete = false;
                 merged.headers_complete = false;
+                if let Some(root) = inst {
+                    merged.installation_complete.insert(root, false);
+                }
                 continue;
             }
             let db_ev = Self::composer_subagent_evidence_from_conn(&conn, tick);
             merged.composer_map_complete &= db_ev.composer_map_complete;
             merged.headers_complete &= db_ev.headers_complete;
+            if let Some(root) = inst {
+                let entry = merged.installation_complete.entry(root).or_insert(true);
+                *entry &= db_ev.composer_map_complete && db_ev.headers_complete;
+            }
             for (child, parent) in db_ev.child_to_parent {
                 merged.child_to_parent.insert(child, parent);
             }
@@ -1313,10 +1351,19 @@ impl CursorConnector {
         {
             return Some((true, None));
         }
-        if false_allowed && ev.composer_map_complete && ev.headers_complete {
+        if false_allowed {
             return Some((false, None));
         }
         None
+    }
+
+    /// Whether the emitting store's installation has complete evidence (round-5
+    /// O3). Partitioned per installation so an unrelated incomplete or remote
+    /// store cannot suppress a fully read local installation's main verdicts.
+    fn installation_evidence_complete(db_path: &Path, ev: &ComposerSubagentEvidence) -> bool {
+        Self::installation_root(db_path)
+            .and_then(|root| ev.installation_complete.get(&root).copied())
+            .unwrap_or(false)
     }
 
     /// Lift the verdict into a parsed composer conversation's metadata.
@@ -1353,9 +1400,9 @@ impl CursorConnector {
         since_ts: Option<i64>,
         tick: &dyn Fn(),
     ) -> Result<Vec<NormalizedConversation>> {
-        let included = HashSet::from([dedupe_path_key(db_path)]);
-        let false_allowed = Self::local_installation_fully_read(db_path, &included);
-        Self::extract_from_db_with_evidence(db_path, since_ts, tick, None, false_allowed)
+        let included = HashSet::from([Self::canon_path(db_path)]);
+        let coverage_allowed = Self::local_installation_fully_read(db_path, &included);
+        Self::extract_from_db_with_evidence(db_path, since_ts, tick, None, coverage_allowed)
     }
 
     fn extract_from_db_with_evidence(
@@ -1363,7 +1410,7 @@ impl CursorConnector {
         since_ts: Option<i64>,
         tick: &dyn Fn(),
         external_evidence: Option<&ComposerSubagentEvidence>,
-        false_allowed: bool,
+        coverage_allowed: bool,
     ) -> Result<Vec<NormalizedConversation>> {
         let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
             .with_context(|| format!("failed to open Cursor db: {}", db_path.display()))?;
@@ -1399,9 +1446,16 @@ impl CursorConnector {
                 let evidence = if let Some(ev) = external_evidence {
                     ev
                 } else {
-                    owned_evidence = Self::composer_subagent_evidence(&rows, &conn, tick);
+                    let mut ev = Self::composer_subagent_evidence(&rows, &conn, tick);
+                    if let Some(root) = Self::installation_root(db_path) {
+                        ev.installation_complete
+                            .insert(root, ev.composer_map_complete && ev.headers_complete);
+                    }
+                    owned_evidence = ev;
                     &owned_evidence
                 };
+                let false_allowed =
+                    coverage_allowed && Self::installation_evidence_complete(db_path, evidence);
                 for (key, value) in rows {
                     let Some(value) = value else {
                         continue;
@@ -2974,7 +3028,8 @@ impl CursorConnector {
         let mut found: HashMap<String, Option<NormalizedConversation>> = HashMap::new();
         let mut failures: Vec<String> = Vec::new();
         let mut pending: Vec<String> = sids.to_vec();
-        let included: HashSet<PathBuf> = db_paths.iter().map(|(_, p)| dedupe_path_key(p)).collect();
+        let included: HashSet<PathBuf> =
+            db_paths.iter().map(|(_, p)| Self::canon_path(p)).collect();
         for (root, db_path) in db_paths {
             if pending.is_empty() {
                 break;
@@ -3005,11 +3060,17 @@ impl CursorConnector {
             let evidence = if let Some(ev) = external_evidence {
                 ev
             } else {
-                owned_evidence = Self::composer_subagent_evidence_from_conn(&conn, tick);
+                let mut ev = Self::composer_subagent_evidence_from_conn(&conn, tick);
+                if let Some(root) = Self::installation_root(db_path) {
+                    ev.installation_complete
+                        .insert(root, ev.composer_map_complete && ev.headers_complete);
+                }
+                owned_evidence = ev;
                 &owned_evidence
             };
-            let false_allowed =
-                !root.origin.is_remote() && Self::local_installation_fully_read(db_path, &included);
+            let false_allowed = !root.origin.is_remote()
+                && Self::local_installation_fully_read(db_path, &included)
+                && Self::installation_evidence_complete(db_path, evidence);
             let mut still_pending: Vec<String> = Vec::new();
             for sid in &pending {
                 tick();
@@ -3141,7 +3202,7 @@ impl CursorConnector {
 
         let included_db_keys: HashSet<PathBuf> = all_db_paths
             .iter()
-            .map(|(_, p)| dedupe_path_key(p))
+            .map(|(_, p)| Self::canon_path(p))
             .collect();
         // Coverage for a false verdict is decided per emitting store via
         // local_installation_fully_read + origin (round-4 ruling); cross-DB
@@ -3166,14 +3227,14 @@ impl CursorConnector {
                 ));
             }
 
-            let false_allowed = !root.origin.is_remote()
+            let coverage_allowed = !root.origin.is_remote()
                 && Self::local_installation_fully_read(db_path, &included_db_keys);
             match Self::extract_from_db_with_evidence(
                 db_path,
                 ctx.since_ts,
                 &tick,
                 cross_db_evidence.as_ref(),
-                false_allowed,
+                coverage_allowed,
             ) {
                 Ok(convs) => {
                     let mut kept = 0;
@@ -6581,6 +6642,9 @@ mod cursor_fragment_merge_tests {
     /// minimal composerHeaders(composerId, isSubagent) table.
     /// Local synthetic store builder (this test module has no create_test_db).
     fn verdict_test_db(path: &Path) -> Connection {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
         let conn = Connection::open(path.to_string_lossy().as_ref()).unwrap();
         conn.execute("CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
             .unwrap();
@@ -6594,7 +6658,7 @@ mod cursor_fragment_merge_tests {
         headers: Option<&[(&str, i64)]>,
     ) -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("state.vscdb");
+        let db_path = dir.path().join("globalStorage").join("state.vscdb");
         let conn = verdict_test_db(&db_path);
         for (id, val) in composers {
             let key = format!("composerData:{id}");
@@ -7371,7 +7435,7 @@ mod cursor_fragment_merge_tests {
         // deviates deliberately — see decode_is_subagent).
         let c = "aaaaaaaa-0000-4000-8000-000000000007";
         let dir3 = TempDir::new().unwrap();
-        let db3 = dir3.path().join("state.vscdb");
+        let db3 = dir3.path().join("globalStorage").join("state.vscdb");
         let conn3 = verdict_test_db(&db3);
         conn3
             .execute_compat(
@@ -7816,7 +7880,7 @@ mod cursor_fragment_merge_tests {
         {
             let id = format!("bbbbbbbb-0000-4000-8001-{i:012}");
             let dir = TempDir::new().unwrap();
-            let db = dir.path().join("state.vscdb");
+            let db = dir.path().join("globalStorage").join("state.vscdb");
             let conn = verdict_test_db(&db);
             conn.execute_compat(
                 "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
@@ -7844,7 +7908,7 @@ mod cursor_fragment_merge_tests {
 
         // SQL columns: INTEGER 1/0 and supported TEXT spellings.
         let dir = TempDir::new().unwrap();
-        let db = dir.path().join("state.vscdb");
+        let db = dir.path().join("globalStorage").join("state.vscdb");
         let conn = verdict_test_db(&db);
         conn.execute("CREATE TABLE composerHeaders (composerId TEXT, isSubagent, lastUpdatedAt)")
             .unwrap();
@@ -7975,7 +8039,7 @@ mod cursor_fragment_merge_tests {
 
         // composerData own evidence uses the same explicit decoding.
         let dir = TempDir::new().unwrap();
-        let db = dir.path().join("state.vscdb");
+        let db = dir.path().join("globalStorage").join("state.vscdb");
         let conn = verdict_test_db(&db);
         conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
@@ -8674,5 +8738,260 @@ mod cursor_fragment_merge_tests {
             .find(|c| c.external_id.as_deref() == Some(main))
             .unwrap();
         assert_eq!(c.metadata["is_subagent"], json!(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_workspace_enumeration_withholds_false() {
+        use std::os::unix::fs::PermissionsExt;
+        let c = "dddddddd-0000-4000-8000-000000000001";
+        let p = "dddddddd-0000-4000-8000-000000000002";
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let global_db = base.join("globalStorage").join("state.vscdb");
+        let ws_dir = base.join("workspaceStorage");
+        let ws_db = ws_dir.join("ws1").join("state.vscdb");
+        fs::create_dir_all(global_db.parent().unwrap()).unwrap();
+        fs::create_dir_all(ws_db.parent().unwrap()).unwrap();
+        let g = verdict_test_db(&global_db);
+        g.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{c}").as_str(),
+                json!({"text": "c", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(g);
+        let w = verdict_test_db(&ws_db);
+        w.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{p}").as_str(),
+                json!({"text": "p", "subagentComposerIds": [c], "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(w);
+        // Deny enumeration of the workspace directory.
+        fs::set_permissions(&ws_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(global_db.parent().unwrap().to_path_buf())],
+            None,
+        );
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        fs::set_permissions(&ws_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let cc = convs
+            .iter()
+            .find(|x| x.external_id.as_deref() == Some(c))
+            .unwrap();
+        assert!(
+            cc.metadata.get("is_subagent").is_none(),
+            "denied workspace enumeration must not certify main"
+        );
+    }
+
+    #[test]
+    fn missing_global_store_withholds_false() {
+        let c = "dddddddd-0000-4000-8001-000000000001";
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let ws_db = base
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("state.vscdb");
+        fs::create_dir_all(ws_db.parent().unwrap()).unwrap();
+        let w = verdict_test_db(&ws_db);
+        w.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{c}").as_str(),
+                json!({"text": "c", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(w);
+        // No globalStorage/state.vscdb exists at all.
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            None,
+        );
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        let cc = convs
+            .iter()
+            .find(|x| x.external_id.as_deref() == Some(c))
+            .unwrap();
+        assert!(
+            cc.metadata.get("is_subagent").is_none(),
+            "a missing global store must not certify main"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_global_store_withholds_false() {
+        use std::os::unix::fs::PermissionsExt;
+        let c = "dddddddd-0000-4000-8002-000000000001";
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let global_dir = base.join("globalStorage");
+        let global_db = global_dir.join("state.vscdb");
+        let ws_db = base
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("state.vscdb");
+        fs::create_dir_all(global_dir.as_path()).unwrap();
+        fs::create_dir_all(ws_db.parent().unwrap()).unwrap();
+        drop(verdict_test_db(&global_db));
+        let w = verdict_test_db(&ws_db);
+        w.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{c}").as_str(),
+                json!({"text": "c", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(w);
+        // Global exists but its directory is unreadable (metadata probe fails).
+        fs::set_permissions(&global_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            None,
+        );
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        fs::set_permissions(&global_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let cc = convs
+            .iter()
+            .find(|x| x.external_id.as_deref() == Some(c))
+            .unwrap();
+        assert!(
+            cc.metadata.get("is_subagent").is_none(),
+            "an unreadable global store must not certify main"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_alias_to_workspace_db_with_unread_installation_withholds_false() {
+        use std::os::unix::fs::symlink;
+        let child = "dddddddd-0000-4000-8003-000000000001";
+        let parent = "dddddddd-0000-4000-8003-000000000002";
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let inst = base.join("U");
+        let global_db = inst.join("globalStorage").join("state.vscdb");
+        let ws_db = inst
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("state.vscdb");
+        fs::create_dir_all(global_db.parent().unwrap()).unwrap();
+        fs::create_dir_all(ws_db.parent().unwrap()).unwrap();
+        let gconn = verdict_test_db(&global_db);
+        gconn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{parent}").as_str(),
+                json!({"text": "p", "subagentComposerIds": [child], "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(gconn);
+        let wconn = verdict_test_db(&ws_db);
+        wconn
+            .execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{child}").as_str(),
+                    json!({"text": "c", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        drop(wconn);
+        // A standalone-named alias pointing at one workspace DB of installation U.
+        let alias_dir = base.join("alias");
+        fs::create_dir_all(&alias_dir).unwrap();
+        let alias = alias_dir.join("state.vscdb");
+        symlink(&ws_db, &alias).unwrap();
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(alias.clone())],
+            None,
+        );
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        let conv = convs
+            .iter()
+            .find(|x| x.external_id.as_deref() == Some(child))
+            .unwrap();
+        assert!(
+            conv.metadata.get("is_subagent").is_none(),
+            "an alias must not certify main when its installation's global is unread"
+        );
+    }
+
+    #[test]
+    fn incomplete_remote_store_does_not_suppress_local_main_verdicts() {
+        let m1 = "dddddddd-0000-4000-8004-000000000001";
+        let m2 = "dddddddd-0000-4000-8004-000000000002";
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let local_global = base.join("local").join("globalStorage").join("state.vscdb");
+        fs::create_dir_all(local_global.parent().unwrap()).unwrap();
+        let g = verdict_test_db(&local_global);
+        for id in [m1, m2] {
+            g.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    json!({"text": "m", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        }
+        drop(g);
+        // A remote mirror whose composerData is uninterpretable.
+        let container = base.join("mirror");
+        let remote_db = container.join("ws1").join("state.vscdb");
+        fs::create_dir_all(remote_db.parent().unwrap()).unwrap();
+        let r = verdict_test_db(&remote_db);
+        r.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params!["composerData:broken", "{not json"],
+        )
+        .unwrap();
+        drop(r);
+        let local_root = ScanRoot::local(base.join("local"));
+        let remote_root = ScanRoot::remote(container, crate::types::Origin::remote("laptop"), None)
+            .with_mirrored_source_path("~/.config/Cursor/User/workspaceStorage/ws1");
+        let ctx = ScanContext::with_roots(base.to_path_buf(), vec![local_root, remote_root], None);
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        for id in [m1, m2] {
+            let cc = convs
+                .iter()
+                .find(|x| x.external_id.as_deref() == Some(id))
+                .unwrap();
+            assert_eq!(
+                cc.metadata["is_subagent"],
+                json!(false),
+                "{id}: a fully read local installation keeps its main verdicts"
+            );
+        }
     }
 }

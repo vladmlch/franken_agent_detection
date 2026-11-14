@@ -97,6 +97,7 @@
 //! way; records the connector drops whole (empty-body `USER_INPUT` turns,
 //! content-less markers) still emit no message and therefore no archive.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -802,9 +803,206 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
     }
 }
 
+/// The proven verdict fields: (`is_subagent`, `parent_id`, `role`, `type_name`).
+type SubagentVerdict = (bool, Option<String>, Option<String>, Option<String>);
+
+/// One subagent descriptor: the parent brain dir that names the child, plus
+/// the role/type the descriptor JSON carries (native `_descriptor_role_type`).
+#[derive(Clone, Debug)]
+struct SubagentDescriptor {
+    parent: String,
+    role: Option<String>,
+    type_name: Option<String>,
+}
+
+/// Index `brain/<parent>/.system_generated/subagents/<child>.json` descriptors
+/// under a scan target. The filename is the child session id; the parent dir
+/// names the parent. Returns the index and whether it is COMPLETE: a single
+/// conversation dir sees no sibling descriptors, so it cannot prove a main.
+fn subagent_descriptor_index(scan_target: &Path) -> (HashMap<String, SubagentDescriptor>, bool) {
+    if AntigravityConnector::is_conversation_dir(scan_target) {
+        return (HashMap::new(), false);
+    }
+    let mut index = HashMap::new();
+    for entry in WalkDir::new(scan_target)
+        .min_depth(1)
+        .max_depth(8)
+        .into_iter()
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // Require .../<parent>/.system_generated/subagents/<child>.json.
+        let Some(sub_dir) = path.parent() else {
+            continue;
+        };
+        if sub_dir.file_name().and_then(|n| n.to_str()) != Some("subagents") {
+            continue;
+        }
+        let Some(sg) = sub_dir.parent() else {
+            continue;
+        };
+        if sg.file_name().and_then(|n| n.to_str()) != Some(".system_generated") {
+            continue;
+        }
+        let Some(parent_dir) = sg.parent() else {
+            continue;
+        };
+        let Some(parent) = parent_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(child) = path.file_stem().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let (role, type_name) = read_descriptor_role_type(path);
+        index
+            .entry(child.to_string())
+            .or_insert_with(|| SubagentDescriptor {
+                parent: parent.to_string(),
+                role,
+                type_name,
+            });
+    }
+    (index, true)
+}
+
+/// role/typeName from a descriptor JSON, preferring `subagentDescriptor` and
+/// falling back to the top level (native `_descriptor_role_type`).
+fn read_descriptor_role_type(path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(content) = fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&content) else {
+        return (None, None);
+    };
+    let Some(obj) = val.as_object() else {
+        return (None, None);
+    };
+    let sd = obj.get("subagentDescriptor").and_then(Value::as_object);
+    let field = |key: &str| -> Option<String> {
+        sd.and_then(|s| s.get(key))
+            .and_then(Value::as_str)
+            .or_else(|| obj.get(key).and_then(Value::as_str))
+            .map(str::to_string)
+    };
+    (field("role"), field("typeName"))
+}
+
+/// The first `id: "<36 hex/dash chars>"` in `scope` (native `id:\s*"`).
+fn find_id_uuid(scope: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(rel) = scope[from..].find("id:") {
+        let pos = from + rel;
+        from = pos + 3;
+        let after = scope[from..].trim_start();
+        let Some(rest) = after.strip_prefix('"') else {
+            continue;
+        };
+        let candidate: String = rest.chars().take(36).collect();
+        if candidate.len() == 36
+            && candidate
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b'-')
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Mirrors the native `PARENT_REMINDER_RE`: the parent UUID embedded in a
+/// caller-agent, `<subagent_reminder>`, or `parent", id:` prompt reminder.
+/// The leftmost matching reminder wins, as the native regex `search` does.
+fn parent_reminder_uuid(text: &str) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    let mut consider = |pos: usize, uuid: String| {
+        if best.as_ref().is_none_or(|(b, _)| pos < *b) {
+            best = Some((pos, uuid));
+        }
+    };
+    // caller agent ( ... id: "<uuid>"  (the id must sit inside the parens)
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("caller agent") {
+        let pos = search + rel;
+        search = pos + "caller agent".len();
+        let rest = text[search..].trim_start();
+        if let Some(after) = rest.strip_prefix('(') {
+            let scope = after.find(')').map_or(after, |i| &after[..i]);
+            if let Some(uuid) = find_id_uuid(scope) {
+                consider(pos, uuid);
+            }
+        }
+    }
+    // <subagent_reminder> ... id: "<uuid>"
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("<subagent_reminder>") {
+        let pos = search + rel;
+        search = pos + "<subagent_reminder>".len();
+        if let Some(uuid) = find_id_uuid(&text[search..]) {
+            consider(pos, uuid);
+        }
+    }
+    // parent", id: "<uuid>"
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("parent\",") {
+        let pos = search + rel;
+        search = pos + "parent\",".len();
+        let rest = text[search..].trim_start();
+        if rest.starts_with("id:")
+            && let Some(uuid) = find_id_uuid(rest)
+        {
+            consider(pos, uuid);
+        }
+    }
+    best.map(|(_, uuid)| uuid)
+}
+
+/// Resolve a conversation's subagent verdict: prompt reminder first (native
+/// order), then the descriptor index. With a complete index and neither signal
+/// the session is provably main (native closed-world semantics); an incomplete
+/// index (a single-conversation scan) withholds the verdict instead of guessing.
+fn subagent_verdict(
+    records: &[Value],
+    conversation_uuid: Option<&str>,
+    descriptors: &HashMap<String, SubagentDescriptor>,
+    index_complete: bool,
+) -> Option<SubagentVerdict> {
+    let prompt_parent = records.iter().take(10).find_map(|rec| {
+        ["content", "prompt"].iter().find_map(|key| {
+            rec.get(key)
+                .and_then(Value::as_str)
+                .and_then(parent_reminder_uuid)
+        })
+    });
+    let descriptor = conversation_uuid.and_then(|id| descriptors.get(id));
+    match (prompt_parent, descriptor) {
+        (Some(parent), d) => Some((
+            true,
+            Some(parent),
+            d.and_then(|d| d.role.clone()),
+            d.and_then(|d| d.type_name.clone()),
+        )),
+        (None, Some(d)) => Some((
+            true,
+            Some(d.parent.clone()),
+            d.role.clone(),
+            d.type_name.clone(),
+        )),
+        (None, None) if index_complete => Some((false, None, None, None)),
+        (None, None) => None,
+    }
+}
+
 fn parse_conversation(
     conversation_dir: &Path,
     _scan_root: &ScanRoot,
+    descriptors: &HashMap<String, SubagentDescriptor>,
+    index_complete: bool,
 ) -> Option<NormalizedConversation> {
     let transcript = AntigravityConnector::transcript_path(conversation_dir);
     let records = AntigravityConnector::read_transcript_records(&transcript);
@@ -822,8 +1020,10 @@ fn parse_conversation(
 
     let base = AntigravityConnector::base_of_conversation_dir(conversation_dir);
     let layout = base.and_then(AntigravityLayout::from_base);
-    let external_id = AntigravityConnector::conversation_uuid(conversation_dir)
-        .map(|uuid| layout.unwrap_or(AntigravityLayout::Cli).external_id(&uuid));
+    let conversation_uuid = AntigravityConnector::conversation_uuid(conversation_dir);
+    let external_id = conversation_uuid
+        .as_ref()
+        .map(|uuid| layout.unwrap_or(AntigravityLayout::Cli).external_id(uuid));
     let model = detect_model(&records);
 
     let mut messages: Vec<NormalizedMessage> = Vec::new();
@@ -862,6 +1062,15 @@ fn parse_conversation(
         .and_then(|m| m.content.lines().find(|l| !l.trim().is_empty()))
         .map(|line| line.chars().take(100).collect::<String>());
 
+    // Subagent verdict: prompt reminder first (native order), then the
+    // descriptor index; a complete index with neither signal proves main.
+    let verdict = subagent_verdict(
+        &records,
+        conversation_uuid.as_deref(),
+        descriptors,
+        index_complete,
+    );
+
     let mut metadata = Map::new();
     metadata.insert("source".to_string(), Value::String(AGENT_SLUG.to_string()));
     if let Some(model) = model {
@@ -881,6 +1090,22 @@ fn parse_conversation(
             "data_root".to_string(),
             Value::String(base.to_string_lossy().into_owned()),
         );
+    }
+    if let Some((is_subagent, parent, role, type_name)) = verdict {
+        metadata.insert("is_subagent".to_string(), Value::Bool(is_subagent));
+        if is_subagent {
+            if let Some(parent) = parent {
+                metadata.insert("parent_id".to_string(), Value::String(parent));
+            }
+            metadata.insert(
+                "subagent_role".to_string(),
+                Value::String(role.unwrap_or_else(|| "subagent".to_string())),
+            );
+            metadata.insert(
+                "subagent_type".to_string(),
+                Value::String(type_name.unwrap_or_else(|| "antigravity_subagent".to_string())),
+            );
+        }
     }
 
     Some(NormalizedConversation {
@@ -916,6 +1141,9 @@ fn scan_antigravity_with_hooks(
         if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
             continue;
         }
+        // Built over the whole root regardless of since_ts, so a stale parent's
+        // descriptor still classifies a fresh child on an incremental scan.
+        let (descriptors, index_complete) = subagent_descriptor_index(&root.path);
         for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
             let transcript = AntigravityConnector::transcript_path(&conversation_dir);
             if path_is_excluded(&conversation_dir, &excluded_paths)
@@ -941,7 +1169,9 @@ fn scan_antigravity_with_hooks(
                 continue;
             }
             ctx.tick();
-            if let Some(mut conversation) = parse_conversation(&conversation_dir, &root) {
+            if let Some(mut conversation) =
+                parse_conversation(&conversation_dir, &root, &descriptors, index_complete)
+            {
                 root.apply_workspace_rewrite(&mut conversation);
                 on_conversation(conversation).with_context(|| {
                     format!(
@@ -2327,5 +2557,165 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["step_index"], 0);
         assert_eq!(records[1]["step_index"], 2);
+    }
+
+    // -----------------------------------------------------------------
+    // Subagent verdict metadata (metadata.is_subagent / metadata.parent_id)
+    // -----------------------------------------------------------------
+
+    fn ag_write_conversation(base: &Path, uuid: &str, steps: &[String]) {
+        let logs = base
+            .join("brain")
+            .join(uuid)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let body = steps.join("\n") + "\n";
+        fs::write(logs.join("transcript.jsonl"), body).unwrap();
+    }
+
+    fn ag_user_step(content: &str) -> String {
+        serde_json::json!({
+            "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": "2026-11-12T00:00:00Z", "content": content
+        })
+        .to_string()
+    }
+
+    fn ag_assistant_step() -> String {
+        serde_json::json!({
+            "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "status": "DONE", "created_at": "2026-11-12T00:00:01Z", "content": "done"
+        })
+        .to_string()
+    }
+
+    fn ag_scan(base: &Path) -> Vec<NormalizedConversation> {
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            None,
+        );
+        AntigravityConnector::new().scan(&ctx).unwrap()
+    }
+
+    fn ag_find<'a>(convs: &'a [NormalizedConversation], id: &str) -> &'a Value {
+        &convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("conversation {id} not emitted"))
+            .metadata
+    }
+
+    #[test]
+    fn descriptor_names_subagent_with_parent() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        ag_write_conversation(
+            base,
+            parent,
+            &[
+                ag_user_step("<USER_REQUEST>\nparent task\n</USER_REQUEST>"),
+                ag_assistant_step(),
+            ],
+        );
+        ag_write_conversation(
+            base,
+            child,
+            &[
+                ag_user_step("<USER_REQUEST>\nchild task\n</USER_REQUEST>"),
+                ag_assistant_step(),
+            ],
+        );
+        let sub_dir = base
+            .join("brain")
+            .join(parent)
+            .join(".system_generated")
+            .join("subagents");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(
+            sub_dir.join(format!("{child}.json")),
+            serde_json::json!({"subagentDescriptor": {"role": "researcher", "typeName": "research"}})
+                .to_string(),
+        )
+        .unwrap();
+        let convs = ag_scan(base);
+        assert_eq!(convs.len(), 2);
+        let cm = ag_find(&convs, child);
+        assert_eq!(cm["is_subagent"], serde_json::json!(true));
+        assert_eq!(cm["parent_id"], serde_json::json!(parent));
+        assert_eq!(cm["subagent_role"], serde_json::json!("researcher"));
+        assert_eq!(cm["subagent_type"], serde_json::json!("research"));
+        assert_eq!(
+            ag_find(&convs, parent)["is_subagent"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn prompt_reminder_names_subagent_parent() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let parent = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let child = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        ag_write_conversation(
+            base,
+            parent,
+            &[
+                ag_user_step("<USER_REQUEST>\nparent\n</USER_REQUEST>"),
+                ag_assistant_step(),
+            ],
+        );
+        let reminder = format!(
+            "caller agent (name: \"orchestrator\", id: \"{parent}\")\n<USER_REQUEST>\nchild task\n</USER_REQUEST>"
+        );
+        ag_write_conversation(base, child, &[ag_user_step(&reminder), ag_assistant_step()]);
+        let convs = ag_scan(base);
+        let cm = ag_find(&convs, child);
+        assert_eq!(cm["is_subagent"], serde_json::json!(true));
+        assert_eq!(cm["parent_id"], serde_json::json!(parent));
+    }
+
+    #[test]
+    fn conversation_without_evidence_is_main_when_index_complete() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        ag_write_conversation(
+            base,
+            uuid,
+            &[
+                ag_user_step("<USER_REQUEST>\nplain task\n</USER_REQUEST>"),
+                ag_assistant_step(),
+            ],
+        );
+        let convs = ag_scan(base);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].metadata["is_subagent"], serde_json::json!(false));
+        assert!(convs[0].metadata.get("parent_id").is_none());
+    }
+
+    #[test]
+    fn single_conversation_scan_cannot_prove_main() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        ag_write_conversation(
+            base,
+            uuid,
+            &[
+                ag_user_step("<USER_REQUEST>\nplain task\n</USER_REQUEST>"),
+                ag_assistant_step(),
+            ],
+        );
+        // Scanning the conversation dir itself sees no sibling descriptors, so
+        // the index is incomplete and a main verdict must not be guessed.
+        let conv_dir = base.join("brain").join(uuid);
+        let ctx = ScanContext::with_roots(conv_dir.clone(), vec![ScanRoot::local(conv_dir)], None);
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert!(convs[0].metadata.get("is_subagent").is_none());
     }
 }

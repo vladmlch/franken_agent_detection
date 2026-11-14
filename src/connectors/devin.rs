@@ -311,6 +311,10 @@ impl DevinConnector {
                     "main_chain_nodes": chain.nodes.len(),
                     "off_chain_nodes": chain.off_chain_nodes,
                     "source": "sqlite",
+                    // FAD emits only the sessions-table main chains; those are
+                    // provably main sessions. Subagent-tree extraction is a
+                    // separate follow-up and never lands here.
+                    "is_subagent": false,
                 }),
                 messages,
             });
@@ -1406,5 +1410,18 @@ mod tests {
             DevinConnector::database_path_from_root(&missing),
             missing.join("sessions.db")
         );
+    }
+
+    #[test]
+    fn main_chain_session_is_proven_main() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        seed_reference_store(&db_path);
+        let convs = DevinConnector::extract_from_sqlite(&db_path, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        // The sessions-table main chain is provably a main session; the
+        // subagent trees are a separate follow-up and never emitted here.
+        assert_eq!(convs[0].metadata["is_subagent"], json!(false));
+        assert!(convs[0].metadata.get("parent_id").is_none());
     }
 }

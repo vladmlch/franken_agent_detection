@@ -125,15 +125,16 @@ struct ComposerSubagentEvidence {
     own: HashMap<String, ComposerSubagentFlag>,
     /// composerId -> `composerHeaders` / `ItemTable` flag/parent.
     headers: HashMap<String, ComposerSubagentFlag>,
-    /// True when a captured `composerData` row could not be interpreted at all
-    /// (round-8/9 N6 ruling): its payload might have held a
+    /// Identity (`db_path`) of every store whose captured `composerData` rows
+    /// contained at least one row FAD could not interpret at all (round-8/9/10
+    /// N6 ruling): the unreadable payload might have held a
     /// `subagentComposerIds` listing for ANY composer, so it withholds every
-    /// false THE STORE THAT CAPTURED IT would certify — not just its own id.
-    /// Decodable rows' positive/parent evidence is always kept. The flag is
-    /// store-scoped: `extend_subagent_evidence` deliberately does not merge
-    /// it, so an uninterpretable sibling store cannot suppress this store's
-    /// own-header falses.
-    rows_undecodable: bool,
+    /// false certified FROM THAT STORE — but no other store's. The set is
+    /// merged by `extend_subagent_evidence`, so the uncertainty is sticky for
+    /// the whole scan: once ANY read of store S captured an undecodable row,
+    /// no composer of S gets false in this scan even when a later reread of S
+    /// is clean. Decodable rows' positive/parent evidence is always kept.
+    uncertain_stores: HashSet<PathBuf>,
 }
 
 /// One `cursorDiskKV` value cell under a `composerData:*` key. The column is
@@ -826,16 +827,23 @@ impl CursorConnector {
         .map_err(|_| ())
     }
 
-    /// Interpret one `cursorDiskKV` value cell in place: TEXT is the composer
-    /// JSON, NULL an internal marker, a BLOB is lossy-UTF-8 decoded so a
-    /// blob-stored composer JSON keeps its evidence (round-9 N6 — matching the
-    /// native reader); INTEGER/REAL cells are undecodable.
-    fn composer_data_cell(row: &frankensqlite::Row) -> ComposerDataCell {
-        match row.get(1) {
-            Some(SqliteValue::Text(s)) => ComposerDataCell::Text(s.as_str().to_string()),
-            Some(SqliteValue::Blob(b)) => {
-                ComposerDataCell::Text(String::from_utf8_lossy(b).into_owned())
-            }
+    /// Interpret one `cursorDiskKV` value cell at column `idx` in place: TEXT
+    /// and valid-UTF-8 BLOB bytes carry the composer JSON, NULL is an
+    /// internal marker, everything else is undecodable. Decoding is STRICT
+    /// (round-10 N10): a BLOB that is not valid UTF-8 is undecodable — no
+    /// lossy/ignore-errors recovery, because replacement characters inside
+    /// an identifier would invent composers (e.g. `P�`) that can shadow a
+    /// real parent or listing. Raw (non-UTF-8) TEXT gets the same verdict.
+    fn composer_data_cell(row: &frankensqlite::Row, idx: usize) -> ComposerDataCell {
+        match row.get(idx) {
+            Some(SqliteValue::Text(s)) => match s.as_str_checked() {
+                Some(t) => ComposerDataCell::Text(t.to_string()),
+                None => ComposerDataCell::Undecodable,
+            },
+            Some(SqliteValue::Blob(b)) => match std::str::from_utf8(b) {
+                Ok(t) => ComposerDataCell::Text(t.to_string()),
+                Err(_) => ComposerDataCell::Undecodable,
+            },
             Some(SqliteValue::Null) => ComposerDataCell::Null,
             _ => ComposerDataCell::Undecodable,
         }
@@ -846,12 +854,12 @@ impl CursorConnector {
     /// Shared by the bulk row scan and by the targeted lookup's exact per-sid
     /// hits — a fetched hit's own JSON proves subagent/parent even when the
     /// bulk evidence read failed (round-8 N6 residual). A row whose payload
-    /// cannot be interpreted marks the composer's own flag unknown AND the
-    /// whole evidence set `rows_undecodable` — the unreadable payload might
-    /// have listed any composer as a subagent, so it withholds false
-    /// everywhere (round-9 N6), not just for its own id. A payload that is
+    /// cannot be interpreted marks the composer's own flag unknown AND
+    /// records `store` in `uncertain_stores` — the unreadable payload might
+    /// have listed any composer as a subagent, so it withholds every false
+    /// certified from that store (round-9/10 N6). A payload that is
     /// verifiably empty is skipped like the native reader (`if not v`).
-    fn fold_composer_value(ev: &mut ComposerSubagentEvidence, id: &str, value: &str) {
+    fn fold_composer_value(ev: &mut ComposerSubagentEvidence, id: &str, value: &str, store: &Path) {
         if value.trim().is_empty() {
             return;
         }
@@ -867,12 +875,12 @@ impl CursorConnector {
         };
         if !value.trim_start().starts_with('{') {
             mark_unknown(ev);
-            ev.rows_undecodable = true;
+            ev.uncertain_stores.insert(store.to_path_buf());
             return;
         }
         let Ok(parsed) = serde_json::from_str::<ComposerEvidenceJson>(value) else {
             mark_unknown(ev);
-            ev.rows_undecodable = true;
+            ev.uncertain_stores.insert(store.to_path_buf());
             return;
         };
         match &parsed.subagent_composer_ids {
@@ -885,7 +893,9 @@ impl CursorConnector {
             }
             Some(Value::Null) | None => {}
             // A listing FAD cannot read could have named any child.
-            Some(_) => ev.rows_undecodable = true,
+            Some(_) => {
+                ev.uncertain_stores.insert(store.to_path_buf());
+            }
         }
         let mut flag_unknown = false;
         let mut parse_parent = |val: &Option<Value>| -> Option<String> {
@@ -937,6 +947,7 @@ impl CursorConnector {
     fn fold_composer_row_evidence(
         rows: &[(String, ComposerDataCell)],
         ev: &mut ComposerSubagentEvidence,
+        store: &Path,
     ) {
         for (key, cell) in rows {
             let Some(id) = key.strip_prefix("composerData:") else {
@@ -953,9 +964,11 @@ impl CursorConnector {
                             ..ComposerSubagentFlag::default()
                         },
                     );
-                    ev.rows_undecodable = true;
+                    ev.uncertain_stores.insert(store.to_path_buf());
                 }
-                ComposerDataCell::Text(value) => Self::fold_composer_value(ev, id, value),
+                ComposerDataCell::Text(value) => {
+                    Self::fold_composer_value(ev, id, value, store);
+                }
             }
         }
     }
@@ -967,10 +980,11 @@ impl CursorConnector {
     fn composer_subagent_evidence(
         rows: &[(String, ComposerDataCell)],
         conn: &Connection,
+        store: &Path,
         tick: &dyn Fn(),
     ) -> ComposerSubagentEvidence {
         let mut ev = ComposerSubagentEvidence::default();
-        Self::fold_composer_row_evidence(rows, &mut ev);
+        Self::fold_composer_row_evidence(rows, &mut ev, store);
         // Header records are deliberately read AFTER the composer rows
         // (round-8 N7/N8 ordering ruling — see the emit paths).
         ev.headers = Self::read_composer_headers(conn, tick);
@@ -979,8 +993,11 @@ impl CursorConnector {
 
     /// The same evidence, reading the composerData key range itself: the
     /// targeted lookup path opens a store without a prior full read.
+    /// `store` identifies this store for `uncertain_stores` — uncertainty is
+    /// sticky per store for the whole scan (round-10 N6).
     fn composer_subagent_evidence_from_conn(
         conn: &Connection,
+        store: &Path,
         tick: &dyn Fn(),
     ) -> ComposerSubagentEvidence {
         let prefix = "composerData:";
@@ -994,11 +1011,11 @@ impl CursorConnector {
             |row| {
                 tick();
                 let key: String = row.get_typed(0)?;
-                Ok((key, Self::composer_data_cell(row)))
+                Ok((key, Self::composer_data_cell(row, 1)))
             },
         );
         if let Ok(rows) = rows {
-            Self::composer_subagent_evidence(&rows, conn, tick)
+            Self::composer_subagent_evidence(&rows, conn, store, tick)
         } else {
             // The composerData read failed, but header evidence is an
             // independent source: read it instead of discarding it (O1).
@@ -1188,7 +1205,7 @@ impl CursorConnector {
             if conn.execute("PRAGMA busy_timeout = 5000;").is_err() {
                 continue;
             }
-            let db_ev = Self::composer_subagent_evidence_from_conn(&conn, tick);
+            let db_ev = Self::composer_subagent_evidence_from_conn(&conn, db_path, tick);
             Self::extend_subagent_evidence(&mut merged, &db_ev);
         }
         merged
@@ -1213,10 +1230,14 @@ impl CursorConnector {
         for (id, flag) in &extra.headers {
             Self::merge_flag(&mut merged.headers, id.clone(), flag.clone());
         }
-        // `rows_undecodable` is deliberately NOT merged: the uncertainty is
-        // scoped to the store that captured the unreadable row (round-9 N6 —
-        // "that store's" flags are uncertain). An uninterpretable remote
-        // store cannot suppress another store's own-header false.
+        // `uncertain_stores` unions by store identity (round-10 N6): the
+        // uncertainty stays scoped to the store that captured the unreadable
+        // row — an uninterpretable remote store cannot suppress another
+        // store's own-header false — but it is sticky for the whole scan, so
+        // a later clean reread of the same store cannot lift it.
+        merged
+            .uncertain_stores
+            .extend(extra.uncertain_stores.iter().cloned());
     }
 
     /// Resolve one composer's verdict. Positive evidence (a parent link or an
@@ -1264,20 +1285,22 @@ impl CursorConnector {
     /// only an earlier read saw cannot be borrowed when the post-row header
     /// is absent or flagless. The late flag must decode cleanly to false and
     /// no observed component of this composer's own evidence may be
-    /// uninterpretable. `emitting_rows_undecodable` is the EMITTING store's
-    /// own uncertainty flag (round-9 N6): a captured composerData row FAD
-    /// cannot read might have listed any composer, so it withholds every
-    /// false certified from THAT store — but does not propagate cross-store.
+    /// uninterpretable. `store` is the EMITTING store's identity (round-10
+    /// N6): if ANY read of it this scan captured a composerData row FAD could
+    /// not interpret, that payload might have listed any composer, so it
+    /// withholds every false certified from THAT store for the whole scan —
+    /// a later clean reread cannot lift the earlier uncertainty — while
+    /// another store's uncertainty cannot suppress this store's falses.
     fn own_header_certifies_false(
         composer_id: &str,
         own_headers: &HashMap<String, ComposerSubagentFlag>,
         ev: &ComposerSubagentEvidence,
-        emitting_rows_undecodable: bool,
+        store: &Path,
     ) -> bool {
         own_headers
             .get(composer_id)
             .is_some_and(|f| f.is_subagent == Some(false) && !f.flag_unknown)
-            && !emitting_rows_undecodable
+            && !ev.uncertain_stores.contains(store)
             && !ev.own.get(composer_id).is_some_and(|f| f.flag_unknown)
     }
 
@@ -1322,7 +1345,7 @@ impl CursorConnector {
         db_path: &Path,
         since_ts: Option<i64>,
         tick: &dyn Fn(),
-        external_evidence: Option<&ComposerSubagentEvidence>,
+        external_evidence: Option<&mut ComposerSubagentEvidence>,
     ) -> Result<Vec<NormalizedConversation>> {
         let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
             .with_context(|| format!("failed to open Cursor db: {}", db_path.display()))?;
@@ -1364,25 +1387,26 @@ impl CursorConnector {
             |row| {
                 tick();
                 let key: String = row.get_typed(0)?;
-                Ok((key, Self::composer_data_cell(row)))
+                Ok((key, Self::composer_data_cell(row, 1)))
             },
         ) {
             Ok(rows) => {
                 // The header records are read inside the evidence build,
                 // strictly after the composerData capture above.
-                let local_evidence = Self::composer_subagent_evidence(&rows, &conn, tick);
+                let local_evidence = Self::composer_subagent_evidence(&rows, &conn, db_path, tick);
                 // Round-7 N6: the evidence of the exact rows and headers being
                 // emitted is merged into any earlier cross-store evidence
                 // before resolving verdicts — the earlier pass may have run
                 // before these rows were committed, and the current data can
                 // still prove a subagent it missed (an own header that says
                 // isSubagent=false but carries a parent id is a subagent with
-                // that parent, never a main).
-                let mut merged;
+                // that parent, never a main). The merge extends the shared map
+                // in place (round-10 O5): positives/parents and store
+                // uncertainty captured here stay visible to every later store
+                // and to the targeted-lookup pass of this scan.
                 let evidence = if let Some(ev) = external_evidence {
-                    merged = ev.clone();
-                    Self::extend_subagent_evidence(&mut merged, &local_evidence);
-                    &merged
+                    Self::extend_subagent_evidence(ev, &local_evidence);
+                    &*ev
                 } else {
                     &local_evidence
                 };
@@ -1411,7 +1435,7 @@ impl CursorConnector {
                                 &id,
                                 own_headers,
                                 evidence,
-                                local_evidence.rows_undecodable,
+                                db_path,
                             );
                             Self::apply_subagent_verdict(
                                 &mut conv,
@@ -2928,19 +2952,20 @@ impl CursorConnector {
         }
     }
 
-    /// The `composerData:<sid>` value of one store, if present: a
-    /// primary-key point query (F8: never a value-predicated scan). NULL
-    /// values count as absent, mirroring the full scan's NULL skip.
-    fn composer_row_for_sid(conn: &Connection, sid: &str) -> Result<Option<String>> {
+    /// The `composerData:<sid>` value cell of one store, if the row exists: a
+    /// primary-key point query (F8: never a value-predicated scan). Shares the
+    /// range scan's storage-class semantics (`composer_data_cell`): TEXT and
+    /// valid-UTF-8 BLOB bytes carry the composer JSON, NULL counts as absent,
+    /// and a non-UTF-8 BLOB is undecodable — never lossy-decoded (round-10
+    /// N10), so malformed bytes cannot invent an identifier on this path.
+    fn composer_cell_for_sid(conn: &Connection, sid: &str) -> Result<Option<ComposerDataCell>> {
         let key = format!("composerData:{sid}");
         let rows = conn.query_map_collect(
             "SELECT value FROM cursorDiskKV WHERE key = ?",
             params![key.as_str()],
-            // A blob-stored composer JSON decodes like TEXT (round-9 N6 —
-            // same storage classes as the range scan's composer_data_cell).
-            |row| Self::text_or_bytes_column(row, 0),
+            |row| Ok(Self::composer_data_cell(row, 0)),
         )?;
-        Ok(rows.into_iter().flatten().next())
+        Ok(rows.into_iter().next())
     }
 
     /// Resolve the Composer conversations for `sids` from db files an
@@ -2969,7 +2994,7 @@ impl CursorConnector {
         db_paths: &[(ScanRoot, PathBuf)],
         sids: &[String],
         tick: &dyn Fn(),
-        external_evidence: Option<&ComposerSubagentEvidence>,
+        mut external_evidence: Option<&mut ComposerSubagentEvidence>,
     ) -> (HashMap<String, Option<NormalizedConversation>>, Vec<String>) {
         let mut found: HashMap<String, Option<NormalizedConversation>> = HashMap::new();
         let mut failures: Vec<String> = Vec::new();
@@ -3011,14 +3036,35 @@ impl CursorConnector {
             // obsolete false for a subagent whose rows were emitted.
             // Contradicting evidence committed after the row reads stays
             // unobserved: the accepted B1 limit.
-            let mut local_evidence = Self::composer_subagent_evidence_from_conn(&conn, tick);
+            let mut local_evidence =
+                Self::composer_subagent_evidence_from_conn(&conn, db_path, tick);
             let mut hits: Vec<(String, String)> = Vec::new();
             let mut still_pending: Vec<String> = Vec::new();
             for sid in &pending {
                 tick();
-                match Self::composer_row_for_sid(&conn, sid) {
-                    Ok(Some(value)) => hits.push((sid.clone(), value)),
-                    Ok(None) => still_pending.push(sid.clone()),
+                match Self::composer_cell_for_sid(&conn, sid) {
+                    Ok(Some(ComposerDataCell::Text(value))) => {
+                        hits.push((sid.clone(), value));
+                    }
+                    // The row was captured but cannot be interpreted at all:
+                    // like a bad cell in the bulk read, its payload might have
+                    // listed any composer, so it marks this store uncertain
+                    // for the rest of the scan (round-10 N6/N10).
+                    Ok(Some(ComposerDataCell::Undecodable)) => {
+                        Self::merge_flag(
+                            &mut local_evidence.own,
+                            sid.clone(),
+                            ComposerSubagentFlag {
+                                flag_unknown: true,
+                                ..ComposerSubagentFlag::default()
+                            },
+                        );
+                        local_evidence.uncertain_stores.insert(db_path.clone());
+                        still_pending.push(sid.clone());
+                    }
+                    Ok(Some(ComposerDataCell::Null) | None) => {
+                        still_pending.push(sid.clone());
+                    }
                     Err(error) => {
                         tracing::warn!(
                             db = %db_path.display(),
@@ -3035,7 +3081,7 @@ impl CursorConnector {
             // success — the exact row being emitted is itself positive/parent
             // evidence.
             for (sid, value) in &hits {
-                Self::fold_composer_value(&mut local_evidence, sid, value);
+                Self::fold_composer_value(&mut local_evidence, sid, value, db_path);
             }
             // The own-header flags are read AGAIN after the composer rows
             // (the evidence build read them earlier). The late flags merge
@@ -3050,12 +3096,13 @@ impl CursorConnector {
             }
             // Round-7 N6: merge this store's current positive/parent evidence
             // into the earlier cross-store evidence before resolving verdicts —
-            // the cached pass may predate the very rows being emitted.
-            let mut merged;
-            let evidence = if let Some(ev) = external_evidence {
-                merged = ev.clone();
-                Self::extend_subagent_evidence(&mut merged, &local_evidence);
-                &merged
+            // the cached pass may predate the very rows being emitted. The
+            // merge extends the shared map in place (round-10 O5): everything
+            // captured here — positives, parents and this store's uncertainty —
+            // stays visible to every later store probed this scan.
+            let evidence = if let Some(ev) = external_evidence.as_deref_mut() {
+                Self::extend_subagent_evidence(ev, &local_evidence);
+                &*ev
             } else {
                 &local_evidence
             };
@@ -3074,12 +3121,8 @@ impl CursorConnector {
                     Some(&conn),
                 );
                 if let Some(mut composer_conv) = parsed {
-                    let own_header_false = Self::own_header_certifies_false(
-                        &sid,
-                        own_headers,
-                        evidence,
-                        local_evidence.rows_undecodable,
-                    );
+                    let own_header_false =
+                        Self::own_header_certifies_false(&sid, own_headers, evidence, db_path);
                     Self::apply_subagent_verdict(
                         &mut composer_conv,
                         &sid,
@@ -3201,7 +3244,7 @@ impl CursorConnector {
                 db_path,
                 ctx.since_ts,
                 &tick,
-                cross_db_evidence.as_ref(),
+                cross_db_evidence.as_mut(),
             ) {
                 Ok(convs) => {
                     let mut kept = 0;
@@ -3266,7 +3309,7 @@ impl CursorConnector {
             &all_db_paths,
             &need_lookup,
             &tick,
-            cross_db_evidence.as_ref(),
+            cross_db_evidence.as_mut(),
         );
         for (root, transcript) in fresh_transcripts {
             ctx.tick();
@@ -9201,7 +9244,7 @@ mod cursor_fragment_merge_tests {
         let dbs = vec![(ScanRoot::local(dir.path().to_path_buf()), db.clone())];
         // The cached pass predates the commit — exactly what a scan's earlier
         // evidence pass returns for a store whose rows arrived afterwards.
-        let cached = CursorConnector::collect_cross_db_evidence(&dbs, &|| {});
+        let mut cached = CursorConnector::collect_cross_db_evidence(&dbs, &|| {});
         assert!(
             !cached.child_to_parent.contains_key(child),
             "fixture: the cached pass must predate the commit"
@@ -9249,7 +9292,7 @@ mod cursor_fragment_merge_tests {
         w.execute("COMMIT").unwrap();
         drop(w);
         let convs =
-            CursorConnector::extract_from_db_with_evidence(&db, None, &|| {}, Some(&cached))
+            CursorConnector::extract_from_db_with_evidence(&db, None, &|| {}, Some(&mut cached))
                 .unwrap();
         let c = convs
             .iter()
@@ -9296,7 +9339,7 @@ mod cursor_fragment_merge_tests {
         .unwrap();
         drop(conn);
         let dbs = vec![(ScanRoot::local(dir.path().to_path_buf()), db.clone())];
-        let cached = CursorConnector::collect_cross_db_evidence(&dbs, &|| {});
+        let mut cached = CursorConnector::collect_cross_db_evidence(&dbs, &|| {});
         let w = Connection::open(db.to_string_lossy().as_ref()).unwrap();
         w.execute("BEGIN").unwrap();
         for (id, val) in [
@@ -9333,7 +9376,7 @@ mod cursor_fragment_merge_tests {
             &dbs,
             &[child.to_string()],
             &|| {},
-            Some(&cached),
+            Some(&mut cached),
         );
         assert!(failures.is_empty());
         let resolved = found[child].as_ref().unwrap();
@@ -9441,7 +9484,7 @@ mod cursor_fragment_merge_tests {
             (ScanRoot::local(dir.path().to_path_buf()), db.clone()),
             (ScanRoot::local(dir2.path().to_path_buf()), db2),
         ];
-        let cached = CursorConnector::collect_cross_db_evidence(&dbs, &|| {});
+        let mut cached = CursorConnector::collect_cross_db_evidence(&dbs, &|| {});
         let (found, failures) = CursorConnector::lookup_composer_conversations_with_evidence(
             &dbs,
             &[
@@ -9451,7 +9494,7 @@ mod cursor_fragment_merge_tests {
                 broken.to_string(),
             ],
             &|| {},
-            Some(&cached),
+            Some(&mut cached),
         );
         assert!(failures.is_empty());
         let resolved = found[c].as_ref().unwrap();
@@ -9604,18 +9647,23 @@ mod cursor_fragment_merge_tests {
         assert_eq!(resolved.metadata["parent_id"], json!(p));
     }
 
-    /// N6 residual (round-9): a captured composerData row FAD cannot
-    /// interpret at all — a non-UTF-8 BLOB and an INTEGER cell — withholds
-    /// false for the WHOLE store, not only its own id: the unreadable
-    /// payload might have listed any composer as a subagent. Rows that DO
-    /// decode keep their positives (`child` stays proven by `parent`'s
-    /// listing) and their emission.
+    /// N6 residual (round-9/10): a captured composerData row FAD cannot
+    /// interpret at all withholds false for the WHOLE store, not only its own
+    /// id — the unreadable payload might have listed any composer as a
+    /// subagent. Each undecodable storage form is pinned in its OWN store so
+    /// each must independently withhold: db1 carries a non-UTF-8 BLOB; db2
+    /// carries a raw INTEGER — its `value` column is declared without a type
+    /// so it has no affinity and 42 really stores as INTEGER (a TEXT-affinity
+    /// column would coerce it to "42" and never reach the undecodable arm —
+    /// round-10 M3). Rows that DO decode keep their positives.
     #[test]
     fn undecodable_composer_cells_withhold_store_false() {
         let main = "eeeeeeee-0000-4000-800c-00000000000e";
         let flagless = "eeeeeeee-0000-4000-800c-00000000000f";
         let parent = "eeeeeeee-0000-4000-800c-000000000010";
         let child = "eeeeeeee-0000-4000-800c-000000000011";
+        let main_i = "eeeeeeee-0000-4000-800c-000000000012";
+        // Store 1 — the non-UTF-8 BLOB cell.
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("state.vscdb");
         let conn = verdict_test_db(&db);
@@ -9646,15 +9694,10 @@ mod cursor_fragment_merge_tests {
             )
             .unwrap();
         }
-        // Genuinely undecodable rows: a BLOB whose bytes are not UTF-8
-        // (lossy decode yields U+FFFD, still not JSON) and an INTEGER cell
-        // no JSON reading can interpret.
         conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:z_blob', X'80FF')",
         )
         .unwrap();
-        conn.execute("INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:z_int', 42)")
-            .unwrap();
         conn.execute(
             "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
         )
@@ -9667,10 +9710,60 @@ mod cursor_fragment_merge_tests {
             .unwrap();
         }
         drop(conn);
+        // Store 2 — the raw INTEGER cell on a no-affinity column.
+        let dir_i = TempDir::new().unwrap();
+        let db_i = dir_i.path().join("state.vscdb");
+        let conn_i = verdict_test_db(&db_i);
+        conn_i.execute("DROP TABLE cursorDiskKV").unwrap();
+        // An untyped column carries no affinity: INTEGER stays INTEGER, TEXT
+        // stays TEXT — SQLite's storage-class rule the verdict relies on.
+        conn_i
+            .execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value)")
+            .unwrap();
+        conn_i
+            .execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{main_i}").as_str(),
+                    "{\"text\": \"mi\", \"createdAt\": \"2026-11-12T00:00:00Z\"}"
+                ],
+            )
+            .unwrap();
+        conn_i
+            .execute("INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:z_int', 42)")
+            .unwrap();
+        // Independently assert the fixture reached the INTEGER storage class —
+        // the assertion below means nothing if 42 silently stored as TEXT.
+        let stored: String = conn_i
+            .query_map_collect(
+                "SELECT typeof(value) FROM cursorDiskKV WHERE key = 'composerData:z_int'",
+                params![],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            stored, "integer",
+            "fixture: 42 must store as INTEGER on the no-affinity column"
+        );
+        conn_i
+            .execute(
+                "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
+            )
+            .unwrap();
+        conn_i
+            .execute_compat(
+                "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+                params![main_i, 0i64],
+            )
+            .unwrap();
+        drop(conn_i);
         let v = cursor_verdicts(&db, None);
         assert!(
             v[main].get("is_subagent").is_none(),
-            "undecodable captured rows withhold every false in the store — \
+            "the non-UTF-8 BLOB withholds every false in its store — \
              `main`'s clean own-header false stays unemitted"
         );
         assert!(
@@ -9680,12 +9773,312 @@ mod cursor_fragment_merge_tests {
         assert_eq!(
             v[child]["is_subagent"],
             json!(true),
-            "decodable rows keep their positive evidence past the bad cells"
+            "decodable rows keep their positive evidence past the bad cell"
         );
         assert_eq!(v[child]["parent_id"], json!(parent));
         assert!(
-            !v.contains_key("z_blob") && !v.contains_key("z_int"),
-            "undecodable cells are not emitted as conversations"
+            !v.contains_key("z_blob"),
+            "the undecodable BLOB is not emitted as a conversation"
+        );
+        let v_i = cursor_verdicts(&db_i, None);
+        assert!(
+            v_i[main_i].get("is_subagent").is_none(),
+            "the raw INTEGER cell independently withholds every false in ITS \
+             store — the BLOB case cannot mask it"
+        );
+        assert!(
+            !v_i.contains_key("z_int"),
+            "the undecodable INTEGER cell is not emitted as a conversation"
+        );
+    }
+
+    /// N6 residual (round-10): store uncertainty is sticky for the whole
+    /// scan. The cross-store evidence pass reads store A while it still
+    /// holds a row FAD cannot interpret; the writer then replaces that row
+    /// with NULL before A's emitting reread. The reread sees a clean store —
+    /// but the earlier capture already marked A uncertain, so A's own-header
+    /// false is withheld anyway: the bad payload might have listed any
+    /// composer of A.
+    #[test]
+    fn captured_undecodable_row_keeps_store_uncertain_past_clean_reread() {
+        let c = "aaaaaaa1-0000-4000-800d-00000000000c";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{c}").as_str(),
+                "{\"text\": \"child\", \"createdAt\": \"2026-11-12T00:00:00Z\"}"
+            ],
+        )
+        .unwrap();
+        // The row the evidence pass will fail to interpret.
+        conn.execute("INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:p', X'80FF')")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![c, 0i64],
+        )
+        .unwrap();
+        drop(conn);
+        let dir_b = TempDir::new().unwrap();
+        let db_b = dir_b.path().join("state.vscdb");
+        drop(verdict_test_db(&db_b));
+        let dbs = vec![
+            (ScanRoot::local(dir.path().to_path_buf()), db.clone()),
+            (ScanRoot::local(dir_b.path().to_path_buf()), db_b),
+        ];
+        let mut cached = CursorConnector::collect_cross_db_evidence(&dbs, &|| {});
+        // Between the evidence pass and the emitting reread, the writer
+        // replaces the unreadable row with a NULL marker — the reread of A
+        // now looks clean.
+        let w = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        w.execute("UPDATE cursorDiskKV SET value = NULL WHERE key = 'composerData:p'")
+            .unwrap();
+        drop(w);
+        let convs =
+            CursorConnector::extract_from_db_with_evidence(&db, None, &|| {}, Some(&mut cached))
+                .unwrap();
+        let resolved = convs
+            .iter()
+            .find(|cv| cv.external_id.as_deref() == Some(c))
+            .expect("C's TEXT row still emits");
+        assert!(
+            resolved.metadata.get("is_subagent").is_none(),
+            "the earlier capture of A's undecodable row stays authoritative \
+             for the whole scan — a clean reread cannot lift it"
+        );
+    }
+
+    /// The same stickiness on the targeted-lookup path (round-10 N6): the
+    /// evidence pass captured the undecodable row; the clean reread during
+    /// lookup must not permit C's own-header false.
+    #[test]
+    fn lookup_captured_undecodable_row_keeps_store_uncertain_past_clean_reread() {
+        let c = "aaaaaaa2-0000-4000-800d-00000000000c";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{c}").as_str(),
+                "{\"text\": \"child\", \"createdAt\": \"2026-11-12T00:00:00Z\"}"
+            ],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:p', X'80FF')")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![c, 0i64],
+        )
+        .unwrap();
+        drop(conn);
+        let dir_b = TempDir::new().unwrap();
+        let db_b = dir_b.path().join("state.vscdb");
+        drop(verdict_test_db(&db_b));
+        let dbs = vec![
+            (ScanRoot::local(dir.path().to_path_buf()), db.clone()),
+            (ScanRoot::local(dir_b.path().to_path_buf()), db_b),
+        ];
+        let mut cached = CursorConnector::collect_cross_db_evidence(&dbs, &|| {});
+        let w = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        w.execute("UPDATE cursorDiskKV SET value = NULL WHERE key = 'composerData:p'")
+            .unwrap();
+        drop(w);
+        let (found, failures) = CursorConnector::lookup_composer_conversations_with_evidence(
+            &dbs,
+            &[c.to_string()],
+            &|| {},
+            Some(&mut cached),
+        );
+        assert!(failures.is_empty());
+        let resolved = found[c].as_ref().unwrap();
+        assert!(
+            resolved.metadata.get("is_subagent").is_none(),
+            "the earlier capture of A's undecodable row stays authoritative \
+             for the whole scan — a clean reread cannot lift it"
+        );
+    }
+
+    /// N10 (round-10): malformed UTF-8 inside a BLOB identifier must never
+    /// be lossy-decoded into an invented composer — `P\xff` cannot become
+    /// `P�` and shadow the parent the composer's own header names. Under
+    /// strict classification the whole cell is undecodable: C is not
+    /// emitted at all (its conversation cannot be decoded), and the store
+    /// stays uncertain, so `main`'s clean own-header false is withheld.
+    #[test]
+    fn non_utf8_blob_parent_id_is_undecodable_not_invented() {
+        let c = "bbbbbbb1-0000-4000-800d-00000000000c";
+        let p = "bbbbbbb1-0000-4000-800d-00000000000p";
+        let main = "bbbbbbb1-0000-4000-800d-0000000000e0";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        // C's row is a BLOB whose bytes are invalid UTF-8 right inside the
+        // parentComposerId identifier.
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{c}").as_str(),
+                b"{\"text\":\"child\",\"parentComposerId\":\"P\xff\",\"createdAt\":\"2026-11-12T00:00:00Z\"}"
+                    .to_vec()
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{main}").as_str(),
+                "{\"text\": \"m\", \"createdAt\": \"2026-11-12T00:00:00Z\"}"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER, parentComposerId TEXT)",
+        )
+        .unwrap();
+        // The known-header-parent contrast: C's own header already names
+        // parent P — the corrupted identifier must never reach the output
+        // as `P�`, nor replace the known parent.
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent, parentComposerId) VALUES (?, ?, ?)",
+            params![c, 1i64, p],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![main, 0i64],
+        )
+        .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        assert!(
+            !v.contains_key(c),
+            "a non-UTF-8 BLOB is undecodable — no invented parent identifier \
+             reaches the output"
+        );
+        assert!(
+            v[main].get("is_subagent").is_none(),
+            "the undecodable cell keeps the whole store uncertain for false"
+        );
+    }
+
+    /// The same malformed-identifier rule on the targeted-lookup path
+    /// (round-10 N10): a non-UTF-8 BLOB hit never lossy-decodes into a
+    /// resolvable conversation, and its capture keeps the store uncertain,
+    /// so `main`'s own-header false is withheld.
+    #[test]
+    fn lookup_non_utf8_blob_parent_id_is_undecodable_not_invented() {
+        let c = "bbbbbbb2-0000-4000-800d-00000000000c";
+        let p = "bbbbbbb2-0000-4000-800d-00000000000p";
+        let main = "bbbbbbb2-0000-4000-800d-0000000000e0";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{c}").as_str(),
+                b"{\"text\":\"child\",\"parentComposerId\":\"P\xff\",\"createdAt\":\"2026-11-12T00:00:00Z\"}"
+                    .to_vec()
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{main}").as_str(),
+                "{\"text\": \"m\", \"createdAt\": \"2026-11-12T00:00:00Z\"}"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER, parentComposerId TEXT)",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent, parentComposerId) VALUES (?, ?, ?)",
+            params![c, 1i64, p],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![main, 0i64],
+        )
+        .unwrap();
+        drop(conn);
+        let (found, failures) = CursorConnector::lookup_composer_conversations(
+            &[(ScanRoot::local(dir.path().to_path_buf()), db)],
+            &[c.to_string(), main.to_string()],
+            &|| {},
+        );
+        assert!(failures.is_empty());
+        assert!(
+            found.get(c).and_then(Option::as_ref).is_none(),
+            "a non-UTF-8 BLOB hit is undecodable — no invented parent \
+             identifier resolves to a conversation"
+        );
+        let resolved = found[main].as_ref().unwrap();
+        assert!(
+            resolved.metadata.get("is_subagent").is_none(),
+            "the undecodable cell keeps the whole store uncertain for false"
+        );
+    }
+
+    /// N10 (round-10): a BLOB `subagentComposerIds` listing whose bytes are
+    /// not valid UTF-8 cannot be lossy-recovered either — the corrupted
+    /// identifier it might have named keeps the whole store uncertain
+    /// instead of either inventing a parent link or being silently ignored.
+    #[test]
+    fn non_utf8_blob_listing_withholds_false() {
+        let c = "ccccccc1-0000-4000-800d-00000000000c";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{c}").as_str(),
+                "{\"text\": \"child\", \"createdAt\": \"2026-11-12T00:00:00Z\"}"
+            ],
+        )
+        .unwrap();
+        // The listing names a child id with a raw 0xFF byte inside — invalid
+        // UTF-8, so the whole row is undecodable and its possible listing of
+        // ANY composer (including C) stays unproven-but-not-disproven.
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:p', X'7B227375626167656E74436F6D706F736572496473223A5B2243FF225D7D')",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![c, 0i64],
+        )
+        .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        assert!(
+            v[c].get("is_subagent").is_none(),
+            "the unrecoverable listing withholds C's own-header false"
+        );
+        assert!(
+            v[c].get("parent_id").is_none(),
+            "and no invented parent link reaches the output"
         );
     }
 

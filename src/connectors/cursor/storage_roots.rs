@@ -6,54 +6,25 @@ use std::path::{Component, Path, PathBuf};
 use super::ScanRoot;
 
 /// Enumerate only the documented workspace level; never walk project trees.
-/// Returns the discovered state.vscdb files plus a completeness bit: false if
-/// any read_dir, directory-entry, or metadata probe failed, so the inventory is
-/// unproven and must not certify a fully-read installation (round-5 N4). A
-/// missing directory or file is ordinary absence, not a failure. Local callers
-/// retain their existing symlink behavior; mirror callers apply the stricter
-/// transport-boundary check below before admitting each file.
-pub(super) fn workspace_db_files(base: &Path) -> (Vec<PathBuf>, bool) {
+/// Local callers retain their existing symlink behavior. Mirror callers apply
+/// the stricter transport-boundary check below before admitting each file.
+pub(super) fn workspace_db_files(base: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let mut complete = true;
     let direct = base.join("state.vscdb");
-    match fs::metadata(&direct) {
-        Ok(meta) if meta.is_file() => files.push(direct),
-        Ok(_) => {}
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) => {}
-        Err(_) => complete = false,
+    if direct.is_file() {
+        files.push(direct);
     }
-    match fs::read_dir(base) {
-        Ok(entries) => {
-            for entry in entries {
-                let Ok(entry) = entry else {
-                    complete = false;
-                    continue;
-                };
-                let file = entry.path().join("state.vscdb");
-                match fs::metadata(&file) {
-                    Ok(meta) if meta.is_file() => files.push(file),
-                    Ok(_) => {}
-                    // A non-directory entry (ENOTDIR) or a missing state.vscdb is
-                    // ordinary absence, not an enumeration failure.
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                        ) => {}
-                    Err(_) => complete = false,
-                }
+    if let Ok(entries) = fs::read_dir(base) {
+        for entry in entries.flatten() {
+            let file = entry.path().join("state.vscdb");
+            if file.is_file() {
+                files.push(file);
             }
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => complete = false,
     }
     files.sort();
     files.dedup();
-    (files, complete)
+    files
 }
 
 /// `None` retains ordinary structural detection (including whole-home scans).
@@ -97,7 +68,7 @@ pub(super) fn mirrored_db_files(root: &ScanRoot) -> Option<Vec<PathBuf>> {
             files.push(global.join("state.vscdb"));
         }
         if let Some(workspaces) = root.mirrored_store(&["Cursor", "User", "workspaceStorage"]) {
-            files.extend(workspace_db_files(&workspaces).0);
+            files.extend(workspace_db_files(&workspaces));
         }
     }
     files.retain(|file| regular_mirror_file(&root.path, file));
@@ -169,31 +140,10 @@ mod tests {
             put(&temp.path().join(relative));
         }
         assert_eq!(
-            workspace_db_files(temp.path()).0,
+            workspace_db_files(temp.path()),
             ["a/state.vscdb", "b/state.vscdb", "state.vscdb"]
                 .map(|relative| temp.path().join(relative))
         );
-        assert!(
-            workspace_db_files(temp.path()).1,
-            "a readable tree enumerates completely"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workspace_enumeration_reports_failure() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("workspaceStorage");
-        put(&base.join("a/state.vscdb"));
-        fs::set_permissions(&base, fs::Permissions::from_mode(0o000)).unwrap();
-        let (files, complete) = workspace_db_files(&base);
-        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            !complete,
-            "a denied read_dir must clear the completeness bit"
-        );
-        assert!(files.is_empty());
     }
 
     #[test]

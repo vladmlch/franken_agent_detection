@@ -32,6 +32,7 @@ use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use frankensqlite::SqliteValue;
 use frankensqlite::compat::RowExt;
 use frankensqlite::params;
 
@@ -122,6 +123,31 @@ struct ComposerSubagentEvidence {
     composer_map_complete: bool,
     /// Every header source (`composerHeaders` / `ItemTable`) was fully read (or absent).
     headers_complete: bool,
+}
+
+/// One `composerHeaders` SQL cell. SQLite columns are dynamically typed, so a
+/// column declared INTEGER can still hold REAL/TEXT/BLOB; the reader interprets
+/// each storage class instead of aborting the table scan on a type mismatch.
+enum HeaderCell {
+    Null,
+    Int(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+    /// The column could not be read at all.
+    Unreadable,
+}
+
+/// One `composerHeaders` row, read tolerantly. `readable == false` means some
+/// column held a shape FAD cannot interpret: the store is marked incomplete,
+/// but the row's readable evidence still counts (a proven subagent stays one).
+struct ComposerHeaderRow {
+    id: String,
+    is_subagent: Option<bool>,
+    parent_id: Option<String>,
+    value: Option<String>,
+    last_updated_at: Option<i64>,
+    readable: bool,
 }
 
 impl CursorConnector {
@@ -546,24 +572,61 @@ impl CursorConnector {
         None
     }
 
-    fn json_opt_bool(value: &Value) -> Option<bool> {
+    /// Native `CursorComposerHeader.from_dict` classifies `isSubagent` with
+    /// Python `bool(...)` (models.py:48): booleans as-is, numbers by `!= 0`,
+    /// and strings by non-emptiness (`"true"`/`"1"` are truthy). Arrays and
+    /// objects are shapes FAD cannot interpret: `None` tells the caller to mark
+    /// the store incomplete rather than guess a verdict.
+    fn native_header_bool(value: &Value) -> Option<bool> {
         match value {
             Value::Bool(b) => Some(*b),
             Value::Number(n) => n
                 .as_i64()
                 .map(|i| i != 0)
                 .or_else(|| n.as_f64().map(|f| f != 0.0)),
+            Value::String(s) => Some(!s.is_empty()),
             _ => None,
         }
     }
 
-    fn non_empty_json_str(obj: &Map<String, Value>, key: &str) -> Option<String> {
-        obj.get(key)
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+    /// `isSubagent` from a header JSON object with native truthiness. A present
+    /// non-null value FAD cannot interpret marks the store incomplete.
+    fn header_bool_field(obj: &Map<String, Value>, complete: &mut bool) -> Option<bool> {
+        match obj.get("isSubagent") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let parsed = Self::native_header_bool(v);
+                if parsed.is_none() {
+                    *complete = false;
+                }
+                parsed
+            }
+        }
     }
 
+    /// A non-empty string id from a header JSON object. A present non-string id
+    /// is an unknown shape (native stringifies it; the orchestrator ruling
+    /// withholds instead): mark the store incomplete and return `None`.
+    fn header_id_field(obj: &Map<String, Value>, key: &str, complete: &mut bool) -> Option<String> {
+        match obj.get(key) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            Some(Value::String(_)) => None,
+            Some(_) => {
+                *complete = false;
+                None
+            }
+        }
+    }
+
+    /// Merge one composer's flag/parent evidence. Positive subagent evidence is
+    /// monotonic: once any source proves `is_subagent = true`, no other source
+    /// (including a newer or partial header) may downgrade it to false/absent,
+    /// and a known `parent_id` is never erased by a source that lacks one. A
+    /// true/false conflict resolves to true. Native overwrites headers by
+    /// `lastUpdatedAt` (discovery.py:198-201, 326-330); FAD deviates deliberately
+    /// because a wrong `false` is worse than a stale positive. Timestamps only
+    /// break ties between two known parents.
     fn merge_flag(
         map: &mut HashMap<String, ComposerSubagentFlag>,
         id: String,
@@ -576,16 +639,19 @@ impl CursorConnector {
             Some(existing) => {
                 let inc_ts = incoming.last_updated_at.unwrap_or(0);
                 let cur_ts = existing.last_updated_at.unwrap_or(0);
-                if inc_ts > cur_ts {
-                    *existing = incoming;
-                } else if inc_ts == cur_ts {
-                    if existing.is_subagent.is_none() {
-                        existing.is_subagent = incoming.is_subagent;
-                    }
-                    if existing.parent_id.is_none() {
-                        existing.parent_id = incoming.parent_id;
-                    }
+                existing.is_subagent = match (existing.is_subagent, incoming.is_subagent) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (a, b) => a.or(b),
+                };
+                if incoming.parent_id.is_some() && (existing.parent_id.is_none() || inc_ts > cur_ts)
+                {
+                    existing.parent_id = incoming.parent_id;
                 }
+                existing.last_updated_at =
+                    match (existing.last_updated_at, incoming.last_updated_at) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
             }
         }
     }
@@ -602,6 +668,96 @@ impl CursorConnector {
                 Err(_) => Err(err),
             },
         }
+    }
+
+    /// Native `_safe_int` truncates `int(float(val))` toward zero.
+    #[allow(clippy::cast_possible_truncation)]
+    fn safe_int_from_f64(v: f64) -> i64 {
+        v as i64
+    }
+
+    fn header_cell(row: &frankensqlite::Row, idx: usize) -> HeaderCell {
+        match row.get(idx) {
+            Some(SqliteValue::Null) => HeaderCell::Null,
+            Some(SqliteValue::Integer(i)) => HeaderCell::Int(*i),
+            Some(SqliteValue::Float(f)) => HeaderCell::Real(*f),
+            Some(SqliteValue::Text(s)) => HeaderCell::Text(s.as_str().to_string()),
+            Some(SqliteValue::Blob(b)) => HeaderCell::Blob(b.to_vec()),
+            None => HeaderCell::Unreadable,
+        }
+    }
+
+    /// Read one `composerHeaders` row without aborting on REAL/TEXT/BLOB cells
+    /// (discovery.py:20-27 parses `lastUpdatedAt` via `_safe_int`). An
+    /// uninterpretable cell clears `readable` so the store is marked
+    /// incomplete, while the row's readable evidence is still returned.
+    fn read_composer_header_row(
+        row: &frankensqlite::Row,
+        sub_idx: Option<usize>,
+        parent_idx: Option<usize>,
+        value_idx: Option<usize>,
+        updated_idx: Option<usize>,
+    ) -> ComposerHeaderRow {
+        let mut out = ComposerHeaderRow {
+            id: String::new(),
+            is_subagent: None,
+            parent_id: None,
+            value: None,
+            last_updated_at: None,
+            readable: true,
+        };
+        match Self::header_cell(row, 0) {
+            HeaderCell::Text(s) => out.id = s,
+            HeaderCell::Null => {}
+            _ => out.readable = false,
+        }
+        if let Some(i) = sub_idx {
+            match Self::header_cell(row, i) {
+                HeaderCell::Null => {}
+                HeaderCell::Int(v) => out.is_subagent = Some(v != 0),
+                HeaderCell::Real(v) => out.is_subagent = Some(v != 0.0),
+                // Native bool(text): any non-empty string is truthy.
+                HeaderCell::Text(s) => out.is_subagent = Some(!s.is_empty()),
+                _ => out.readable = false,
+            }
+        }
+        if let Some(i) = parent_idx {
+            match Self::header_cell(row, i) {
+                HeaderCell::Null => {}
+                HeaderCell::Text(s) if !s.is_empty() => out.parent_id = Some(s),
+                HeaderCell::Text(_) => {}
+                // A non-string id is an unknown shape: withhold, don't guess.
+                _ => out.readable = false,
+            }
+        }
+        if let Some(i) = value_idx {
+            match Self::header_cell(row, i) {
+                HeaderCell::Null => {}
+                HeaderCell::Text(s) => out.value = Some(s),
+                HeaderCell::Blob(b) => out.value = Some(String::from_utf8_lossy(&b).into_owned()),
+                _ => out.readable = false,
+            }
+        }
+        if let Some(i) = updated_idx {
+            match Self::header_cell(row, i) {
+                HeaderCell::Null => {}
+                HeaderCell::Int(v) => out.last_updated_at = Some(v),
+                HeaderCell::Real(v) if v.is_finite() => {
+                    out.last_updated_at = Some(Self::safe_int_from_f64(v));
+                }
+                HeaderCell::Text(s) => {
+                    if let Ok(v) = s.parse::<i64>() {
+                        out.last_updated_at = Some(v);
+                    } else if let Some(v) = s.parse::<f64>().ok().filter(|f| f.is_finite()) {
+                        out.last_updated_at = Some(Self::safe_int_from_f64(v));
+                    } else {
+                        out.readable = false;
+                    }
+                }
+                _ => out.readable = false,
+            }
+        }
+        out
     }
 
     fn sqlite_table_exists(conn: &Connection, table_name: &str) -> Result<bool, ()> {
@@ -676,7 +832,7 @@ impl CursorConnector {
             let is_subagent = match parsed.is_subagent {
                 None | Some(Value::Null) => None,
                 Some(ref v) => {
-                    let parsed_bool = Self::json_opt_bool(v);
+                    let parsed_bool = Self::native_header_bool(v);
                     if parsed_bool.is_none() {
                         complete = false;
                     }
@@ -788,61 +944,60 @@ impl CursorConnector {
                     let sql = format!("SELECT {} FROM composerHeaders", select_cols.join(", "));
                     let rows = conn.query_map_collect(&sql, params![], |row| {
                         tick();
-                        let id = row.get_typed::<Option<String>>(0)?.unwrap_or_default();
-                        let sql_sub = match sub_idx {
-                            Some(i) => row.get_typed::<Option<i64>>(i)?.map(|v| v != 0),
-                            None => None,
-                        };
-                        let sql_parent = match parent_idx {
-                            Some(i) => row
-                                .get_typed::<Option<String>>(i)?
-                                .filter(|s| !s.is_empty()),
-                            None => None,
-                        };
-                        let raw_value = match value_idx {
-                            Some(i) => Self::text_or_bytes_column(row, i)?,
-                            None => None,
-                        };
-                        let sql_updated = match updated_idx {
-                            Some(i) => row.get_typed::<Option<i64>>(i)?,
-                            None => None,
-                        };
-                        Ok((id, sql_sub, sql_parent, raw_value, sql_updated))
+                        Ok(Self::read_composer_header_row(
+                            row,
+                            sub_idx,
+                            parent_idx,
+                            value_idx,
+                            updated_idx,
+                        ))
                     });
                     match rows {
                         Ok(rows) => {
-                            for (id, sql_sub, sql_parent, raw_value, sql_updated) in rows {
+                            for hr in rows {
+                                if !hr.readable {
+                                    headers_complete = false;
+                                }
+                                if hr.id.is_empty() {
+                                    continue;
+                                }
                                 let mut flag = ComposerSubagentFlag {
-                                    is_subagent: sql_sub,
-                                    parent_id: sql_parent.clone(),
-                                    last_updated_at: sql_updated,
+                                    is_subagent: hr.is_subagent,
+                                    parent_id: hr.parent_id.clone(),
+                                    last_updated_at: hr.last_updated_at,
                                 };
-                                if let Some(raw) = raw_value.filter(|s| !s.trim().is_empty()) {
+                                if let Some(raw) = hr.value.filter(|s| !s.trim().is_empty()) {
                                     match serde_json::from_str::<Value>(&raw) {
                                         Ok(Value::Object(obj)) => {
-                                            let val_sub =
-                                                obj.get("isSubagent").and_then(Self::json_opt_bool);
-                                            let val_parent =
-                                                Self::non_empty_json_str(&obj, "parentComposerId");
-                                            let val_parent_fallback =
-                                                Self::non_empty_json_str(&obj, "parentId");
+                                            let val_sub = Self::header_bool_field(
+                                                &obj,
+                                                &mut headers_complete,
+                                            );
+                                            let val_parent = Self::header_id_field(
+                                                &obj,
+                                                "parentComposerId",
+                                                &mut headers_complete,
+                                            );
+                                            let val_parent_fallback = Self::header_id_field(
+                                                &obj,
+                                                "parentId",
+                                                &mut headers_complete,
+                                            );
                                             let val_updated =
                                                 obj.get("lastUpdatedAt").and_then(parse_timestamp);
-                                            flag.is_subagent = val_sub.or(sql_sub);
+                                            flag.is_subagent = val_sub.or(hr.is_subagent);
                                             flag.parent_id =
-                                                val_parent.or(sql_parent).or(val_parent_fallback);
-                                            flag.last_updated_at = match (sql_updated, val_updated)
-                                            {
-                                                (Some(a), Some(b)) => Some(a.max(b)),
-                                                (a, b) => a.or(b),
-                                            };
+                                                val_parent.or(hr.parent_id).or(val_parent_fallback);
+                                            flag.last_updated_at =
+                                                match (hr.last_updated_at, val_updated) {
+                                                    (Some(a), Some(b)) => Some(a.max(b)),
+                                                    (a, b) => a.or(b),
+                                                };
                                         }
                                         _ => headers_complete = false,
                                     }
                                 }
-                                if !id.is_empty() {
-                                    Self::merge_flag(&mut headers, id, flag);
-                                }
+                                Self::merge_flag(&mut headers, hr.id, flag);
                             }
                         }
                         Err(_) => headers_complete = false,
@@ -875,20 +1030,34 @@ impl CursorConnector {
                                             headers_complete = false;
                                             continue;
                                         };
-                                        let id = Self::non_empty_json_str(obj, "composerId")
-                                            .or_else(|| Self::non_empty_json_str(obj, "id"));
+                                        let id = Self::header_id_field(
+                                            obj,
+                                            "composerId",
+                                            &mut headers_complete,
+                                        )
+                                        .or_else(|| {
+                                            Self::header_id_field(obj, "id", &mut headers_complete)
+                                        });
                                         let Some(id) = id else {
                                             continue;
                                         };
                                         let flag = ComposerSubagentFlag {
-                                            is_subagent: obj
-                                                .get("isSubagent")
-                                                .and_then(Self::json_opt_bool),
-                                            parent_id: Self::non_empty_json_str(
+                                            is_subagent: Self::header_bool_field(
+                                                obj,
+                                                &mut headers_complete,
+                                            ),
+                                            parent_id: Self::header_id_field(
                                                 obj,
                                                 "parentComposerId",
+                                                &mut headers_complete,
                                             )
-                                            .or_else(|| Self::non_empty_json_str(obj, "parentId")),
+                                            .or_else(|| {
+                                                Self::header_id_field(
+                                                    obj,
+                                                    "parentId",
+                                                    &mut headers_complete,
+                                                )
+                                            }),
                                             last_updated_at: obj
                                                 .get("lastUpdatedAt")
                                                 .and_then(parse_timestamp),
@@ -931,6 +1100,48 @@ impl CursorConnector {
         };
         let global_db = base.join("globalStorage").join("state.vscdb");
         global_db.is_file() && !included.contains(&dedupe_path_key(&global_db))
+    }
+
+    /// True when `root` mirrors a remote Cursor `workspaceStorage` store (the
+    /// whole directory or a single workspace) and no `globalStorage` database
+    /// from the same transport container was read in this scan. The remote
+    /// host's `globalStorage/state.vscdb` can hold the parent/header evidence
+    /// for these composers, and `storage_roots::mirrored_db_files` copies only
+    /// the requested store, so verdicts from the mirror alone must withhold
+    /// `false`. The local-path check in `has_unfolded_global_sibling` cannot see
+    /// this: a leaf workspace mirror omits the `workspaceStorage` directory name
+    /// and the remote `globalStorage` is not present on the local filesystem.
+    fn remote_workspace_mirror_missing_global(
+        root: &ScanRoot,
+        db_paths: &[(ScanRoot, PathBuf)],
+    ) -> bool {
+        if !root.origin.is_remote() {
+            return false;
+        }
+        let Some(source) = root.mirrored_source_path.as_deref() else {
+            return false;
+        };
+        let parts: Vec<&str> = source
+            .split(['/', '\\'])
+            .filter(|p| !p.is_empty())
+            .collect();
+        let Some(user_start) = parts.windows(2).rposition(|w| w == ["Cursor", "User"]) else {
+            return false;
+        };
+        let suffix = &parts[user_start + 2..];
+        if !matches!(suffix, ["workspaceStorage"] | ["workspaceStorage", _]) {
+            return false;
+        }
+        // A mirror that contributed no store has no composers to withhold for;
+        // do not let an empty/missing mirror root poison unrelated complete stores.
+        if !db_paths.iter().any(|(_, p)| p.starts_with(&root.path)) {
+            return false;
+        }
+        // The mirror's globalStorage counts as read only when some included db
+        // in the same transport container lives under a globalStorage directory.
+        !db_paths.iter().any(|(_, p)| {
+            p.starts_with(&root.path) && p.components().any(|c| c.as_os_str() == "globalStorage")
+        })
     }
 
     /// Aggregate subagent evidence across all discovered Cursor DBs so an
@@ -2835,7 +3046,11 @@ impl CursorConnector {
             .collect();
         let unfolded_global = all_db_paths
             .iter()
-            .any(|(_, p)| Self::has_unfolded_global_sibling(p, &included_db_keys));
+            .any(|(_, p)| Self::has_unfolded_global_sibling(p, &included_db_keys))
+            || ctx
+                .scan_roots
+                .iter()
+                .any(|r| Self::remote_workspace_mirror_missing_global(r, &all_db_paths));
         let needs_cross_db_evidence = all_db_paths.len() > 1 || any_db_excluded || unfolded_global;
         let mut cross_db_evidence: Option<ComposerSubagentEvidence> = None;
 
@@ -6866,6 +7081,587 @@ mod cursor_fragment_merge_tests {
             ticks.load(std::sync::atomic::Ordering::Relaxed) >= 7,
             "expected per-row ticks during evidence scan, got {}",
             ticks.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn newer_partial_header_does_not_erase_proven_subagent_or_parent() {
+        let parent = "aaaaaaaa-0000-4000-8000-000000000001";
+        let child = "aaaaaaaa-0000-4000-8000-000000000002";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{child}").as_str(),
+                json!({"text": "child", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER, parentComposerId TEXT, lastUpdatedAt INTEGER)",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent, parentComposerId, lastUpdatedAt) VALUES (?, ?, ?, ?)",
+            params![child, 1i64, parent, 1_700_000_000_000i64],
+        )
+        .unwrap();
+        // A newer legacy ItemTable header that omits isSubagent/parentComposerId
+        // must not downgrade the proven subagent or erase its known parent.
+        let item =
+            json!([{"composerId": child, "lastUpdatedAt": 1_700_000_001_000i64}]).to_string();
+        conn.execute_compat(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            params!["composer.composerHeaders", item.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        assert_eq!(v[child]["is_subagent"], json!(true));
+        assert_eq!(v[child]["parent_id"], json!(parent));
+    }
+
+    #[test]
+    fn conflicting_header_flags_resolve_to_subagent_true() {
+        let child = "aaaaaaaa-0000-4000-8000-000000000003";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{child}").as_str(),
+                json!({"text": "child", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![child, 0i64],
+        )
+        .unwrap();
+        // Equal (absent) timestamps: an explicit true must win over an
+        // explicit false, never the other way around.
+        let item = json!([{"composerId": child, "isSubagent": true}]).to_string();
+        conn.execute_compat(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            params!["composer.composerHeaders", item.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        assert_eq!(v[child]["is_subagent"], json!(true));
+    }
+
+    #[test]
+    fn cross_db_conflicting_header_flags_resolve_to_subagent_true() {
+        let child = "aaaaaaaa-0000-4000-8000-000000000004";
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let global_dir = base.join("globalStorage");
+        let ws_dir = base.join("workspaceStorage").join("ws1");
+        fs::create_dir_all(&global_dir).unwrap();
+        fs::create_dir_all(&ws_dir).unwrap();
+        let global_db = global_dir.join("state.vscdb");
+        let ws_db = ws_dir.join("state.vscdb");
+        let child_val = json!({"text": "child", "createdAt": "2026-11-12T00:00:00Z"});
+        let g = verdict_test_db(&global_db);
+        g.execute("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)")
+            .unwrap();
+        g.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![child, 0i64],
+        )
+        .unwrap();
+        drop(g);
+        let w = verdict_test_db(&ws_db);
+        w.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{child}").as_str(),
+                child_val.to_string().as_str()
+            ],
+        )
+        .unwrap();
+        w.execute("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, isSubagent INTEGER)")
+            .unwrap();
+        w.execute_compat(
+            "INSERT INTO composerHeaders (composerId, isSubagent) VALUES (?, ?)",
+            params![child, 1i64],
+        )
+        .unwrap();
+        drop(w);
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            None,
+        );
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        let c = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some(child))
+            .unwrap();
+        assert_eq!(c.metadata["is_subagent"], json!(true));
+    }
+
+    #[test]
+    fn header_json_string_is_subagent_is_truthy() {
+        // composerHeaders.value JSON: native bool("true") is True.
+        let a = "aaaaaaaa-0000-4000-8000-000000000005";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{a}").as_str(),
+                json!({"text": "a", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        let hj = json!({"composerId": a, "isSubagent": "true"}).to_string();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, value) VALUES (?, ?)",
+            params![a, hj.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(cursor_verdicts(&db, None)[a]["is_subagent"], json!(true));
+
+        // ItemTable: native bool("1") is True.
+        let b = "aaaaaaaa-0000-4000-8000-000000000006";
+        let dir2 = TempDir::new().unwrap();
+        let db2 = dir2.path().join("state.vscdb");
+        let conn2 = verdict_test_db(&db2);
+        conn2
+            .execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{b}").as_str(),
+                    json!({"text": "b", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        let item = json!([{"composerId": b, "isSubagent": "1"}]).to_string();
+        conn2
+            .execute_compat(
+                "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+                params!["composer.composerHeaders", item.as_str()],
+            )
+            .unwrap();
+        drop(conn2);
+        assert_eq!(cursor_verdicts(&db2, None)[b]["is_subagent"], json!(true));
+
+        // Native bool("false") is also True (any non-empty string): parity.
+        let c = "aaaaaaaa-0000-4000-8000-000000000007";
+        let dir3 = TempDir::new().unwrap();
+        let db3 = dir3.path().join("state.vscdb");
+        let conn3 = verdict_test_db(&db3);
+        conn3
+            .execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{c}").as_str(),
+                    json!({"text": "c", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        let item3 = json!([{"composerId": c, "isSubagent": "false"}]).to_string();
+        conn3
+            .execute_compat(
+                "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+                params!["composer.composerHeaders", item3.as_str()],
+            )
+            .unwrap();
+        drop(conn3);
+        assert_eq!(cursor_verdicts(&db3, None)[c]["is_subagent"], json!(true));
+    }
+
+    #[test]
+    fn header_uninterpretable_values_withhold_false() {
+        let good = "aaaaaaaa-0000-4000-8000-000000000008";
+        let val = json!({"text": "hello", "createdAt": "2026-11-12T00:00:00Z"});
+
+        // A) non-string parentComposerId in composerHeaders.value JSON.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{good}").as_str(),
+                val.to_string().as_str()
+            ],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        let hj = json!({"composerId": good, "parentComposerId": 123}).to_string();
+        conn.execute_compat(
+            "INSERT INTO composerHeaders (composerId, value) VALUES (?, ?)",
+            params![good, hj.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            cursor_verdicts(&db, None)[good]
+                .get("is_subagent")
+                .is_none(),
+            "non-string parentComposerId must withhold false"
+        );
+
+        // B) non-string composerId in ItemTable.
+        let dir2 = TempDir::new().unwrap();
+        let db2 = dir2.path().join("state.vscdb");
+        let conn2 = verdict_test_db(&db2);
+        conn2
+            .execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{good}").as_str(),
+                    val.to_string().as_str()
+                ],
+            )
+            .unwrap();
+        let item = json!([{"composerId": 123, "isSubagent": true}]).to_string();
+        conn2
+            .execute_compat(
+                "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+                params!["composer.composerHeaders", item.as_str()],
+            )
+            .unwrap();
+        drop(conn2);
+        assert!(
+            cursor_verdicts(&db2, None)[good]
+                .get("is_subagent")
+                .is_none(),
+            "non-string composerId must withhold false"
+        );
+
+        // C) unknown isSubagent shape (array) in value JSON.
+        let dir3 = TempDir::new().unwrap();
+        let db3 = dir3.path().join("state.vscdb");
+        let conn3 = verdict_test_db(&db3);
+        conn3
+            .execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{good}").as_str(),
+                    val.to_string().as_str()
+                ],
+            )
+            .unwrap();
+        conn3
+            .execute("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        let hj3 = json!({"composerId": good, "isSubagent": [1]}).to_string();
+        conn3
+            .execute_compat(
+                "INSERT INTO composerHeaders (composerId, value) VALUES (?, ?)",
+                params![good, hj3.as_str()],
+            )
+            .unwrap();
+        drop(conn3);
+        assert!(
+            cursor_verdicts(&db3, None)[good]
+                .get("is_subagent")
+                .is_none(),
+            "array isSubagent must withhold false"
+        );
+
+        // D) unknown isSubagent shape (object) in ItemTable.
+        let dir4 = TempDir::new().unwrap();
+        let db4 = dir4.path().join("state.vscdb");
+        let conn4 = verdict_test_db(&db4);
+        conn4
+            .execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{good}").as_str(),
+                    val.to_string().as_str()
+                ],
+            )
+            .unwrap();
+        let item4 = json!([{"composerId": good, "isSubagent": {"x": 1}}]).to_string();
+        conn4
+            .execute_compat(
+                "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+                params!["composer.composerHeaders", item4.as_str()],
+            )
+            .unwrap();
+        drop(conn4);
+        assert!(
+            cursor_verdicts(&db4, None)[good]
+                .get("is_subagent")
+                .is_none(),
+            "object isSubagent must withhold false"
+        );
+    }
+
+    #[test]
+    fn remote_workspace_mirror_without_global_withholds_false() {
+        for (source, leaf) in [
+            ("~/.config/Cursor/User/workspaceStorage/ws1", "ws1"),
+            (
+                "~/.config/Cursor/User/workspaceStorage",
+                "workspaceStorage/ws1",
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let container = tmp.path().join("mirror_0123456789abcdef");
+            let db = container.join(leaf).join("state.vscdb");
+            fs::create_dir_all(db.parent().unwrap()).unwrap();
+            let conn = verdict_test_db(&db);
+            let main = "aaaaaaaa-0000-4000-8000-000000000009";
+            let parent = "aaaaaaaa-0000-4000-8000-00000000000a";
+            let child = "aaaaaaaa-0000-4000-8000-00000000000b";
+            for (id, v) in [
+                (
+                    main,
+                    json!({"text": "m", "createdAt": "2026-11-12T00:00:00Z"}),
+                ),
+                (
+                    parent,
+                    json!({"text": "p", "subagentComposerIds": [child], "createdAt": "2026-11-12T00:00:00Z"}),
+                ),
+                (
+                    child,
+                    json!({"text": "c", "createdAt": "2026-11-12T00:00:00Z"}),
+                ),
+            ] {
+                conn.execute_compat(
+                    "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                    params![
+                        format!("composerData:{id}").as_str(),
+                        v.to_string().as_str()
+                    ],
+                )
+                .unwrap();
+            }
+            drop(conn);
+            let root = ScanRoot::remote(
+                container.clone(),
+                crate::types::Origin::remote("laptop"),
+                None,
+            )
+            .with_mirrored_source_path(source);
+            let ctx = ScanContext::with_roots(tmp.path().join("state"), vec![root], None);
+            let convs = CursorConnector::new().scan(&ctx).unwrap();
+            let by_id: HashMap<String, Value> = convs
+                .into_iter()
+                .filter_map(|c| c.external_id.map(|id| (id, c.metadata)))
+                .collect();
+            assert!(
+                by_id[main].get("is_subagent").is_none(),
+                "{source}: unmirrored globalStorage must withhold false"
+            );
+            // Positive evidence inside the mirror still proves subagents.
+            assert_eq!(by_id[child]["is_subagent"], json!(true), "{source}");
+            assert_eq!(by_id[child]["parent_id"], json!(parent), "{source}");
+        }
+    }
+
+    #[test]
+    fn remote_workspace_mirror_with_read_global_emits_false() {
+        let tmp = TempDir::new().unwrap();
+        let container = tmp.path().join("mirror_0123456789abcdef");
+        let ws_db = container.join("ws1").join("state.vscdb");
+        let global_db = container.join("globalStorage").join("state.vscdb");
+        fs::create_dir_all(ws_db.parent().unwrap()).unwrap();
+        fs::create_dir_all(global_db.parent().unwrap()).unwrap();
+        let main = "aaaaaaaa-0000-4000-8000-00000000000c";
+        let w = verdict_test_db(&ws_db);
+        w.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{main}").as_str(),
+                json!({"text": "m", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(w);
+        let g = verdict_test_db(&global_db);
+        g.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                "composerData:global-side",
+                json!({"text": "g", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(g);
+        let origin = crate::types::Origin::remote("laptop");
+        let ws_root = ScanRoot::remote(container.clone(), origin.clone(), None)
+            .with_mirrored_source_path("~/.config/Cursor/User/workspaceStorage/ws1");
+        let g_root = ScanRoot::remote(container.clone(), origin, None)
+            .with_mirrored_source_path("~/.config/Cursor/User/globalStorage");
+        let ctx = ScanContext::with_roots(tmp.path().join("state"), vec![ws_root, g_root], None);
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        let c = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some(main))
+            .unwrap();
+        assert_eq!(c.metadata["is_subagent"], json!(false));
+    }
+
+    #[test]
+    fn empty_remote_workspace_mirror_does_not_withhold_from_complete_local_store() {
+        let tmp = TempDir::new().unwrap();
+        // A remote workspaceStorage mirror root whose leaf was never copied:
+        // it contributes no database to the scan.
+        let container = tmp.path().join("mirror_0123456789abcdef");
+        fs::create_dir_all(&container).unwrap();
+        let remote_root = ScanRoot::remote(container, crate::types::Origin::remote("laptop"), None)
+            .with_mirrored_source_path("~/.config/Cursor/User/workspaceStorage/ws1");
+        // An unrelated complete local store.
+        let local_dir = tmp.path().join("local");
+        let local_db = local_dir.join("globalStorage").join("state.vscdb");
+        fs::create_dir_all(local_db.parent().unwrap()).unwrap();
+        let main = "aaaaaaaa-0000-4000-8000-00000000001a";
+        let conn = verdict_test_db(&local_db);
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params![
+                format!("composerData:{main}").as_str(),
+                json!({"text": "m", "createdAt": "2026-11-12T00:00:00Z"})
+                    .to_string()
+                    .as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let ctx = ScanContext::with_roots(
+            tmp.path().join("state"),
+            vec![remote_root, ScanRoot::local(local_dir)],
+            None,
+        );
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        let c = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some(main))
+            .unwrap();
+        assert_eq!(c.metadata["is_subagent"], json!(false));
+    }
+
+    #[test]
+    fn real_or_text_header_columns_do_not_abort_table_scan() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        // Untyped columns keep the exact storage class inserted (no affinity
+        // conversion), so REAL/TEXT values reach the reader as-is.
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT, isSubagent, parentComposerId, lastUpdatedAt)",
+        )
+        .unwrap();
+        let ids = [
+            "aaaaaaaa-0000-4000-8000-000000000011",
+            "aaaaaaaa-0000-4000-8000-000000000012",
+            "aaaaaaaa-0000-4000-8000-000000000013",
+            "aaaaaaaa-0000-4000-8000-000000000014",
+            "aaaaaaaa-0000-4000-8000-000000000015",
+            "aaaaaaaa-0000-4000-8000-000000000016",
+        ];
+        for id in ids {
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    json!({"text": "t", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        }
+        let insert = "INSERT INTO composerHeaders (composerId, isSubagent, parentComposerId, lastUpdatedAt) VALUES (?, ?, ?, ?)";
+        // INTEGER isSubagent + INTEGER lastUpdatedAt (the ordinary shape).
+        conn.execute_compat(insert, params![ids[0], 1i64, "p1", 100i64])
+            .unwrap();
+        // REAL lastUpdatedAt.
+        conn.execute_compat(insert, params![ids[1], 1i64, "p2", 200.5f64])
+            .unwrap();
+        // TEXT lastUpdatedAt (numeric).
+        conn.execute_compat(insert, params![ids[2], 1i64, "p3", "300"])
+            .unwrap();
+        // TEXT isSubagent ("true" is truthy under native bool()).
+        conn.execute_compat(insert, params![ids[3], "true", "p4", 400i64])
+            .unwrap();
+        // REAL isSubagent.
+        conn.execute_compat(insert, params![ids[4], 1.0f64, "p5", 500i64])
+            .unwrap();
+        // REAL isSubagent 0.0 -> explicit false.
+        conn.execute_compat(insert, params![ids[5], 0.0f64, None::<i64>, 600i64])
+            .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        for (id, parent) in ids[..5].iter().copied().zip(["p1", "p2", "p3", "p4", "p5"]) {
+            assert_eq!(v[id]["is_subagent"], json!(true), "{id}");
+            assert_eq!(v[id]["parent_id"], json!(parent), "{id}");
+        }
+        assert_eq!(v[ids[5]]["is_subagent"], json!(false));
+    }
+
+    #[test]
+    fn unreadable_header_row_withholds_false_but_keeps_readable_evidence() {
+        let child = "aaaaaaaa-0000-4000-8000-000000000017";
+        let main = "aaaaaaaa-0000-4000-8000-000000000018";
+        let parent = "aaaaaaaa-0000-4000-8000-000000000019";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = verdict_test_db(&db);
+        for id in [child, main] {
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    format!("composerData:{id}").as_str(),
+                    json!({"text": "t", "createdAt": "2026-11-12T00:00:00Z"})
+                        .to_string()
+                        .as_str()
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "CREATE TABLE composerHeaders (composerId TEXT, isSubagent, parentComposerId, lastUpdatedAt)",
+        )
+        .unwrap();
+        let insert = "INSERT INTO composerHeaders (composerId, isSubagent, parentComposerId, lastUpdatedAt) VALUES (?, ?, ?, ?)";
+        // Unparseable TEXT timestamp: the row is not fully interpretable, but
+        // its readable isSubagent/parentComposerId still prove the subagent.
+        conn.execute_compat(insert, params![child, 1i64, parent, "not-a-timestamp"])
+            .unwrap();
+        conn.execute_compat(insert, params![main, 0i64, None::<i64>, 100i64])
+            .unwrap();
+        drop(conn);
+        let v = cursor_verdicts(&db, None);
+        assert_eq!(v[child]["is_subagent"], json!(true));
+        assert_eq!(v[child]["parent_id"], json!(parent));
+        assert!(
+            v[main].get("is_subagent").is_none(),
+            "an unreadable row must withhold false for the whole store"
         );
     }
 }

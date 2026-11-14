@@ -818,22 +818,41 @@ struct SubagentDescriptor {
 /// Index `brain/<parent>/.system_generated/subagents/<child>.json` descriptors
 /// under a scan target. The filename is the child session id; the parent dir
 /// names the parent. Returns the index and whether it is COMPLETE: a single
-/// conversation dir sees no sibling descriptors, so it cannot prove a main.
-fn subagent_descriptor_index(scan_target: &Path) -> (HashMap<String, SubagentDescriptor>, bool) {
-    if AntigravityConnector::is_conversation_dir(scan_target) {
+/// conversation dir (or sub-path inside one), a walk I/O error, or an excluded
+/// subtree sees incomplete sibling descriptors, so it cannot prove a main.
+fn subagent_descriptor_index(
+    scan_target: &Path,
+    excluded_paths: &[PathBuf],
+) -> (HashMap<String, SubagentDescriptor>, bool) {
+    if scan_target
+        .ancestors()
+        .any(AntigravityConnector::is_conversation_dir)
+    {
         return (HashMap::new(), false);
     }
     let mut index = HashMap::new();
-    for entry in WalkDir::new(scan_target)
+    let mut complete = true;
+    let mut iter = WalkDir::new(scan_target)
         .min_depth(1)
         .max_depth(8)
-        .into_iter()
-        .flatten()
-    {
+        .sort_by_file_name()
+        .into_iter();
+    while let Some(entry_res) = iter.next() {
+        let Ok(entry) = entry_res else {
+            complete = false;
+            continue;
+        };
+        let path = entry.path();
+        if path_is_excluded(path, excluded_paths) {
+            complete = false;
+            if entry.file_type().is_dir() {
+                iter.skip_current_dir();
+            }
+            continue;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
-        let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
@@ -868,7 +887,7 @@ fn subagent_descriptor_index(scan_target: &Path) -> (HashMap<String, SubagentDes
                 type_name,
             });
     }
-    (index, true)
+    (index, complete)
 }
 
 /// role/typeName from a descriptor JSON, preferring `subagentDescriptor` and
@@ -893,23 +912,24 @@ fn read_descriptor_role_type(path: &Path) -> (Option<String>, Option<String>) {
     (field("role"), field("typeName"))
 }
 
+/// Parse an immediate `\s*"<36 hex/dash chars>"` after `id:`.
+fn parse_quoted_uuid(after_id_colon: &str) -> Option<String> {
+    let rest = after_id_colon.trim_start().strip_prefix('"')?;
+    let candidate: String = rest.chars().take(36).collect();
+    (candidate.len() == 36
+        && candidate
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b'-'))
+    .then_some(candidate)
+}
+
 /// The first `id: "<36 hex/dash chars>"` in `scope` (native `id:\s*"`).
 fn find_id_uuid(scope: &str) -> Option<String> {
     let mut from = 0;
     while let Some(rel) = scope[from..].find("id:") {
-        let pos = from + rel;
-        from = pos + 3;
-        let after = scope[from..].trim_start();
-        let Some(rest) = after.strip_prefix('"') else {
-            continue;
-        };
-        let candidate: String = rest.chars().take(36).collect();
-        if candidate.len() == 36
-            && candidate
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() || b == b'-')
-        {
-            return Some(candidate);
+        from += rel + 3;
+        if let Some(uuid) = parse_quoted_uuid(&scope[from..]) {
+            return Some(uuid);
         }
     }
     None
@@ -947,14 +967,14 @@ fn parent_reminder_uuid(text: &str) -> Option<String> {
             consider(pos, uuid);
         }
     }
-    // parent", id: "<uuid>"
+    // parent", id: "<uuid>" (anchored immediately after "parent\",", matching detect.py:16)
     let mut search = 0;
     while let Some(rel) = text[search..].find("parent\",") {
         let pos = search + rel;
         search = pos + "parent\",".len();
         let rest = text[search..].trim_start();
-        if rest.starts_with("id:")
-            && let Some(uuid) = find_id_uuid(rest)
+        if let Some(after_colon) = rest.strip_prefix("id:")
+            && let Some(uuid) = parse_quoted_uuid(after_colon)
         {
             consider(pos, uuid);
         }
@@ -1095,7 +1115,10 @@ fn parse_conversation(
         metadata.insert("is_subagent".to_string(), Value::Bool(is_subagent));
         if is_subagent {
             if let Some(parent) = parent {
-                metadata.insert("parent_id".to_string(), Value::String(parent));
+                let qualified = layout
+                    .unwrap_or(AntigravityLayout::Cli)
+                    .external_id(&parent);
+                metadata.insert("parent_id".to_string(), Value::String(qualified));
             }
             metadata.insert(
                 "subagent_role".to_string(),
@@ -1134,20 +1157,29 @@ fn scan_antigravity_with_hooks(
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
     let excluded_paths = excluded_scan_paths_from_env()?;
+    scan_antigravity_with_exclusions(ctx, hooks, &excluded_paths, on_conversation)
+}
+
+fn scan_antigravity_with_exclusions(
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    excluded_paths: &[PathBuf],
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
     let roots = AntigravityConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for root in roots {
-        if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
+        if !root.path.exists() || path_is_excluded(&root.path, excluded_paths) {
             continue;
         }
         // Built over the whole root regardless of since_ts, so a stale parent's
         // descriptor still classifies a fresh child on an incremental scan.
-        let (descriptors, index_complete) = subagent_descriptor_index(&root.path);
+        let (descriptors, index_complete) = subagent_descriptor_index(&root.path, excluded_paths);
         for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
             let transcript = AntigravityConnector::transcript_path(&conversation_dir);
-            if path_is_excluded(&conversation_dir, &excluded_paths)
-                || path_is_excluded(&transcript, &excluded_paths)
+            if path_is_excluded(&conversation_dir, excluded_paths)
+                || path_is_excluded(&transcript, excluded_paths)
             {
                 continue;
             }
@@ -2717,5 +2749,170 @@ mod tests {
         let convs = AntigravityConnector::new().scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].metadata.get("is_subagent").is_none());
+    }
+
+    #[test]
+    fn excluded_parent_descriptor_is_not_read_and_withholds_false() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let parent = "11111111-1111-4111-8111-111111111111";
+        let child = "22222222-2222-4222-8222-222222222222";
+        ag_write_conversation(base, parent, &[ag_user_step("parent"), ag_assistant_step()]);
+        ag_write_conversation(base, child, &[ag_user_step("child"), ag_assistant_step()]);
+        let sub_dir = base
+            .join("brain")
+            .join(parent)
+            .join(".system_generated")
+            .join("subagents");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(
+            sub_dir.join(format!("{child}.json")),
+            serde_json::json!({"subagentDescriptor": {"role": "worker", "typeName": "worker"}})
+                .to_string(),
+        )
+        .unwrap();
+        let excluded = vec![base.join("brain").join(parent)];
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            None,
+        );
+        let mut convs = Vec::new();
+        scan_antigravity_with_exclusions(
+            &ctx,
+            &mut SourceScanHooks::default(),
+            &excluded,
+            &mut |conv| {
+                convs.push(conv);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some(child));
+        assert!(
+            convs[0].metadata.get("is_subagent").is_none(),
+            "excluded descriptor subtree must leave child verdict absent, not true or false: {:?}",
+            convs[0].metadata
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_descriptor_dir_withholds_false_verdict() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let parent = "33333333-3333-4333-8333-333333333333";
+        let child = "44444444-4444-4444-8444-444444444444";
+        ag_write_conversation(base, parent, &[ag_user_step("parent"), ag_assistant_step()]);
+        ag_write_conversation(base, child, &[ag_user_step("child"), ag_assistant_step()]);
+        let sub_dir = base
+            .join("brain")
+            .join(parent)
+            .join(".system_generated")
+            .join("subagents");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(sub_dir.join(format!("{child}.json")), "{}").unwrap();
+        fs::set_permissions(&sub_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Only run the assertion when the OS enforces directory permissions
+        // (e.g. non-root). Restore permissions before TempDir drops.
+        let enforced = fs::read_dir(&sub_dir).is_err();
+        let convs = ag_scan(base);
+        fs::set_permissions(&sub_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if enforced {
+            let cm = ag_find(&convs, child);
+            assert!(
+                cm.get("is_subagent").is_none(),
+                "unreadable descriptor directory must withhold false verdict: {cm:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sub_conversation_root_withholds_false_verdict() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "55555555-5555-4555-8555-555555555555";
+        ag_write_conversation(base, uuid, &[ag_user_step("plain"), ag_assistant_step()]);
+        let sub_root = base.join("brain").join(uuid).join(".system_generated");
+        let ctx = ScanContext::with_roots(sub_root.clone(), vec![ScanRoot::local(sub_root)], None);
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert!(
+            convs[0].metadata.get("is_subagent").is_none(),
+            "sub-conversation root cannot see sibling descriptors"
+        );
+    }
+
+    #[test]
+    fn parent_reminder_arm_is_anchored_like_native_regex() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let false_positive_uuid = "66666666-6666-4666-8666-666666666666";
+        let main_uuid = "77777777-7777-4777-8777-777777777777";
+        let code_text = format!(
+            "example snippet: parent\", id: 1, other_id: \"x\", id: \"{false_positive_uuid}\""
+        );
+        ag_write_conversation(
+            base,
+            main_uuid,
+            &[ag_user_step(&code_text), ag_assistant_step()],
+        );
+
+        let sub_uuid = "88888888-8888-4888-8888-888888888888";
+        let valid_reminder = format!("parent\",  id: \"{main_uuid}\"\n<USER_REQUEST>\nhi");
+        ag_write_conversation(
+            base,
+            sub_uuid,
+            &[ag_user_step(&valid_reminder), ag_assistant_step()],
+        );
+
+        let convs = ag_scan(base);
+        assert_eq!(
+            ag_find(&convs, main_uuid)["is_subagent"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            ag_find(&convs, sub_uuid)["is_subagent"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            ag_find(&convs, sub_uuid)["parent_id"],
+            serde_json::json!(main_uuid)
+        );
+    }
+
+    #[test]
+    fn ide_layout_qualifies_parent_id_like_external_id() {
+        let dir = TempDir::new().unwrap();
+        let ide_base = dir.path().join(".gemini").join("antigravity");
+        let parent = "99999999-9999-4999-8999-999999999999";
+        let child = "aaaaaaaa-0000-4000-8000-aaaaaaaaaaaa";
+        ag_write_conversation(
+            &ide_base,
+            parent,
+            &[ag_user_step("parent"), ag_assistant_step()],
+        );
+        ag_write_conversation(
+            &ide_base,
+            child,
+            &[ag_user_step("child"), ag_assistant_step()],
+        );
+        let sub_dir = ide_base
+            .join("brain")
+            .join(parent)
+            .join(".system_generated")
+            .join("subagents");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(sub_dir.join(format!("{child}.json")), "{}").unwrap();
+
+        let convs = ag_scan(&ide_base);
+        let cm = ag_find(&convs, &format!("ide/{child}"));
+        assert_eq!(cm["is_subagent"], serde_json::json!(true));
+        assert_eq!(cm["parent_id"], serde_json::json!(format!("ide/{parent}")));
     }
 }

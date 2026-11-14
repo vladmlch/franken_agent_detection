@@ -108,6 +108,7 @@
       }
     ],
     "metadata": {
+      "is_subagent": false,
       "source": "rollout"
     },
     "source_path": "rollout-2026-11-12T22-40-18-01a1d1b4-5529-7cd3-97db-d52326514bc2.jsonl",

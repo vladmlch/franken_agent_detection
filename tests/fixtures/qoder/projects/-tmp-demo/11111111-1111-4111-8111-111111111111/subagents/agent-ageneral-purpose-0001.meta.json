@@ -1,0 +1,7 @@
+{
+  "agentType": "general-purpose",
+  "color": "blue",
+  "description": "Explore demo",
+  "invocationName": "Agent",
+  "toolUseId": "call-subagent-1"
+}

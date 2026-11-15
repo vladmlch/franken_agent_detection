@@ -1,0 +1,13 @@
+{
+  "agentId": "ageneral-purpose-0001",
+  "agentType": "general-purpose",
+  "completedAt": "2026-11-15T10:00:05Z",
+  "createdAt": "2026-11-15T10:00:02Z",
+  "description": "Explore demo",
+  "parentToolUseId": "call-subagent-1",
+  "resolvedModel": "qmodel-demo",
+  "sessionId": "11111111-1111-4111-8111-111111111111",
+  "status": "completed",
+  "summary": "Explored demo module",
+  "taskId": "a0001"
+}

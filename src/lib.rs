@@ -77,8 +77,8 @@ pub use connectors::{
     grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector, muse::MuseConnector,
     normalize_model, omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
     parse_timestamp, percent_decode_utf8, pi_agent::PiAgentConnector,
-    pi_durable::PiDurableConnector, prime_agent::PrimeAgentConnector, qwen::QwenConnector,
-    token_extraction, unwrap_skill_invocations, vibe::VibeConnector,
+    pi_durable::PiDurableConnector, prime_agent::PrimeAgentConnector, qoder::QoderConnector,
+    qwen::QwenConnector, token_extraction, unwrap_skill_invocations, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -169,6 +169,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "pi_agent",
     "pi_durable",
     "prime_agent",
+    "qoder",
     "qwen",
     "shelley",
     "vibe",
@@ -224,6 +225,7 @@ pub fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "pi_agent" | "pi-agent" | "piagent" | "pi_mono" | "pi-mono" => Some("pi_agent"),
         "pi_durable" | "pi-durable" | "pidurable" => Some("pi_durable"),
         "prime_agent" | "prime-agent" | "primeagent" => Some("prime_agent"),
+        "qoder" | "qoder-cli" | "qoder_cli" => Some("qoder"),
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
         "shelley" | "shelley-db" => Some("shelley"),
         "vibe" | "vibe-cli" => Some("vibe"),
@@ -593,6 +595,14 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                 return None;
             }
             Some(vec![PathBuf::from(root).join("sessions")])
+        }
+        "qoder" => {
+            let root = read("QODER_HOME")?;
+            if root.is_empty() {
+                return None;
+            }
+            let home = expand_leading_tilde(&root, dirs::home_dir().as_deref());
+            Some(vec![home.join("projects"), home])
         }
         "qwen" => {
             let root = qwen_runtime_root_from_env()?;
@@ -1274,6 +1284,10 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             }
             maybe_push(&mut out, &["shelley.db"]);
         }
+        "qoder" => {
+            maybe_push(&mut out, &[".qoder", "projects"]);
+            maybe_push(&mut out, &[".qoder"]);
+        }
         "qwen" => {
             maybe_push(&mut out, &[".qwen", "projects"]);
             maybe_push(&mut out, &[".qwen", "tmp"]);
@@ -1858,6 +1872,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 // the wildcard) documents that this emptiness is deliberate.
                 #[allow(clippy::match_same_arms)]
                 "shelley" => vec![],
+                "qoder" => vec![tilde(&[".qoder", "projects"]), tilde(&[".qoder"])],
                 "qwen" => vec![
                     tilde(&[".qwen", "projects"]),
                     tilde(&[".qwen", "tmp"]),

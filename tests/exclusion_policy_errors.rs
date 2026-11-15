@@ -27,7 +27,8 @@ use franken_agent_detection::connectors::{
     grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector, muse::MuseConnector,
     omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
     pi_agent::PiAgentConnector, pi_durable::PiDurableConnector, pi_wire,
-    prime_agent::PrimeAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
+    prime_agent::PrimeAgentConnector, qoder::QoderConnector, qwen::QwenConnector,
+    vibe::VibeConnector,
 };
 use franken_agent_detection::{
     Connector, DiscoveredSourceFile, NormalizedConversation, ScanContext, ScanRoot,
@@ -50,6 +51,7 @@ const PROVIDERS: &[&str] = &[
     "grok",
     "muse",
     "factory",
+    "qoder",
     "qwen",
     "prime_agent",
     "vibe",
@@ -161,6 +163,11 @@ fn case(root: &Path, provider: &'static str) -> Case {
             Box::new(FactoryConnector::new()),
             ".factory/sessions",
             "-work-demo/sess-1.jsonl".to_string(),
+        ),
+        "qoder" => (
+            Box::new(QoderConnector::new()),
+            ".qoder",
+            "projects/demo/11111111-2222-3333-4444-555555555555.jsonl".to_string(),
         ),
         "qwen" => (
             Box::new(QwenConnector::new()),
@@ -358,6 +365,15 @@ impl Fixture {
                             "role": "user",
                             "content": [{"type": "text", "text": text}]
                         }
+                    }),
+                    "qoder" => json!({
+                        "uuid": "u1",
+                        "parentUuid": null,
+                        "sessionId": "11111111-2222-3333-4444-555555555555",
+                        "timestamp": "2026-10-09T00:00:00Z",
+                        "cwd": "/work/demo",
+                        "type": "user",
+                        "message": {"role": "user", "content": text}
                     }),
                     "qwen" => json!({
                         "uuid": "u1",

@@ -39,7 +39,7 @@ pub(super) fn resolve(container: &Path, source: &str, store: &[&str]) -> Option<
             "sessions",
         ] | [".prime" | ".pi" | ".omp", "agent", "sessions"]
             | [".local", "share", "omp" | "muse" | "goose", "sessions"]
-            | [".qwen" | ".claude", "projects"]
+            | [".qwen" | ".claude" | ".qoder", "projects"]
             | [".qwen", "tmp"]
             | [".kiro", "sessions", "cli"]
             | [".openhands" | ".openhands-state", "conversations"]

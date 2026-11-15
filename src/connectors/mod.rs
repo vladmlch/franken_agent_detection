@@ -45,6 +45,7 @@ pub mod pi_agent;
 pub mod pi_durable;
 pub mod pi_wire;
 pub mod prime_agent;
+pub mod qoder;
 pub mod qwen;
 pub mod scan;
 #[cfg(feature = "shelley")]
@@ -327,6 +328,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("copilot_cli", || {
             Box::new(copilot_cli::CopilotCliConnector::new())
         }),
+        ("qoder", || Box::new(qoder::QoderConnector::new())),
         ("qwen", || Box::new(qwen::QwenConnector::new())),
         ("grok", || Box::new(grok::GrokConnector::new())),
         ("devin", || Box::new(devin::DevinConnector::new())),

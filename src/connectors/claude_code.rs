@@ -922,7 +922,6 @@ fn scan_claude_with_readers<R: BufRead>(
             let mut session_id: Option<String> = None;
             let mut cli_session_id: Option<String> = None;
             let git_branch: Option<String> = None;
-            let json_title: Option<String>;
             let mut permission_mode: Option<String> = None;
             let mut source_kind = "claude_code";
 
@@ -963,10 +962,8 @@ fn scan_claude_with_readers<R: BufRead>(
                         continue;
                     }
                     Err(error) => {
-                        match error.downcast::<io::Error>() {
-                            Ok(io_err) => read_failures.record(&path, "read", io_err),
-                            Err(other) => return Err(other),
-                        }
+                        let io_err = error.downcast::<io::Error>()?;
+                        read_failures.record(&path, "read", io_err);
                         // Never emit or certify an incompletely read source.
                         continue 'sources;
                     }
@@ -1009,115 +1006,112 @@ fn scan_claude_with_readers<R: BufRead>(
                     })?;
                 }
                 continue;
-            } else {
-                if let Ok(metadata) = fs::metadata(&path)
-                    && metadata.len() > 100 * 1024 * 1024
-                {
-                    tracing::debug!(
-                        path = %path.display(),
-                        size_bytes = metadata.len(),
-                        "skipping large file (>100MB)"
-                    );
+            }
+            if let Ok(metadata) = fs::metadata(&path)
+                && metadata.len() > 100 * 1024 * 1024
+            {
+                tracing::debug!(
+                    path = %path.display(),
+                    size_bytes = metadata.len(),
+                    "skipping large file (>100MB)"
+                );
+                continue;
+            }
+
+            let content_string = match read_json(&path) {
+                Ok(content) => content,
+                Err(error) => {
+                    read_failures.record(&path, "read", error);
                     continue;
                 }
-
-                let content_string = match read_json(&path) {
-                    Ok(content) => content,
-                    Err(error) => {
-                        read_failures.record(&path, "read", error);
-                        continue;
-                    }
-                };
-                let val: Value = match serde_json::from_str(&content_string) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::debug!(path = %path.display(), error = %e, "claude_code skipping malformed JSON");
-                        continue;
-                    }
-                };
-
-                json_title = ClaudeCodeConnector::non_empty_json_string(&val, "title");
-                if workspace.is_none() {
-                    workspace =
-                        ClaudeCodeConnector::non_empty_json_string(&val, "cwd").map(PathBuf::from);
+            };
+            let val: Value = match serde_json::from_str(&content_string) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(path = %path.display(), error = %e, "claude_code skipping malformed JSON");
+                    continue;
                 }
-                if session_id.is_none() {
-                    session_id = ClaudeCodeConnector::non_empty_json_string(&val, "sessionId");
-                }
-                if cli_session_id.is_none() {
-                    cli_session_id =
-                        ClaudeCodeConnector::non_empty_json_string(&val, "cliSessionId");
-                }
-                if permission_mode.is_none() {
-                    permission_mode =
-                        ClaudeCodeConnector::non_empty_json_string(&val, "permissionMode");
-                }
-                let sidecar_created_at = val.get("createdAt").and_then(parse_timestamp);
-                let sidecar_last_activity_at = val.get("lastActivityAt").and_then(parse_timestamp);
-                started_at = started_at
-                    .or(sidecar_created_at)
-                    .or(sidecar_last_activity_at);
-                ended_at = ended_at.or(sidecar_last_activity_at).or(sidecar_created_at);
+            };
 
-                if let Some(arr) = val.get("messages").and_then(|m| m.as_array()) {
-                    for item in arr {
-                        let role = item
-                            .get("role")
-                            .or_else(|| item.get("type"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("agent");
-                        let created = item
-                            .get("timestamp")
-                            .or_else(|| item.get("time"))
-                            .and_then(parse_timestamp);
-
-                        started_at = match (started_at, created) {
-                            (Some(curr), Some(ts)) => Some(curr.min(ts)),
-                            (None, Some(ts)) => Some(ts),
-                            (other, None) => other,
-                        };
-                        ended_at = match (ended_at, created) {
-                            (Some(curr), Some(ts)) => Some(curr.max(ts)),
-                            (None, Some(ts)) => Some(ts),
-                            (Some(curr), None) => Some(curr),
-                            (None, None) => None,
-                        };
-
-                        let content_val = item.get("content").or_else(|| item.get("text"));
-                        let content_str = content_val
-                            .map(retained_content::flatten_claude_content)
-                            .unwrap_or_default();
-
-                        if content_str.trim().is_empty() {
-                            continue;
-                        }
-
-                        let mut invocations = content_val
-                            .map_or_else(Vec::new, extract_invocations_from_content_blocks);
-                        unwrap_skill_invocations(&mut invocations);
-
-                        messages.push(NormalizedMessage {
-                            idx: 0,
-                            role: role.to_string(),
-                            author: None,
-                            created_at: created,
-                            content: content_str,
-                            extra: item.clone(),
-                            invocations,
-                            snippets: Vec::new(),
-                        });
-                    }
-                }
-                if messages.is_empty()
-                    && ClaudeCodeConnector::path_is_desktop_sidecar(&path)
-                    && let Some(message) =
-                        ClaudeCodeConnector::desktop_sidecar_metadata_message(&val)
-                {
-                    source_kind = "claude_code_desktop_sidecar";
-                    messages.push(message);
-                }
-                crate::types::reindex_messages(&mut messages);
+            let json_title = ClaudeCodeConnector::non_empty_json_string(&val, "title");
+            if workspace.is_none() {
+                workspace =
+                    ClaudeCodeConnector::non_empty_json_string(&val, "cwd").map(PathBuf::from);
             }
+            if session_id.is_none() {
+                session_id = ClaudeCodeConnector::non_empty_json_string(&val, "sessionId");
+            }
+            if cli_session_id.is_none() {
+                cli_session_id = ClaudeCodeConnector::non_empty_json_string(&val, "cliSessionId");
+            }
+            if permission_mode.is_none() {
+                permission_mode =
+                    ClaudeCodeConnector::non_empty_json_string(&val, "permissionMode");
+            }
+            let sidecar_created_at = val.get("createdAt").and_then(parse_timestamp);
+            let sidecar_last_activity_at = val.get("lastActivityAt").and_then(parse_timestamp);
+            started_at = started_at
+                .or(sidecar_created_at)
+                .or(sidecar_last_activity_at);
+            ended_at = ended_at.or(sidecar_last_activity_at).or(sidecar_created_at);
+
+            if let Some(arr) = val.get("messages").and_then(|m| m.as_array()) {
+                for item in arr {
+                    let role = item
+                        .get("role")
+                        .or_else(|| item.get("type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("agent");
+                    let created = item
+                        .get("timestamp")
+                        .or_else(|| item.get("time"))
+                        .and_then(parse_timestamp);
+
+                    started_at = match (started_at, created) {
+                        (Some(curr), Some(ts)) => Some(curr.min(ts)),
+                        (None, Some(ts)) => Some(ts),
+                        (other, None) => other,
+                    };
+                    ended_at = match (ended_at, created) {
+                        (Some(curr), Some(ts)) => Some(curr.max(ts)),
+                        (None, Some(ts)) => Some(ts),
+                        (Some(curr), None) => Some(curr),
+                        (None, None) => None,
+                    };
+
+                    let content_val = item.get("content").or_else(|| item.get("text"));
+                    let content_str = content_val
+                        .map(retained_content::flatten_claude_content)
+                        .unwrap_or_default();
+
+                    if content_str.trim().is_empty() {
+                        continue;
+                    }
+
+                    let mut invocations =
+                        content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
+                    unwrap_skill_invocations(&mut invocations);
+
+                    messages.push(NormalizedMessage {
+                        idx: 0,
+                        role: role.to_string(),
+                        author: None,
+                        created_at: created,
+                        content: content_str,
+                        extra: item.clone(),
+                        invocations,
+                        snippets: Vec::new(),
+                    });
+                }
+            }
+            if messages.is_empty()
+                && ClaudeCodeConnector::path_is_desktop_sidecar(&path)
+                && let Some(message) = ClaudeCodeConnector::desktop_sidecar_metadata_message(&val)
+            {
+                source_kind = "claude_code_desktop_sidecar";
+                messages.push(message);
+            }
+            crate::types::reindex_messages(&mut messages);
 
             if messages.is_empty() {
                 if file_count <= 3 {
@@ -3113,6 +3107,7 @@ mod qoder_flavor_tests {
     use std::io::Cursor;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn qoder_flavor_parses_fixture_and_fallbacks_without_bogus_messages() {
         let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
             "tests/fixtures/qoder/projects/-tmp-demo/11111111-1111-4111-8111-111111111111.jsonl",

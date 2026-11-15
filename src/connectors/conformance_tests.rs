@@ -1082,6 +1082,14 @@ mod conformance {
                     );
                     r
                 }
+                "qoder" => {
+                    let r = base.join(".qoder");
+                    write_fixture_file(
+                        &r.join("projects/-tmp-demo/11111111-1111-4111-8111-111111111111.jsonl"),
+                        "{\"uuid\":\"u1\",\"parentUuid\":null,\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"timestamp\":\"2026-10-09T00:00:00Z\",\"cwd\":\"/work/demo\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Hello Qoder\"}}\n",
+                    );
+                    r
+                }
                 "qwen" => {
                     let r = base.join(".qwen");
                     write_fixture_file(
@@ -2164,6 +2172,14 @@ mod conformance {
                     leaf_dir: "sessions",
                     rel_file: "wkey/sess1/wire.jsonl",
                     payload: "{\"type\":\"metadata\",\"protocol_version\":\"1.3\"}\n{\"timestamp\":1770000000.0,\"message\":{\"type\":\"TurnBegin\",\"payload\":{\"role\":\"human\",\"content\":\"hello kimi\"}}}\n",
+                },
+                MirrorCase {
+                    detect_slug: "qoder",
+                    factory_slug: "qoder",
+                    tilde_source: "~/.qoder/projects",
+                    leaf_dir: "projects",
+                    rel_file: "proj/11111111-1111-4111-8111-111111111111.jsonl",
+                    payload: "{\"uuid\":\"u1\",\"parentUuid\":null,\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello qoder\"}}\n",
                 },
                 MirrorCase {
                     detect_slug: "qwen",

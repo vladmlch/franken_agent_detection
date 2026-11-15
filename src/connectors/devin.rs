@@ -69,6 +69,8 @@ mod batched_chain;
 // Local fix (cass review 2026-11-02, F5).
 #[cfg(feature = "devin")]
 mod checked_scan;
+#[cfg(feature = "devin")]
+mod subagent_tree;
 
 /// Override for the Devin data location. Accepts the `sessions.db` file, the
 /// `cli` directory holding it, or the `devin` data root above that.
@@ -269,9 +271,7 @@ impl DevinConnector {
             if messages.is_empty() {
                 continue;
             }
-            for (idx, message) in messages.iter_mut().enumerate() {
-                message.idx = i64::try_from(idx).unwrap_or(i64::MAX);
-            }
+            assign_message_indices(&mut messages);
 
             let title = session
                 .title
@@ -279,13 +279,7 @@ impl DevinConnector {
                 .map(str::trim)
                 .filter(|title| !title.is_empty())
                 .map(str::to_owned)
-                .or_else(|| {
-                    messages
-                        .iter()
-                        .find(|message| message.role == "user")
-                        .and_then(|message| message.content.lines().next())
-                        .map(|line| line.chars().take(100).collect())
-                });
+                .or_else(|| first_user_line_title(&messages));
             let workspace = session
                 .working_directory
                 .as_deref()
@@ -299,7 +293,7 @@ impl DevinConnector {
                 agent_slug: "devin".into(),
                 external_id: Some(session.id.clone()),
                 title,
-                workspace,
+                workspace: workspace.clone(),
                 source_path: db_path.join(urlencoding::encode(&session.id).as_ref()),
                 started_at: started_at.or(message_started_at),
                 ended_at: ended_at.or(message_ended_at),
@@ -311,15 +305,144 @@ impl DevinConnector {
                     "main_chain_nodes": chain.nodes.len(),
                     "off_chain_nodes": chain.off_chain_nodes,
                     "source": "sqlite",
-                    // FAD emits only the sessions-table main chains; those are
-                    // provably main sessions. Subagent-tree extraction is a
-                    // separate follow-up and never lands here.
                     "is_subagent": false,
                 }),
                 messages,
             });
+
+            if Self::has_subagent_marker_root(&conn, &session.id)? {
+                Self::extract_subagent_conversations(
+                    &conn,
+                    db_path,
+                    &session,
+                    workspace.as_deref(),
+                    &mut conversations,
+                )?;
+            }
         }
         Ok(conversations)
+    }
+
+    fn has_subagent_marker_root(conn: &Connection, session_id: &str) -> Result<bool> {
+        let rows: Vec<i64> = conn
+            .query_map_collect(
+                "SELECT 1 FROM message_nodes m \
+                 WHERE m.session_id = ?1 AND m.parent_node_id IS NULL \
+                   AND instr(m.chat_message, ?2) > 0 \
+                 LIMIT 1",
+                params![session_id, subagent_tree::SUBAGENT_MARKER],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| format!("failed to probe Devin subagent roots for {session_id}"))?;
+        Ok(!rows.is_empty())
+    }
+
+    fn load_session_forest(
+        conn: &Connection,
+        session_id: &str,
+    ) -> Result<(Vec<subagent_tree::ForestNode>, Vec<Option<i64>>)> {
+        let map_row = |row: &frankensqlite::Row| {
+            Ok((
+                subagent_tree::ForestNode {
+                    row_id: row.get_typed(0)?,
+                    node_id: row.get_typed(1)?,
+                    parent_node_id: row.get_typed(2)?,
+                    text: row.get_typed::<Option<String>>(3)?.unwrap_or_default(),
+                },
+                row.get_typed::<Option<i64>>(4)?,
+            ))
+        };
+        let rows = match conn.query_map_collect(
+            "SELECT row_id, node_id, parent_node_id, chat_message, created_at \
+             FROM message_nodes WHERE session_id = ?1",
+            params![session_id],
+            map_row,
+        ) {
+            Ok(rows) => rows,
+            Err(row_id_err) => conn
+                .query_map_collect(
+                    "SELECT node_id AS row_id, node_id, parent_node_id, chat_message, created_at \
+                     FROM message_nodes WHERE session_id = ?1",
+                    params![session_id],
+                    map_row,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to load Devin message_nodes for {session_id} \
+                         (row_id query failed: {row_id_err})"
+                    )
+                })?,
+        };
+        Ok(rows.into_iter().unzip())
+    }
+
+    fn extract_subagent_conversations(
+        conn: &Connection,
+        db_path: &Path,
+        session: &DevinSession,
+        workspace: Option<&Path>,
+        conversations: &mut Vec<NormalizedConversation>,
+    ) -> Result<()> {
+        let (forest, created_ats) = Self::load_session_forest(conn, &session.id)?;
+        let roots = subagent_tree::subagent_roots(&forest);
+        if roots.is_empty() {
+            return Ok(());
+        }
+        let index_by_id: HashMap<i64, usize> = forest
+            .iter()
+            .enumerate()
+            .map(|(idx, node)| (node.node_id, idx))
+            .collect();
+        let encoded_sid = urlencoding::encode(&session.id);
+
+        for root in roots {
+            let node_ids = subagent_tree::subtree(&forest, root);
+            let mut messages = Vec::new();
+            let mut min_ts: Option<i64> = None;
+            let mut max_ts: Option<i64> = None;
+            for node_id in node_ids {
+                let Some(&idx) = index_by_id.get(&node_id) else {
+                    continue;
+                };
+                let created_at = created_ats[idx];
+                if let Some(ts) = created_at {
+                    min_ts = Some(min_ts.map_or(ts, |cur| cur.min(ts)));
+                    max_ts = Some(max_ts.map_or(ts, |cur| cur.max(ts)));
+                }
+                if let Some(msg) = message_from_chat_message(
+                    &forest[idx].text,
+                    epoch_seconds_to_ms(created_at),
+                    session.model.as_deref(),
+                ) {
+                    messages.push(msg);
+                }
+            }
+            if messages.is_empty() {
+                continue;
+            }
+            assign_message_indices(&mut messages);
+            let title = first_user_line_title(&messages);
+            let external_id = format!("{}:agent-{root}", session.id);
+            let source_path = db_path.join(format!("{encoded_sid}:agent-{root}"));
+            conversations.push(NormalizedConversation {
+                agent_slug: "devin".into(),
+                external_id: Some(external_id),
+                title,
+                workspace: workspace.map(Path::to_path_buf),
+                source_path,
+                started_at: epoch_seconds_to_ms(min_ts),
+                ended_at: epoch_seconds_to_ms(max_ts),
+                metadata: serde_json::json!({
+                    "session_id": session.id,
+                    "subagent_root_node": root,
+                    "source": "sqlite",
+                    "is_subagent": true,
+                    "parent_id": session.id,
+                }),
+                messages,
+            });
+        }
+        Ok(())
     }
 
     fn load_sessions(conn: &Connection) -> Result<Vec<DevinSession>> {
@@ -449,6 +572,22 @@ fn epoch_seconds_to_ms(seconds: Option<i64>) -> Option<i64> {
     seconds
         .filter(|seconds| *seconds > 0)
         .and_then(|seconds| seconds.checked_mul(1000))
+}
+
+#[cfg(feature = "devin")]
+fn assign_message_indices(messages: &mut [NormalizedMessage]) {
+    for (idx, message) in messages.iter_mut().enumerate() {
+        message.idx = i64::try_from(idx).unwrap_or(i64::MAX);
+    }
+}
+
+#[cfg(feature = "devin")]
+fn first_user_line_title(messages: &[NormalizedMessage]) -> Option<String> {
+    messages
+        .iter()
+        .find(|message| message.role == "user")
+        .and_then(|message| message.content.lines().next())
+        .map(|line| line.chars().take(100).collect())
 }
 
 /// `content` as text: a plain string, or an OpenAI-style parts array whose
@@ -804,11 +943,14 @@ mod tests {
                 hidden INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE message_nodes (
-                node_id INTEGER PRIMARY KEY,
+                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
+                node_id INTEGER NOT NULL,
                 parent_node_id INTEGER,
-                chat_message TEXT,
-                created_at INTEGER
+                chat_message TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                metadata TEXT,
+                UNIQUE(session_id, node_id)
             );",
         )
         .unwrap();
@@ -1423,5 +1565,187 @@ mod tests {
         // subagent trees are a separate follow-up and never emitted here.
         assert_eq!(convs[0].metadata["is_subagent"], json!(false));
         assert!(convs[0].metadata.get("parent_id").is_none());
+    }
+
+    #[test]
+    fn cli_subagent_subtrees_become_child_conversations() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("sessions.db");
+        let conn = open_test_connection(&db);
+        create_schema(&conn);
+        insert_session(&conn, "parent-s", "Parent", "/w", 1_000, 2_000, Some(3), 0);
+        insert_node(
+            &conn,
+            1,
+            "parent-s",
+            None,
+            &json!({"role": "system", "content": "main"}),
+            1_000,
+        );
+        insert_node(
+            &conn,
+            2,
+            "parent-s",
+            Some(1),
+            &json!({"role": "user", "content": "spawn a helper"}),
+            1_001,
+        );
+        insert_node(
+            &conn,
+            3,
+            "parent-s",
+            Some(2),
+            &json!({"role": "assistant", "content": "spawned"}),
+            1_002,
+        );
+        insert_node(
+            &conn,
+            10,
+            "parent-s",
+            None,
+            &json!({"role": "system", "content": "You are a subagent of Devin. Investigate"}),
+            1_003,
+        );
+        insert_node(
+            &conn,
+            11,
+            "parent-s",
+            Some(10),
+            &json!({"role": "user", "content": "investigate the bug"}),
+            1_004,
+        );
+        insert_node(
+            &conn,
+            12,
+            "parent-s",
+            Some(11),
+            &json!({"role": "assistant", "content": "found it"}),
+            1_005,
+        );
+        drop(conn);
+
+        let convs = DevinConnector::extract_from_sqlite(&db, None).unwrap();
+        let main = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("parent-s"))
+            .unwrap();
+        assert_eq!(main.metadata["is_subagent"], false);
+        assert_eq!(main.messages.len(), 2);
+
+        let sub = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("parent-s:agent-10"))
+            .unwrap();
+        assert_eq!(sub.metadata["is_subagent"], true);
+        assert_eq!(sub.metadata["parent_id"], "parent-s");
+        assert_eq!(sub.metadata["subagent_root_node"], 10);
+        assert_eq!(sub.metadata["session_id"], "parent-s");
+        assert_eq!(sub.metadata["source"], "sqlite");
+        assert_eq!(sub.workspace.as_deref(), Some(Path::new("/w")));
+        assert_eq!(sub.title.as_deref(), Some("investigate the bug"));
+        assert_eq!(sub.started_at, Some(1_003_000));
+        assert_eq!(sub.ended_at, Some(1_005_000));
+        let texts: Vec<_> = sub.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(texts, vec!["investigate the bug", "found it"]);
+        assert_eq!(
+            sub.messages.iter().map(|m| m.idx).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(sub.source_path.ends_with("parent-s:agent-10"));
+        assert_eq!(convs.len(), 2);
+    }
+
+    #[test]
+    fn cli_subagent_handles_legacy_schema_and_empty_or_gated_subtrees() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("sessions.db");
+        let conn = open_test_connection(&db);
+        // Legacy store without `row_id` or `hidden`.
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, title TEXT, working_directory TEXT, model TEXT, \
+             agent_mode TEXT, created_at INTEGER, last_activity_at INTEGER, main_chain_id INTEGER);
+             CREATE TABLE message_nodes (node_id INTEGER, session_id TEXT, parent_node_id INTEGER, \
+             chat_message TEXT, created_at INTEGER);",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO sessions VALUES ('s1', 'Main', '', NULL, NULL, 100, 200, 2)",
+            params![],
+        )
+        .unwrap();
+        insert_node(
+            &conn,
+            1,
+            "s1",
+            None,
+            &json!({"role": "system", "content": "main"}),
+            100,
+        );
+        insert_node(
+            &conn,
+            2,
+            "s1",
+            Some(1),
+            &json!({"role": "user", "content": "hello"}),
+            105,
+        );
+        // Valid subagent root without `row_id`.
+        insert_node(
+            &conn,
+            10,
+            "s1",
+            None,
+            &json!({"role": "system", "content": "You are a subagent of Devin"}),
+            110,
+        );
+        insert_node(
+            &conn,
+            11,
+            "s1",
+            Some(10),
+            &json!({"role": "user", "content": "legacy child"}),
+            115,
+        );
+        // Childless marker root: ignored.
+        insert_node(
+            &conn,
+            20,
+            "s1",
+            None,
+            &json!({"role": "system", "content": "You are a subagent of Devin"}),
+            120,
+        );
+        // Marker root with only a system child (no indexable messages): ignored.
+        insert_node(
+            &conn,
+            30,
+            "s1",
+            None,
+            &json!({"role": "system", "content": "You are a subagent of Devin"}),
+            130,
+        );
+        insert_node(
+            &conn,
+            31,
+            "s1",
+            Some(30),
+            &json!({"role": "system", "content": "still system"}),
+            135,
+        );
+        drop(conn);
+
+        let convs = DevinConnector::extract_from_sqlite(&db, None).unwrap();
+        assert_eq!(convs.len(), 2);
+        let sub = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("s1:agent-10"))
+            .unwrap();
+        assert_eq!(sub.messages.len(), 1);
+        assert_eq!(sub.messages[0].content, "legacy child");
+        assert!(sub.workspace.is_none());
+
+        // `since_ts` newer than `last_activity_at` (200s -> 200_000ms) skips both main and subagents.
+        let gated = DevinConnector::extract_from_sqlite(&db, Some(200_001)).unwrap();
+        assert!(gated.is_empty());
     }
 }

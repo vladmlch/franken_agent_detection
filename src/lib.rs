@@ -529,9 +529,9 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             )
         }
         "devin" => {
-            // Mirrors DevinConnector's CASS_DEVIN_DATA_ROOT resolution (the
-            // sessions.db file, its `cli` dir, or the `devin` data root) so a
-            // relocated store is detected exactly where it is scanned.
+            // Mirrors DevinConnector's CASS_DEVIN_DATA_ROOT resolution
+            // (CLI `sessions.db`, IDE `acp-messages`, or parent `devin` / `Devin`
+            // data roots) so a relocated store is detected where it is scanned.
             let root = read("CASS_DEVIN_DATA_ROOT")?;
             if root.is_empty() {
                 return None;
@@ -543,6 +543,8 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             Some(vec![
                 root.join("sessions.db"),
                 root.join("cli").join("sessions.db"),
+                root.join("acp-messages"),
+                root.join("User").join("acp-messages"),
                 root,
             ])
         }
@@ -995,6 +997,27 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".local", "bin", "devin"]);
             maybe_push(&mut out, &[".local", "share", "devin"]);
             maybe_push(&mut out, &[".local", "share", "devin", "cli"]);
+            maybe_push(&mut out, &[".config", "Devin", "User", "acp-messages"]);
+            maybe_push(&mut out, &[".config", "Devin", "User"]);
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "Devin",
+                    "User",
+                    "acp-messages",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &["Library", "Application Support", "Devin", "User"],
+            );
+            maybe_push(
+                &mut out,
+                &["AppData", "Roaming", "Devin", "User", "acp-messages"],
+            );
+            maybe_push(&mut out, &["AppData", "Roaming", "Devin", "User"]);
         }
         "factory" => {
             maybe_push(&mut out, &[".factory"]);
@@ -1657,6 +1680,18 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".local", "bin", "devin"]),
                     tilde(&[".local", "share", "devin"]),
                     tilde(&[".local", "share", "devin", "cli"]),
+                    tilde(&[".config", "Devin", "User", "acp-messages"]),
+                    tilde(&[".config", "Devin", "User"]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "Devin",
+                        "User",
+                        "acp-messages",
+                    ]),
+                    tilde(&["Library", "Application Support", "Devin", "User"]),
+                    tilde(&["AppData", "Roaming", "Devin", "User", "acp-messages"]),
+                    tilde(&["AppData", "Roaming", "Devin", "User"]),
                 ],
                 "factory" => vec![
                     tilde(&[".factory"]),

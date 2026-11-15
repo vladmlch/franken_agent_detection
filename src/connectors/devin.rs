@@ -68,6 +68,8 @@ use crate::types::{NormalizedInvocation, NormalizedMessage};
 mod batched_chain;
 // Local fix (cass review 2026-11-02, F5).
 #[cfg(feature = "devin")]
+mod acp_store;
+#[cfg(feature = "devin")]
 mod checked_scan;
 #[cfg(feature = "devin")]
 mod subagent_tree;
@@ -142,29 +144,140 @@ impl DevinConnector {
                 .join("sessions.db")
         })
     }
+
+    /// Default Devin IDE `acp-messages` store directories across platforms.
+    #[cfg(feature = "devin")]
+    fn default_acp_messages_dirs() -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Some(config_dir) = dirs::config_dir() {
+            dirs.push(config_dir.join("Devin").join("User").join("acp-messages"));
+        }
+        if let Some(home) = dirs::home_dir() {
+            for rel in [
+                &[
+                    "Library",
+                    "Application Support",
+                    "Devin",
+                    "User",
+                    "acp-messages",
+                ][..],
+                &[".config", "Devin", "User", "acp-messages"][..],
+                &["AppData", "Roaming", "Devin", "User", "acp-messages"][..],
+            ] {
+                let path = rel.iter().fold(home.clone(), |p, seg| p.join(seg));
+                if !dirs.contains(&path) {
+                    dirs.push(path);
+                }
+            }
+        }
+        dirs
+    }
+
+    /// Whether `path` looks like a Devin IDE `acp-messages/<uuid>.db` store
+    /// (excluding CLI `sessions.db`, viewer caches, and dotfiles).
+    #[cfg(feature = "devin")]
+    fn is_acp_db_file(path: &Path) -> bool {
+        if !path.is_file() {
+            return false;
+        }
+        if path.extension().is_none_or(|ext| ext != "db") {
+            return false;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        !name.starts_with('.') && name != "sessions.db" && !name.starts_with("viewer_")
+    }
+
+    #[cfg(feature = "devin")]
+    fn push_acp_dir_dbs(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut found: Vec<PathBuf> = entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .filter(|p| Self::is_acp_db_file(p))
+            .collect();
+        found.sort();
+        out.extend(found);
+    }
+
+    /// Resolve Devin IDE `acp-messages/*.db` stores from a root path that may
+    /// name one `<uuid>.db`, an `acp-messages` dir, a `User` dir, or the
+    /// parent `Devin` dir.
+    #[cfg(feature = "devin")]
+    fn collect_acp_dbs_from_root(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if root.is_file() {
+            if Self::is_acp_db_file(root) {
+                out.push(root.to_path_buf());
+            }
+            return out;
+        }
+        if !root.is_dir() {
+            return out;
+        }
+        if root.file_name().and_then(|n| n.to_str()) == Some("acp-messages") {
+            Self::push_acp_dir_dbs(root, &mut out);
+        }
+        let direct_acp = root.join("acp-messages");
+        if direct_acp.is_dir() {
+            Self::push_acp_dir_dbs(&direct_acp, &mut out);
+        }
+        let user_acp = root.join("User").join("acp-messages");
+        if user_acp.is_dir() {
+            Self::push_acp_dir_dbs(&user_acp, &mut out);
+        }
+        out
+    }
 }
 
 #[cfg(feature = "devin")]
 impl DevinConnector {
+    /// Collect both CLI (`sessions.db`) and IDE (`acp-messages/*.db`) stores
+    /// located under `root`.
+    fn collect_stores_under_root(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let cli_db = Self::database_path_from_root(root);
+        if cli_db.is_file() {
+            found.push(cli_db);
+        }
+        found.extend(Self::collect_acp_dbs_from_root(root));
+        found
+    }
+
     /// Database candidates for a scan, in precedence order:
-    /// a `.db` data_dir; default detection (a store under data_dir scopes the
-    /// scan, then the env override, then the default location); or, with
-    /// explicit roots, every root that resolves to a store.
+    /// a `.db` data_dir; default detection (stores under data_dir scope the
+    /// scan, then the env override, then default CLI + IDE locations); or,
+    /// with explicit roots, every root that resolves to CLI or IDE stores.
     fn database_candidates(ctx: &ScanContext) -> Vec<(ScanRoot, PathBuf)> {
         let mut candidates: Vec<(ScanRoot, PathBuf)> = Vec::new();
         if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             candidates.push((ScanRoot::local(ctx.data_dir.clone()), ctx.data_dir.clone()));
         } else if ctx.use_default_detection() {
-            let scoped = (!ctx.data_dir.as_os_str().is_empty())
-                .then(|| Self::database_path_from_root(&ctx.data_dir))
-                .filter(|db| db.is_file());
-            if let Some(db) = scoped {
-                candidates.push((ScanRoot::local(db.clone()), db));
+            let scoped = if ctx.data_dir.as_os_str().is_empty() {
+                Vec::new()
+            } else {
+                Self::collect_stores_under_root(&ctx.data_dir)
+            };
+            if !scoped.is_empty() {
+                for db in scoped {
+                    candidates.push((ScanRoot::local(db.clone()), db));
+                }
             } else if let Some(root) = env_path_nonempty(DEVIN_DATA_ROOT_ENV) {
-                let db = Self::database_path_from_root(&root);
-                candidates.push((ScanRoot::local(db.clone()), db));
-            } else if let Some(db) = Self::default_database_path() {
-                candidates.push((ScanRoot::local(db.clone()), db));
+                for db in Self::collect_stores_under_root(&root) {
+                    candidates.push((ScanRoot::local(db.clone()), db));
+                }
+            } else {
+                if let Some(db) = Self::default_database_path() {
+                    candidates.push((ScanRoot::local(db.clone()), db));
+                }
+                for acp_dir in Self::default_acp_messages_dirs() {
+                    for db in Self::collect_acp_dbs_from_root(&acp_dir) {
+                        candidates.push((ScanRoot::local(db.clone()), db));
+                    }
+                }
             }
         } else {
             for scan_root in &ctx.scan_roots {
@@ -173,8 +286,28 @@ impl DevinConnector {
                 {
                     candidates.push((scan_root.clone(), mirrored.join("sessions.db")));
                 }
+                for ide_rel in [
+                    &[
+                        "Library",
+                        "Application Support",
+                        "Devin",
+                        "User",
+                        "acp-messages",
+                    ][..],
+                    &[".config", "Devin", "User", "acp-messages"][..],
+                    &["AppData", "Roaming", "Devin", "User", "acp-messages"][..],
+                ] {
+                    if let Some(mirrored) = scan_root.mirrored_store(ide_rel) {
+                        for db in Self::collect_acp_dbs_from_root(&mirrored) {
+                            candidates.push((scan_root.clone(), db));
+                        }
+                    }
+                }
                 let db = Self::database_path_from_root(&scan_root.path);
                 candidates.push((scan_root.clone(), db));
+                for db in Self::collect_acp_dbs_from_root(&scan_root.path) {
+                    candidates.push((scan_root.clone(), db));
+                }
             }
         }
         let mut seen = HashSet::new();
@@ -224,6 +357,42 @@ impl DevinConnector {
                 sources
             })
             .collect())
+    }
+
+    /// Dispatch a discovered SQLite store to either the CLI (`sessions.db`) or
+    /// IDE (`acp-messages/<uuid>.db`) extractor.
+    fn extract_store(db_path: &Path, since_ts: Option<i64>) -> Result<Vec<NormalizedConversation>> {
+        if db_path.file_name().and_then(|n| n.to_str()) == Some("sessions.db") {
+            return Self::extract_from_sqlite(db_path, since_ts);
+        }
+        if db_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("acp-messages")
+        {
+            return acp_store::extract_acp_store(db_path, since_ts);
+        }
+        let conn = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to open Devin db: {}", db_path.display()))?;
+        conn.execute("PRAGMA busy_timeout = 5000;")
+            .context("failed to set busy_timeout on Devin db")?;
+        let tables: Vec<String> = conn
+            .query_map_collect(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('sessions', 'messages')",
+                params![],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| format!("failed to probe Devin schema: {}", db_path.display()))?;
+        drop(conn);
+
+        if tables.iter().any(|t| t == "sessions") {
+            Self::extract_from_sqlite(db_path, since_ts)
+        } else if tables.iter().any(|t| t == "messages") {
+            acp_store::extract_acp_store(db_path, since_ts)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Read every visible session's main chain from one store.
@@ -850,7 +1019,7 @@ impl Connector for DevinConnector {
                 sidecar.required_for_reconstruction = true;
                 sidecar.with_fs_metadata()
             });
-            match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
+            match Self::extract_store(&source.source_path, ctx.since_ts) {
                 Ok(found) => {
                     tracing::debug!(
                         "devin sqlite: found {} sessions in {}",

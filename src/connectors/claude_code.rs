@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -484,6 +484,360 @@ impl SourceReadFailures {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeFlavor {
+    Claude,
+    Qoder,
+}
+
+pub(crate) struct ParsedClaudeFile {
+    pub messages: Vec<NormalizedMessage>,
+    pub message_uuids: Vec<Option<String>>,
+    pub records_by_uuid: Vec<(String, Option<String>)>,
+    pub record_timestamps: HashMap<String, i64>,
+    pub active_leaves: Vec<String>,
+    pub title: Option<String>,
+    pub json_title: Option<String>,
+    pub workspace: Option<PathBuf>,
+    pub model: Option<String>,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub metadata: Value,
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn parse_claude_records<R: BufRead>(
+    reader: R,
+    path: &Path,
+    flavor: ClaudeFlavor,
+) -> Result<Option<ParsedClaudeFile>> {
+    let mut messages = Vec::new();
+    let mut message_uuids = Vec::new();
+    let mut records_by_uuid = Vec::new();
+    let mut record_timestamps = HashMap::new();
+    let mut active_leaves = Vec::new();
+    let mut started_at: Option<i64> = None;
+    let mut ended_at: Option<i64> = None;
+    let mut workspace: Option<PathBuf> = None;
+    let mut workspace_dir_fallback: Option<PathBuf> = None;
+    let mut session_id: Option<String> = None;
+    let mut git_branch: Option<String> = None;
+    let mut json_title: Option<String> = None;
+    let mut message_model: Option<String> = None;
+    let mut runtime_config_model: Option<String> = None;
+
+    let is_subagent_transcript = path
+        .components()
+        .any(|c| c.as_os_str().to_str() == Some("subagents"));
+    let mut parent_session_id: Option<String> = None;
+    if is_subagent_transcript {
+        let components: Vec<_> = path.components().collect();
+        if let Some(pos) = components
+            .iter()
+            .position(|c| c.as_os_str().to_str() == Some("subagents"))
+            && pos > 0
+        {
+            parent_session_id = components[pos - 1].as_os_str().to_str().map(String::from);
+        }
+    }
+
+    for line_res in JsonlLines::new(reader) {
+        let line = match line_res {
+            Ok(line) => line,
+            Err(error) => return Err(anyhow::Error::new(error)),
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Strip a UTF-8 BOM so the first record (often
+        // session_meta or the first prompt) is not silently lost.
+        let line = line.trim_start_matches('\u{feff}');
+        let Ok(val) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+
+        if workspace.is_none() {
+            workspace = match flavor {
+                ClaudeFlavor::Claude => val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from),
+                ClaudeFlavor::Qoder => val
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from),
+            };
+        }
+        if session_id.is_none() {
+            session_id = val
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+        }
+        if git_branch.is_none() {
+            git_branch = val
+                .get("gitBranch")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+        }
+
+        let record_uuid = val.get("uuid").and_then(Value::as_str).map(String::from);
+        let parent_uuid = val
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let created = val.get("timestamp").and_then(parse_timestamp);
+
+        if let Some(ref uuid) = record_uuid {
+            records_by_uuid.push((uuid.clone(), parent_uuid));
+            if let Some(ts) = created {
+                record_timestamps.insert(uuid.clone(), ts);
+            }
+        }
+
+        let entry_type = val.get("type").and_then(|v| v.as_str());
+        if flavor == ClaudeFlavor::Qoder {
+            if entry_type == Some("active-leaf") {
+                if let Some(leaf) = val
+                    .get("leafUuid")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    active_leaves.push(leaf.to_string());
+                }
+                continue;
+            }
+            if entry_type == Some("workspace-directories") {
+                if workspace_dir_fallback.is_none() {
+                    workspace_dir_fallback = val
+                        .get("directories")
+                        .and_then(Value::as_array)
+                        .and_then(|dirs| {
+                            dirs.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::trim)
+                                .find(|s| !s.is_empty())
+                        })
+                        .map(PathBuf::from);
+                }
+                continue;
+            }
+            if entry_type == Some("runtime-config") {
+                if let Some(model) = val
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    runtime_config_model = Some(model.to_string());
+                }
+                continue;
+            }
+        }
+        // Claude's own generated title beats first-line
+        // truncation; the entry is otherwise skipped as a
+        // non-conversation sidecar type.
+        if entry_type == Some("ai-title") {
+            if let Some(title) = generated_title::generated_title(&val) {
+                json_title = Some(title);
+            }
+            continue;
+        }
+        if entry_type == Some("attachment") {
+            if let Some(message) = ClaudeCodeConnector::queued_command_message(&val) {
+                widen_time_bounds(&mut started_at, &mut ended_at, message.created_at);
+                messages.push(message);
+                message_uuids.push(record_uuid);
+            }
+            continue;
+        }
+        let role_hint = val
+            .get("message")
+            .and_then(|m| m.get("role"))
+            .and_then(|v| v.as_str())
+            .or_else(|| val.get("role").and_then(|v| v.as_str()));
+        let is_user_assistant = matches!(entry_type, Some("user" | "assistant"))
+            || (entry_type == Some("message") && matches!(role_hint, Some("user" | "assistant")));
+        if !is_user_assistant {
+            continue;
+        }
+
+        started_at = match (started_at, created) {
+            (Some(curr), Some(ts)) => Some(curr.min(ts)),
+            (None, Some(ts)) => Some(ts),
+            (other, None) => other,
+        };
+        ended_at = match (ended_at, created) {
+            (Some(curr), Some(ts)) => Some(curr.max(ts)),
+            (None, Some(ts)) => Some(ts),
+            (Some(curr), None) => Some(curr),
+            (None, None) => None,
+        };
+
+        let role = role_hint.or(entry_type).unwrap_or("agent");
+        let content_val = val
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .or_else(|| val.get("content"));
+        let content_str = content_val
+            .map(retained_content::flatten_claude_content)
+            .unwrap_or_default();
+
+        // Tool results ride in user entries as
+        // content:[{type:"tool_result", tool_use_id, content}].
+        // flatten_content ignores those blocks, so without this
+        // pass every result entry is dropped wholesale
+        // (~30-40% of real entries per transcript), leaving
+        // invocations with call_ids but no outputs anywhere.
+        if let Some(blocks) = content_val.and_then(Value::as_array) {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    continue;
+                }
+                let result_text = match block.get("content") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => continue,
+                };
+                if result_text.trim().is_empty() {
+                    continue;
+                }
+                let mut tool_extra = Map::new();
+                tool_extra.insert(
+                    "source".to_string(),
+                    Value::String("tool_result".to_string()),
+                );
+                if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                    tool_extra.insert("tool_use_id".to_string(), Value::String(id.to_string()));
+                }
+                // Failed tool calls are common and downstream
+                // analytics split on them; pass the flag through
+                // when Claude recorded one.
+                if let Some(is_error) = block.get("is_error").and_then(Value::as_bool) {
+                    tool_extra.insert("is_error".to_string(), Value::from(is_error));
+                }
+                messages.push(NormalizedMessage {
+                    idx: 0,
+                    role: "tool".to_string(),
+                    author: None,
+                    created_at: created,
+                    content: result_text,
+                    extra: Value::Object(tool_extra),
+                    invocations: Vec::new(),
+                    snippets: Vec::new(),
+                });
+                message_uuids.push(record_uuid.clone());
+            }
+        }
+
+        if content_str.trim().is_empty() {
+            continue;
+        }
+
+        let author = val
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if message_model.is_none() {
+            message_model = author
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(String::from);
+        }
+        let mut invocations =
+            content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
+        unwrap_skill_invocations(&mut invocations);
+
+        messages.push(NormalizedMessage {
+            idx: 0,
+            role: role.to_string(),
+            author,
+            created_at: created,
+            content: content_str,
+            extra: val,
+            invocations,
+            snippets: Vec::new(),
+        });
+        message_uuids.push(record_uuid);
+    }
+
+    if flavor == ClaudeFlavor::Qoder {
+        if workspace.is_none() {
+            workspace = workspace_dir_fallback;
+        }
+        if let Some(ref rt_model) = runtime_config_model {
+            for message in &mut messages {
+                if message.role == "assistant" && message.author.is_none() {
+                    message.author = Some(rt_model.clone());
+                }
+            }
+        }
+    }
+    let resolved_model = message_model.or_else(|| {
+        (flavor == ClaudeFlavor::Qoder)
+            .then_some(runtime_config_model)
+            .flatten()
+    });
+
+    crate::types::reindex_messages(&mut messages);
+    if messages.is_empty() {
+        return Ok(None);
+    }
+
+    let title = json_title.clone().or_else(|| {
+        messages
+            .iter()
+            .find(|m| m.role == "user")
+            .map(|m| {
+                m.content
+                    .lines()
+                    .next()
+                    .unwrap_or(&m.content)
+                    .chars()
+                    .take(100)
+                    .collect::<String>()
+            })
+            .or_else(|| {
+                workspace
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+            })
+    });
+
+    let metadata = serde_json::json!({
+        "source": "claude_code",
+        "sessionId": session_id,
+        "cliSessionId": Value::Null,
+        "gitBranch": git_branch,
+        "permissionMode": Value::Null,
+        "bodyAvailable": true,
+        "sidechain": is_subagent_transcript,
+        "parentSessionId": parent_session_id
+    });
+
+    Ok(Some(ParsedClaudeFile {
+        messages,
+        message_uuids,
+        records_by_uuid,
+        record_timestamps,
+        active_leaves,
+        title,
+        json_title,
+        workspace,
+        model: resolved_model,
+        started_at,
+        ended_at,
+        metadata,
+    }))
+}
+
 #[allow(clippy::too_many_lines)]
 fn scan_claude_with_readers<R: BufRead>(
     ctx: &ScanContext,
@@ -567,8 +921,8 @@ fn scan_claude_with_readers<R: BufRead>(
             let mut workspace: Option<PathBuf> = None;
             let mut session_id: Option<String> = None;
             let mut cli_session_id: Option<String> = None;
-            let mut git_branch: Option<String> = None;
-            let mut json_title: Option<String> = None;
+            let git_branch: Option<String> = None;
+            let json_title: Option<String>;
             let mut permission_mode: Option<String> = None;
             let mut source_kind = "claude_code";
 
@@ -600,171 +954,61 @@ fn scan_claude_with_readers<R: BufRead>(
                     }
                 };
 
-                for line_res in JsonlLines::new(reader) {
-                    let line = match line_res {
-                        Ok(line) => line,
-                        Err(error) => {
-                            read_failures.record(&path, "read", error);
-                            // Never emit or certify an incompletely read source.
-                            continue 'sources;
-                        }
-                    };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    // Strip a UTF-8 BOM so the first record (often
-                    // session_meta or the first prompt) is not silently lost.
-                    let line = line.trim_start_matches('\u{feff}');
-                    let Ok(val) = serde_json::from_str::<Value>(line) else {
-                        continue;
-                    };
-
-                    if workspace.is_none() {
-                        workspace = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-                    }
-                    if session_id.is_none() {
-                        session_id = val
-                            .get("sessionId")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                    }
-                    if git_branch.is_none() {
-                        git_branch = val
-                            .get("gitBranch")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                    }
-
-                    let entry_type = val.get("type").and_then(|v| v.as_str());
-                    // Claude's own generated title beats first-line
-                    // truncation; the entry is otherwise skipped as a
-                    // non-conversation sidecar type.
-                    if entry_type == Some("ai-title") {
-                        if let Some(title) = generated_title::generated_title(&val) {
-                            json_title = Some(title);
+                let parsed = match parse_claude_records(reader, &path, ClaudeFlavor::Claude) {
+                    Ok(Some(parsed)) => parsed,
+                    Ok(None) => {
+                        if file_count <= 3 {
+                            tracing::debug!(path = %path.display(), "claude_code no messages extracted");
                         }
                         continue;
                     }
-                    if entry_type == Some("attachment") {
-                        if let Some(message) = ClaudeCodeConnector::queued_command_message(&val) {
-                            widen_time_bounds(&mut started_at, &mut ended_at, message.created_at);
-                            messages.push(message);
+                    Err(error) => {
+                        match error.downcast::<io::Error>() {
+                            Ok(io_err) => read_failures.record(&path, "read", io_err),
+                            Err(other) => return Err(other),
                         }
-                        continue;
+                        // Never emit or certify an incompletely read source.
+                        continue 'sources;
                     }
-                    let role_hint = val
-                        .get("message")
-                        .and_then(|m| m.get("role"))
-                        .and_then(|v| v.as_str())
-                        .or_else(|| val.get("role").and_then(|v| v.as_str()));
-                    let is_user_assistant = matches!(entry_type, Some("user" | "assistant"))
-                        || (entry_type == Some("message")
-                            && matches!(role_hint, Some("user" | "assistant")));
-                    if !is_user_assistant {
-                        continue;
-                    }
+                };
+                tracing::debug!(path = %path.display(), messages = parsed.messages.len(), "claude_code extracted messages");
 
-                    let created = val.get("timestamp").and_then(parse_timestamp);
+                let mut conv = NormalizedConversation {
+                    agent_slug: "claude_code".into(),
+                    external_id: external_id_root
+                        .as_deref()
+                        .and_then(|base| path.strip_prefix(base).ok())
+                        .and_then(|rel| rel.to_str())
+                        .map(std::string::ToString::to_string)
+                        .or_else(|| {
+                            path.file_name()
+                                .and_then(|s| s.to_str())
+                                .map(std::string::ToString::to_string)
+                        }),
+                    title: parsed.title,
+                    workspace: parsed.workspace,
+                    source_path: path.clone(),
+                    started_at: parsed.started_at,
+                    ended_at: parsed.ended_at,
+                    metadata: parsed.metadata,
+                    messages: parsed.messages,
+                };
+                root.apply_workspace_rewrite(&mut conv);
+                on_conversation(conv)?;
 
-                    started_at = match (started_at, created) {
-                        (Some(curr), Some(ts)) => Some(curr.min(ts)),
-                        (None, Some(ts)) => Some(ts),
-                        (other, None) => other,
-                    };
-                    ended_at = match (ended_at, created) {
-                        (Some(curr), Some(ts)) => Some(curr.max(ts)),
-                        (None, Some(ts)) => Some(ts),
-                        (Some(curr), None) => Some(curr),
-                        (None, None) => None,
-                    };
-
-                    let role = role_hint.or(entry_type).unwrap_or("agent");
-                    let content_val = val
-                        .get("message")
-                        .and_then(|m| m.get("content"))
-                        .or_else(|| val.get("content"));
-                    let content_str = content_val
-                        .map(retained_content::flatten_claude_content)
-                        .unwrap_or_default();
-
-                    // Tool results ride in user entries as
-                    // content:[{type:"tool_result", tool_use_id, content}].
-                    // flatten_content ignores those blocks, so without this
-                    // pass every result entry is dropped wholesale
-                    // (~30-40% of real entries per transcript), leaving
-                    // invocations with call_ids but no outputs anywhere.
-                    if let Some(blocks) = content_val.and_then(Value::as_array) {
-                        for block in blocks {
-                            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                                continue;
-                            }
-                            let result_text = match block.get("content") {
-                                Some(Value::String(s)) => s.clone(),
-                                Some(Value::Array(parts)) => parts
-                                    .iter()
-                                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                                _ => continue,
-                            };
-                            if result_text.trim().is_empty() {
-                                continue;
-                            }
-                            let mut tool_extra = Map::new();
-                            tool_extra.insert(
-                                "source".to_string(),
-                                Value::String("tool_result".to_string()),
-                            );
-                            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
-                                tool_extra.insert(
-                                    "tool_use_id".to_string(),
-                                    Value::String(id.to_string()),
-                                );
-                            }
-                            // Failed tool calls are common and downstream
-                            // analytics split on them; pass the flag through
-                            // when Claude recorded one.
-                            if let Some(is_error) = block.get("is_error").and_then(Value::as_bool) {
-                                tool_extra.insert("is_error".to_string(), Value::from(is_error));
-                            }
-                            messages.push(NormalizedMessage {
-                                idx: 0,
-                                role: "tool".to_string(),
-                                author: None,
-                                created_at: created,
-                                content: result_text,
-                                extra: Value::Object(tool_extra),
-                                invocations: Vec::new(),
-                                snippets: Vec::new(),
-                            });
-                        }
-                    }
-
-                    if content_str.trim().is_empty() {
-                        continue;
-                    }
-
-                    let author = val
-                        .get("message")
-                        .and_then(|m| m.get("model"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let mut invocations =
-                        content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
-                    unwrap_skill_invocations(&mut invocations);
-
-                    messages.push(NormalizedMessage {
-                        idx: 0,
-                        role: role.to_string(),
-                        author,
-                        created_at: created,
-                        content: content_str,
-                        extra: val,
-                        invocations,
-                        snippets: Vec::new(),
-                    });
+                if discovered.fs_metadata_changed() {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "claude_code source changed during parse; completion withheld"
+                    );
+                } else {
+                    hooks.complete(&SourceCompletion {
+                        source: discovered,
+                        required_sidecars: Vec::new(),
+                        conversations_emitted: 1,
+                    })?;
                 }
-                crate::types::reindex_messages(&mut messages);
+                continue;
             } else {
                 if let Ok(metadata) = fs::metadata(&path)
                     && metadata.len() > 100 * 1024 * 1024
@@ -2859,6 +3103,137 @@ mod tests {
         assert!(
             convs[0].messages.iter().any(|m| m.content == "Second line"),
             "second line should be extractable regardless of BOM"
+        );
+    }
+}
+
+#[cfg(test)]
+mod qoder_flavor_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn qoder_flavor_parses_fixture_and_fallbacks_without_bogus_messages() {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "tests/fixtures/qoder/projects/-tmp-demo/11111111-1111-4111-8111-111111111111.jsonl",
+        );
+        let file = fs::File::open(&fixture_path).expect("fixture file");
+        let parsed = parse_claude_records(BufReader::new(file), &fixture_path, ClaudeFlavor::Qoder)
+            .expect("parse should succeed")
+            .expect("fixture should produce parsed file");
+
+        // attachment(task_reminder), workspace-directories, runtime-config, active-leaf, last-prompt produce no messages.
+        // Only user/assistant/tool_result records produce messages:
+        // u-root-1 (user), a-abandoned-1 (assistant), u-abandoned-2 (user),
+        // a-kept-1 (assistant), u-kept-tool-1 (tool), a-kept-2 (assistant) => 6 messages before branch filter.
+        assert_eq!(parsed.messages.len(), 6);
+        assert_eq!(parsed.message_uuids.len(), parsed.messages.len());
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .map(|m| m.role.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "tool",
+                "assistant"
+            ]
+        );
+        // attachment att-1 must still be in records_by_uuid so parentUuid chains stay intact
+        assert!(
+            parsed
+                .records_by_uuid
+                .iter()
+                .any(|(uuid, parent)| uuid == "att-1" && parent.as_deref() == Some("u-root-1"))
+        );
+        assert_eq!(
+            parsed.active_leaves,
+            vec!["u-abandoned-2".to_string(), "a-kept-2".to_string()]
+        );
+        assert_eq!(parsed.workspace, Some(PathBuf::from("/tmp/demo")));
+        assert_eq!(parsed.model.as_deref(), Some("qmodel-demo"));
+
+        // Equivalent Claude records produce identical message payloads
+        let claude_equiv = concat!(
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/tmp/demo","timestamp":"2026-11-15T10:00:01Z","message":{"role":"user","content":"Inspect the demo module"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","cwd":"/tmp/demo","timestamp":"2026-11-15T10:00:04Z","message":{"id":"m1","role":"assistant","model":"qmodel-demo","content":[{"type":"thinking","thinking":"Delegate inspection to subagent"},{"type":"text","text":"Checking demo module."},{"type":"tool_use","id":"call-subagent-1","name":"Agent","input":{"description":"Explore demo"}}]}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"u2","parentUuid":"a1","cwd":"/tmp/demo","timestamp":"2026-11-15T10:00:05Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-subagent-1","content":"Subagent finished checking demo","is_error":false}]}}"#,
+            "\n"
+        );
+        let qoder_equiv = concat!(
+            r#"{"type":"workspace-directories","directories":["/tmp/demo"]}"#,
+            "\n",
+            r#"{"type":"runtime-config","model":"qmodel-demo"}"#,
+            "\n",
+            r#"{"type":"task_reminder","content":"ignore me"}"#,
+            "\n",
+            r#"{"type":"attachment","uuid":"att","parentUuid":"u1","attachment":{"type":"task_reminder","content":"ignore me"}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/tmp/demo","timestamp":"2026-11-15T10:00:01Z","message":{"role":"user","content":"Inspect the demo module"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","cwd":"/tmp/demo","timestamp":"2026-11-15T10:00:04Z","message":{"id":"m1","role":"assistant","model":"qmodel-demo","content":[{"type":"thinking","thinking":"Delegate inspection to subagent"},{"type":"text","text":"Checking demo module."},{"type":"tool_use","id":"call-subagent-1","name":"Agent","input":{"description":"Explore demo"}}]}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"u2","parentUuid":"a1","cwd":"/tmp/demo","timestamp":"2026-11-15T10:00:05Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-subagent-1","content":"Subagent finished checking demo","is_error":false}]}}"#,
+            "\n",
+            r#"{"type":"active-leaf","leafUuid":"u2"}"#,
+            "\n"
+        );
+        let p_claude = parse_claude_records(
+            Cursor::new(claude_equiv.as_bytes()),
+            Path::new("/tmp/c.jsonl"),
+            ClaudeFlavor::Claude,
+        )
+        .unwrap()
+        .unwrap();
+        let p_qoder = parse_claude_records(
+            Cursor::new(qoder_equiv.as_bytes()),
+            Path::new("/tmp/q.jsonl"),
+            ClaudeFlavor::Qoder,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(p_qoder.messages.len(), p_claude.messages.len());
+        for (qm, cm) in p_qoder.messages.iter().zip(p_claude.messages.iter()) {
+            assert_eq!(qm.role, cm.role);
+            assert_eq!(qm.author, cm.author);
+            assert_eq!(qm.created_at, cm.created_at);
+            assert_eq!(qm.content, cm.content);
+            assert_eq!(qm.invocations, cm.invocations);
+        }
+
+        // Fallback test: no cwd on records -> workspace-directories.directories[0];
+        // no message.model -> runtime-config.model
+        let fallback_jsonl = concat!(
+            r#"{"type":"workspace-directories","directories":["/tmp/fallback-ws","/tmp/other"]}"#,
+            "\n",
+            r#"{"type":"runtime-config","model":"qmodel-fallback"}"#,
+            "\n",
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-11-15T10:00:01Z","message":{"role":"user","content":"hello"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-11-15T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+            "\n"
+        );
+        let p_fallback = parse_claude_records(
+            Cursor::new(fallback_jsonl.as_bytes()),
+            Path::new("/tmp/fallback.jsonl"),
+            ClaudeFlavor::Qoder,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            p_fallback.workspace,
+            Some(PathBuf::from("/tmp/fallback-ws"))
+        );
+        assert_eq!(p_fallback.model.as_deref(), Some("qmodel-fallback"));
+        assert_eq!(
+            p_fallback.messages[1].author.as_deref(),
+            Some("qmodel-fallback")
         );
     }
 }

@@ -86,6 +86,47 @@ impl QoderConnector {
         files
     }
 
+    fn is_subagent_transcript_path(path: &Path) -> bool {
+        let in_subagents_dir = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+            == Some("subagents");
+        let name_ok = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| !n.starts_with('.') && n.starts_with("agent-"));
+        let ext_ok = path.extension().and_then(|s| s.to_str()) == Some("jsonl");
+        in_subagents_dir && name_ok && ext_ok
+    }
+
+    fn subagent_session_files(scan_target: &Path) -> Vec<PathBuf> {
+        if scan_target.is_file() {
+            if Self::is_subagent_transcript_path(scan_target) {
+                return vec![scan_target.to_path_buf()];
+            }
+            return Vec::new();
+        }
+        let mut files = Vec::new();
+        for entry in WalkDir::new(scan_target).into_iter().flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if Self::is_subagent_transcript_path(path) {
+                files.push(path.to_path_buf());
+            }
+        }
+        files.sort();
+        files
+    }
+
+    fn all_session_files(scan_target: &Path) -> Vec<PathBuf> {
+        let mut files = Self::main_session_files(scan_target);
+        files.extend(Self::subagent_session_files(scan_target));
+        files
+    }
+
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let looks_like_root = |path: &Path| path.join("projects").is_dir();
 
@@ -132,7 +173,7 @@ impl QoderConnector {
             if !root.path.exists() {
                 continue;
             }
-            for path in Self::main_session_files(&root.path) {
+            for path in Self::all_session_files(&root.path) {
                 if path_is_excluded(&path, &excluded_paths) {
                     tracing::debug!(
                         path = %path.display(),
@@ -343,6 +384,165 @@ impl SourceReadFailures {
     }
 }
 
+#[derive(Clone, Default)]
+struct TaskSidecar {
+    agent_id: Option<String>,
+    description: Option<String>,
+    resolved_model: Option<String>,
+}
+
+#[derive(Default)]
+struct TaskSidecarIndex {
+    by_parent_tool_use_id: HashMap<String, TaskSidecar>,
+    by_agent_id: HashMap<String, TaskSidecar>,
+}
+
+fn parse_json_file_value(path: &Path) -> Option<serde_json::Value> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn non_empty_json_field(val: &serde_json::Value, key: &str) -> Option<String> {
+    val.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn load_task_sidecars(subagents_dir: &Path) -> TaskSidecarIndex {
+    let mut index = TaskSidecarIndex::default();
+    let Ok(entries) = fs::read_dir(subagents_dir) else {
+        return index;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name_ok = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.starts_with("task-"));
+            let ext_ok = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+            path.is_file() && name_ok && ext_ok
+        })
+        .collect();
+    paths.sort();
+
+    for path in paths {
+        let Some(val) = parse_json_file_value(&path) else {
+            continue;
+        };
+        let sidecar = TaskSidecar {
+            agent_id: non_empty_json_field(&val, "agentId"),
+            description: non_empty_json_field(&val, "description"),
+            resolved_model: non_empty_json_field(&val, "resolvedModel"),
+        };
+        if let Some(parent_tool_use_id) = non_empty_json_field(&val, "parentToolUseId") {
+            index
+                .by_parent_tool_use_id
+                .entry(parent_tool_use_id)
+                .or_insert_with(|| sidecar.clone());
+        }
+        if let Some(agent_id) = &sidecar.agent_id {
+            index.by_agent_id.entry(agent_id.clone()).or_insert(sidecar);
+        }
+    }
+    index
+}
+
+fn subagent_metadata_and_external_id(
+    path: &Path,
+    model: Option<&str>,
+    task_cache: &mut HashMap<PathBuf, TaskSidecarIndex>,
+) -> (Option<String>, serde_json::Value) {
+    let subagents_dir = path.parent();
+    let parent_id = subagents_dir
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let stem = path.file_stem().and_then(|s| s.to_str());
+    let agent_id_from_stem = stem
+        .and_then(|s| s.strip_prefix("agent-"))
+        .filter(|s| !s.is_empty());
+
+    let external_id = match (parent_id.as_deref(), stem) {
+        (Some(pid), Some(st)) => Some(format!("{pid}/{st}")),
+        (None, Some(st)) => Some(st.to_string()),
+        _ => None,
+    };
+
+    let meta_val = match (subagents_dir, stem) {
+        (Some(dir), Some(st)) => parse_json_file_value(&dir.join(format!("{st}.meta.json"))),
+        _ => None,
+    };
+    let meta_agent_type = meta_val
+        .as_ref()
+        .and_then(|v| non_empty_json_field(v, "agentType"));
+    let meta_description = meta_val
+        .as_ref()
+        .and_then(|v| non_empty_json_field(v, "description"));
+    let meta_tool_use_id = meta_val
+        .as_ref()
+        .and_then(|v| non_empty_json_field(v, "toolUseId"));
+
+    let task = subagents_dir.and_then(|dir| {
+        let index = task_cache
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| load_task_sidecars(dir));
+        meta_tool_use_id
+            .as_deref()
+            .and_then(|id| index.by_parent_tool_use_id.get(id))
+            .or_else(|| agent_id_from_stem.and_then(|id| index.by_agent_id.get(id)))
+    });
+
+    let effective_model = model
+        .map(str::to_string)
+        .or_else(|| task.and_then(|t| t.resolved_model.clone()));
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "source".to_string(),
+        serde_json::Value::String("qoder_jsonl".to_string()),
+    );
+    map.insert("is_subagent".to_string(), serde_json::Value::Bool(true));
+    map.insert(
+        "model".to_string(),
+        effective_model.map_or(serde_json::Value::Null, serde_json::Value::String),
+    );
+    if let Some(pid) = parent_id {
+        map.insert("parent_id".to_string(), serde_json::Value::String(pid));
+    }
+    if let Some(agent_type) = meta_agent_type {
+        map.insert(
+            "agent_type".to_string(),
+            serde_json::Value::String(agent_type),
+        );
+    }
+    if let Some(description) = meta_description.or_else(|| task.and_then(|t| t.description.clone()))
+    {
+        map.insert(
+            "description".to_string(),
+            serde_json::Value::String(description),
+        );
+    }
+    if let Some(tool_use_id) = meta_tool_use_id {
+        map.insert(
+            "tool_use_id".to_string(),
+            serde_json::Value::String(tool_use_id),
+        );
+    }
+    if let Some(agent_id) = task.and_then(|t| t.agent_id.clone()) {
+        map.insert("agent_id".to_string(), serde_json::Value::String(agent_id));
+    }
+
+    (external_id, serde_json::Value::Object(map))
+}
+
 fn scan_qoder_with_callback(
     ctx: &ScanContext,
     excluded_paths: &[PathBuf],
@@ -352,12 +552,13 @@ fn scan_qoder_with_callback(
     let roots = QoderConnector::source_roots(ctx);
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut read_failures = SourceReadFailures::default();
+    let mut task_cache: HashMap<PathBuf, TaskSidecarIndex> = HashMap::new();
 
     for root in roots {
         if !root.path.exists() {
             continue;
         }
-        for path in QoderConnector::main_session_files(&root.path) {
+        for path in QoderConnector::all_session_files(&root.path) {
             if path_is_excluded(&path, excluded_paths) {
                 tracing::debug!(
                     path = %path.display(),
@@ -411,10 +612,20 @@ fn scan_qoder_with_callback(
                 continue;
             };
 
-            let external_id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_string);
+            let (external_id, metadata) = if QoderConnector::is_subagent_transcript_path(&path) {
+                subagent_metadata_and_external_id(&path, filtered.model.as_deref(), &mut task_cache)
+            } else {
+                let external_id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string);
+                let metadata = serde_json::json!({
+                    "source": "qoder_jsonl",
+                    "is_subagent": false,
+                    "model": filtered.model,
+                });
+                (external_id, metadata)
+            };
 
             let mut conv = NormalizedConversation {
                 agent_slug: "qoder".into(),
@@ -424,11 +635,7 @@ fn scan_qoder_with_callback(
                 source_path: path.clone(),
                 started_at: filtered.started_at,
                 ended_at: filtered.ended_at,
-                metadata: serde_json::json!({
-                    "source": "qoder_jsonl",
-                    "is_subagent": false,
-                    "model": filtered.model,
-                }),
+                metadata,
                 messages: filtered.messages,
             };
             root.apply_workspace_rewrite(&mut conv);
@@ -611,5 +818,137 @@ mod tests {
         assert!(convs.is_empty());
         let discovered = QoderConnector::new().discover_source_files(&ctx).unwrap();
         assert!(discovered.is_empty());
+    }
+
+    #[test]
+    fn scan_fixture_emits_subagent_with_sidecar_metadata() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qoder");
+        let dir = TempDir::new().unwrap();
+        let ctx =
+            ScanContext::with_roots(dir.path().to_path_buf(), vec![ScanRoot::local(root)], None);
+        let convs = QoderConnector::new().scan(&ctx).unwrap();
+
+        let subagent = convs
+            .iter()
+            .find(|c| {
+                c.external_id.as_deref()
+                    == Some("11111111-1111-4111-8111-111111111111/agent-ageneral-purpose-0001")
+            })
+            .expect("subagent fixture conversation");
+        assert_eq!(subagent.agent_slug, "qoder");
+        assert_eq!(subagent.metadata["source"], "qoder_jsonl");
+        assert_eq!(subagent.metadata["is_subagent"], true);
+        assert_eq!(
+            subagent.metadata["parent_id"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(subagent.metadata["agent_type"], "general-purpose");
+        assert_eq!(subagent.metadata["description"], "Explore demo");
+        assert_eq!(subagent.metadata["tool_use_id"], "call-subagent-1");
+        assert_eq!(subagent.metadata["agent_id"], "ageneral-purpose-0001");
+        assert_eq!(subagent.metadata["model"], "qmodel-demo");
+
+        let contents: Vec<&str> = subagent
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(contents.len(), 2);
+        assert!(contents[0].contains("Inspect demo module files"));
+        assert!(contents[1].contains("Found 2 files in demo."));
+        assert!(
+            !contents.iter().any(|c| c.contains("Stale subagent branch")),
+            "stale subagent branch must not be emitted: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_with_corrupt_meta_still_emits_without_agent_type() {
+        let dir = TempDir::new().unwrap();
+        let subagents_dir = dir
+            .path()
+            .join("projects/-tmp-corrupt/22222222-2222-4222-8222-222222222222/subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+        fs::write(
+            subagents_dir.join("agent-acustom-0002.jsonl"),
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/tmp/corrupt","timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"Hello subagent"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            subagents_dir.join("agent-acustom-0002.meta.json"),
+            "{not valid json",
+        )
+        .unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(dir.path().join("projects"))],
+            None,
+        );
+        let convs = QoderConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let subagent = &convs[0];
+        assert_eq!(
+            subagent.external_id.as_deref(),
+            Some("22222222-2222-4222-8222-222222222222/agent-acustom-0002")
+        );
+        assert_eq!(subagent.metadata["is_subagent"], true);
+        assert_eq!(
+            subagent.metadata["parent_id"],
+            "22222222-2222-4222-8222-222222222222"
+        );
+        assert!(subagent.metadata.get("agent_type").is_none());
+    }
+
+    #[test]
+    fn subagent_with_missing_parent_session_still_emits() {
+        let dir = TempDir::new().unwrap();
+        let subagents_dir = dir
+            .path()
+            .join("projects/-tmp-orphan/33333333-3333-4333-8333-333333333333/subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+        fs::write(
+            subagents_dir.join("agent-aorphan-0003.jsonl"),
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/tmp/orphan","timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"Orphan subagent"}}"#,
+        )
+        .unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(dir.path().join("projects"))],
+            None,
+        );
+        let convs = QoderConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].metadata["is_subagent"], true);
+        assert_eq!(
+            convs[0].metadata["parent_id"],
+            "33333333-3333-4333-8333-333333333333"
+        );
+    }
+
+    #[test]
+    fn main_session_files_never_returns_subagent_files_while_discover_includes_both() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qoder");
+        let main_files = QoderConnector::main_session_files(&root);
+        assert_eq!(main_files.len(), 1);
+        assert!(
+            main_files
+                .iter()
+                .all(|p| !QoderConnector::path_has_subagents_component(p)),
+            "main_session_files must exclude subagents: {main_files:?}"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let ctx =
+            ScanContext::with_roots(dir.path().to_path_buf(), vec![ScanRoot::local(root)], None);
+        let discovered = QoderConnector::new().discover_source_files(&ctx).unwrap();
+        assert_eq!(discovered.len(), 2);
+        assert!(
+            discovered
+                .iter()
+                .any(|d| QoderConnector::path_has_subagents_component(&d.source_path)),
+            "discover_source_files should include subagent transcript"
+        );
     }
 }

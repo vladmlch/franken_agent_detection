@@ -13,6 +13,23 @@ use serde_json::Value;
 use super::super::utils::MAX_SCAN_FILE_BYTES;
 
 const PROGRESS_LINE_STRIDE: usize = 1024;
+/// Maximum single JSONL line buffered by [`Records`] before draining to the
+/// next newline to bound memory on malformed or huge records.
+const MAX_RECORD_LINE_BYTES: usize = 64 * 1024 * 1024;
+/// Scratch buffer capacity threshold above which [`Records`] shrinks its
+/// reusable byte buffer back down after processing a large line.
+const MAX_REUSABLE_LINE_CAPACITY: usize = 256 * 1024;
+/// Maximum zstd back-reference window (`2^26` = 64 MiB), matching
+/// `agentsview`'s `WithDecoderMaxWindow(64<<20)`, so corrupt or adversarial
+/// frame headers cannot force huge decoder window allocations.
+#[cfg(feature = "codex-zstd")]
+const ZSTD_WINDOW_LOG_MAX: u32 = 26;
+#[cfg(feature = "codex-zstd")]
+const ZSTD_FRAME_MAGIC: u32 = 0xFD2F_B528;
+#[cfg(feature = "codex-zstd")]
+const ZSTD_SKIPPABLE_MAGIC_MIN: u32 = 0x184D_2A50;
+#[cfg(feature = "codex-zstd")]
+const ZSTD_SKIPPABLE_MAGIC_MAX: u32 = 0x184D_2A5F;
 
 /// Largest Codex rollout the primary reader admits. The reader streams records
 /// through a length-bounded handle, so this is an admission budget, not a
@@ -154,38 +171,267 @@ impl<'a> RolloutReader<'a> {
 /// Returns an error when the decoder cannot be created.
 #[cfg(feature = "codex-zstd")]
 pub fn decompressed_rollout<R: Read>(compressed: R, budget: u64) -> io::Result<impl BufRead> {
+    let mut decoder = zstd::stream::read::Decoder::new(compressed)?;
+    decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
     Ok(BufReader::new(DecodedBudget {
-        inner: zstd::stream::read::Decoder::new(compressed)?,
+        inner: decoder,
         decoded: 0,
         budget,
     }))
 }
 
-/// The decoded length a compressed rollout's first zstd frame header records.
+/// The total decoded length declared across all zstd data frames in `source`.
 ///
-/// It is read from the start of `source`, which is left where it was. Codex
-/// pledges the whole length when it compresses a rollout, so for its files
-/// this is the length of the session's text; another writer's first frame
-/// may hold only part of it. `None` when the header records no length or is
-/// not a zstd frame header.
+/// Walks RFC 8878 frame headers, skippable frames (`0x184D2A50..=0x184D2A5F`),
+/// and 3-byte block headers from the current position of `source` without
+/// decompressing, then restores `source` to where it was. Sums declared
+/// `Frame_Content_Size` across all data frames when every data frame declares
+/// one. Returns `Ok(None)` when any data frame omits `Frame_Content_Size`,
+/// when `source` is empty, or when `source` does not start with a zstd/skippable
+/// frame magic.
 ///
 /// # Errors
 ///
-/// Returns an error when `source` cannot be read or repositioned.
+/// Returns an error when `source` cannot be read or repositioned, when a frame
+/// or skippable header/block/checksum is truncated before `Block_Last`, or when
+/// invalid frame/block metadata or trailing non-frame bytes follow a frame.
 #[cfg(feature = "codex-zstd")]
 pub fn compressed_rollout_declared_len<R: Read + Seek>(source: &mut R) -> io::Result<Option<u64>> {
-    // ZSTD_FRAMEHEADERSIZE_MAX: no frame header is longer.
-    const FRAME_HEADER_MAX_BYTES: u64 = 18;
     let start = source.stream_position()?;
-    let mut header = Vec::new();
-    source
-        .by_ref()
-        .take(FRAME_HEADER_MAX_BYTES)
-        .read_to_end(&mut header)?;
+    let result = walk_zstd_declared_len(source, start);
     source.seek(SeekFrom::Start(start))?;
-    Ok(zstd::zstd_safe::get_frame_content_size(&header)
-        .ok()
-        .flatten())
+    result
+}
+
+#[cfg(feature = "codex-zstd")]
+fn is_zstd_magic_prefix(prefix: &[u8]) -> bool {
+    const ZSTD_MAGIC_LE: [u8; 4] = ZSTD_FRAME_MAGIC.to_le_bytes();
+    if prefix.is_empty() || prefix.len() >= 4 {
+        return false;
+    }
+    if prefix == &ZSTD_MAGIC_LE[..prefix.len()] {
+        return true;
+    }
+    (0x50..=0x5F).contains(&prefix[0]) && prefix[1..] == [0x2A, 0x4D][..prefix.len() - 1]
+}
+
+#[cfg(feature = "codex-zstd")]
+fn parse_frame_content_size(fcs_flag: u8, single_segment: bool, fcs_bytes: &[u8]) -> Option<u64> {
+    match fcs_flag {
+        0 => single_segment.then(|| u64::from(fcs_bytes[0])),
+        1 => Some(u64::from(u16::from_le_bytes([fcs_bytes[0], fcs_bytes[1]])) + 256),
+        2 => Some(u64::from(u32::from_le_bytes([
+            fcs_bytes[0],
+            fcs_bytes[1],
+            fcs_bytes[2],
+            fcs_bytes[3],
+        ]))),
+        3 => Some(u64::from_le_bytes(
+            fcs_bytes.try_into().expect("8-byte frame content size"),
+        )),
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(feature = "codex-zstd")]
+fn walk_zstd_data_frame<R: Read + Seek>(
+    source: &mut R,
+    pos: &mut u64,
+    end: u64,
+) -> io::Result<Option<u64>> {
+    if end - *pos < 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated zstd frame header descriptor",
+        ));
+    }
+    let mut fhd_buf = [0u8; 1];
+    source.read_exact(&mut fhd_buf)?;
+    *pos += 1;
+    let fhd = fhd_buf[0];
+    if (fhd & 0x18) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reserved bit set in zstd frame header descriptor",
+        ));
+    }
+    let fcs_flag = fhd >> 6;
+    let single_segment = (fhd & 0x20) != 0;
+    let has_checksum = (fhd & 0x04) != 0;
+    let did_bytes = match fhd & 0x03 {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => unreachable!(),
+    };
+    let window_bytes = usize::from(!single_segment);
+    let fcs_bytes = match fcs_flag {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => unreachable!(),
+    };
+    let rest_len = window_bytes + did_bytes + fcs_bytes;
+    if (rest_len as u64) > end - *pos {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated zstd frame header",
+        ));
+    }
+    let mut rest_buf = [0u8; 13];
+    source.read_exact(&mut rest_buf[..rest_len])?;
+    *pos += rest_len as u64;
+    let frame_fcs = parse_frame_content_size(
+        fcs_flag,
+        single_segment,
+        &rest_buf[window_bytes + did_bytes..rest_len],
+    );
+
+    loop {
+        if end - *pos < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated zstd block header",
+            ));
+        }
+        let mut bh = [0u8; 3];
+        source.read_exact(&mut bh)?;
+        *pos += 3;
+        let header = u32::from(bh[0]) | (u32::from(bh[1]) << 8) | (u32::from(bh[2]) << 16);
+        let last_block = (header & 1) != 0;
+        let block_type = (header >> 1) & 0x03;
+        if block_type == 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reserved zstd block type",
+            ));
+        }
+        let payload = if block_type == 1 {
+            // RLE blocks carry a single byte on the wire regardless of regenerated size.
+            1u64
+        } else {
+            u64::from(header >> 3)
+        };
+        if payload > end - *pos {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated zstd block payload",
+            ));
+        }
+        *pos += payload;
+        if payload > 0 {
+            source.seek(SeekFrom::Start(*pos))?;
+        }
+        if last_block {
+            break;
+        }
+    }
+
+    if has_checksum {
+        if end - *pos < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated zstd frame checksum",
+            ));
+        }
+        let mut checksum = [0u8; 4];
+        source.read_exact(&mut checksum)?;
+        *pos += 4;
+    }
+
+    Ok(frame_fcs)
+}
+
+#[cfg(feature = "codex-zstd")]
+fn walk_zstd_declared_len<R: Read + Seek>(source: &mut R, start: u64) -> io::Result<Option<u64>> {
+    let end = source.seek(SeekFrom::End(0))?;
+    source.seek(SeekFrom::Start(start))?;
+    let mut pos = start;
+    if pos >= end {
+        return Ok(None);
+    }
+
+    let mut saw_any_frame = false;
+    let mut saw_data_frame = false;
+    let mut all_declared = true;
+    let mut total_declared: u64 = 0;
+
+    while pos < end {
+        if end - pos < 4 {
+            if !saw_any_frame {
+                let mut prefix = [0u8; 4];
+                let rem = usize::try_from(end - pos).expect("remaining bytes < 4 fit in usize");
+                source.read_exact(&mut prefix[..rem])?;
+                if !is_zstd_magic_prefix(&prefix[..rem]) {
+                    return Ok(None);
+                }
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated zstd frame magic",
+            ));
+        }
+
+        let mut magic_bytes = [0u8; 4];
+        source.read_exact(&mut magic_bytes)?;
+        pos += 4;
+        let magic = u32::from_le_bytes(magic_bytes);
+
+        if (ZSTD_SKIPPABLE_MAGIC_MIN..=ZSTD_SKIPPABLE_MAGIC_MAX).contains(&magic) {
+            saw_any_frame = true;
+            if end - pos < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated zstd skippable frame header",
+                ));
+            }
+            let mut size_bytes = [0u8; 4];
+            source.read_exact(&mut size_bytes)?;
+            pos += 4;
+            let payload = u64::from(u32::from_le_bytes(size_bytes));
+            if payload > end - pos {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated zstd skippable frame payload",
+                ));
+            }
+            pos += payload;
+            if payload > 0 {
+                source.seek(SeekFrom::Start(pos))?;
+            }
+        } else if magic == ZSTD_FRAME_MAGIC {
+            saw_any_frame = true;
+            saw_data_frame = true;
+            match walk_zstd_data_frame(source, &mut pos, end)? {
+                Some(fcs) if all_declared => {
+                    total_declared = total_declared.checked_add(fcs).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "declared zstd content size overflows u64",
+                        )
+                    })?;
+                }
+                _ => {
+                    all_declared = false;
+                }
+            }
+        } else if !saw_any_frame {
+            return Ok(None);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid zstd frame magic",
+            ));
+        }
+    }
+
+    if saw_data_frame && all_declared {
+        Ok(Some(total_declared))
+    } else {
+        Ok(None)
+    }
 }
 
 /// A rollout's path without its format suffix (`.jsonl`, `.json` or
@@ -271,7 +517,7 @@ fn same_snapshot(before: &Metadata, after: &Metadata) -> io::Result<bool> {
 
 struct Records<'a, R> {
     input: R,
-    line: String,
+    line_buf: Vec<u8>,
     line_number: usize,
     bytes_read: u64,
     progress_tick: Option<&'a (dyn Fn() + Send + Sync)>,
@@ -281,10 +527,53 @@ impl<'a, R: BufRead> Records<'a, R> {
     const fn new(input: R, progress_tick: Option<&'a (dyn Fn() + Send + Sync)>) -> Self {
         Self {
             input,
-            line: String::new(),
+            line_buf: Vec::new(),
             line_number: 0,
             bytes_read: 0,
             progress_tick,
+        }
+    }
+
+    fn shrink_scratch_if_large(&mut self) {
+        self.line_buf.clear();
+        if self.line_buf.capacity() > MAX_REUSABLE_LINE_CAPACITY {
+            self.line_buf.shrink_to(MAX_REUSABLE_LINE_CAPACITY);
+        }
+    }
+
+    /// Reads bytes up to `\n` or EOF into `self.line_buf`, capping buffered
+    /// storage at `MAX_RECORD_LINE_BYTES` and draining any remainder to `\n`
+    /// without growing memory further.
+    fn read_bounded_line(&mut self) -> io::Result<(usize, bool, bool)> {
+        self.line_buf.clear();
+        let mut total_bytes: usize = 0;
+        let mut exceeded = false;
+        loop {
+            let available = match self.input.fill_buf() {
+                Ok(buf) => buf,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            };
+            if available.is_empty() {
+                return Ok((total_bytes, false, exceeded));
+            }
+            let (take_len, found_nl) = available
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or((available.len(), false), |idx| (idx + 1, true));
+            total_bytes = total_bytes.saturating_add(take_len);
+            if !exceeded {
+                if self.line_buf.len().saturating_add(take_len) <= MAX_RECORD_LINE_BYTES {
+                    self.line_buf.extend_from_slice(&available[..take_len]);
+                } else {
+                    exceeded = true;
+                    self.line_buf.clear();
+                }
+            }
+            self.input.consume(take_len);
+            if found_nl {
+                return Ok((total_bytes, true, exceeded));
+            }
         }
     }
 
@@ -295,23 +584,32 @@ impl<'a, R: BufRead> Records<'a, R> {
                     tick();
                 }
             }
-            self.line.clear();
-            let count = self
-                .input
-                .read_line(&mut self.line)
+            let (count, terminated, exceeded) = self
+                .read_bounded_line()
                 .with_context(|| format!("read Codex JSONL line {}", self.line_number + 1))?;
             if count == 0 {
+                self.shrink_scratch_if_large();
                 return Ok(None);
             }
             self.bytes_read += count as u64;
             let index = self.line_number;
             self.line_number += 1;
-            let terminated = self.line.ends_with('\n');
-            let text = self.line.trim_start_matches('\u{feff}').trim();
-            if text.is_empty() {
+            if exceeded {
+                self.shrink_scratch_if_large();
                 continue;
             }
-            match serde_json::from_str(text) {
+            let (decoded, had_invalid_utf8) = match std::str::from_utf8(&self.line_buf) {
+                Ok(valid) => (std::borrow::Cow::Borrowed(valid), false),
+                Err(_) => (String::from_utf8_lossy(&self.line_buf), true),
+            };
+            let text = decoded.trim_start_matches('\u{feff}').trim();
+            if text.is_empty() {
+                self.shrink_scratch_if_large();
+                continue;
+            }
+            let parsed = serde_json::from_str(text);
+            self.shrink_scratch_if_large();
+            match parsed {
                 Ok(value) => return Ok(Some((index, value))),
                 Err(error) if !terminated && error.is_eof() => {
                     return Err(io::Error::new(
@@ -323,9 +621,20 @@ impl<'a, R: BufRead> Records<'a, R> {
                     )
                     .into());
                 }
+                Err(_) if had_invalid_utf8 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid UTF-8 in Codex JSONL line {}; retry this source",
+                            self.line_number
+                        ),
+                    )
+                    .into());
+                }
                 // Keep the existing malformed-historical-record policy. Only
-                // an unfinished final record or an actual read failure aborts.
-                // Never include the record's potentially private text in errors.
+                // an unfinished final record, an unrecoverable invalid-UTF-8
+                // line, or an actual read failure aborts. Never include the
+                // record's potentially private text in errors.
                 Err(_) => {}
             }
         }
@@ -390,6 +699,114 @@ mod tests {
             error.downcast_ref::<io::Error>().unwrap().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn invalid_utf8_inside_json_string_is_recovered_lossily() {
+        let line0 = b"{\"type\":\"response_item\",\"payload\":{\"output\":\"ok-\xff\xfe-tail\"}}\n";
+        let line1 = b"{\"ok\":true}\n";
+        let mut bytes = Vec::with_capacity(line0.len() + line1.len());
+        bytes.extend_from_slice(line0);
+        bytes.extend_from_slice(line1);
+        let mut records = Records::new(Cursor::new(bytes.as_slice()), None);
+        assert_eq!(
+            records.next_record().unwrap(),
+            Some((
+                0,
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": { "output": "ok-\u{FFFD}\u{FFFD}-tail" }
+                })
+            ))
+        );
+        assert_eq!(
+            records.next_record().unwrap(),
+            Some((1, serde_json::json!({"ok": true})))
+        );
+        assert!(records.next_record().unwrap().is_none());
+        assert_eq!(records.bytes_read, bytes.len() as u64);
+    }
+
+    #[test]
+    fn large_valid_line_shrinks_reusable_scratch_buffer() {
+        let big_payload = "x".repeat(512 * 1024);
+        let input = format!("{{\"big\":\"{big_payload}\"}}\n{{\"small\":true}}\n");
+        let mut records = Records::new(Cursor::new(input.as_bytes()), None);
+        assert_eq!(
+            records.next_record().unwrap(),
+            Some((0, serde_json::json!({"big": big_payload})))
+        );
+        assert!(
+            records.line_buf.capacity() <= MAX_REUSABLE_LINE_CAPACITY,
+            "scratch buffer capacity {} should shrink to <= {}",
+            records.line_buf.capacity(),
+            MAX_REUSABLE_LINE_CAPACITY
+        );
+        assert_eq!(
+            records.next_record().unwrap(),
+            Some((1, serde_json::json!({"small": true})))
+        );
+        assert!(records.next_record().unwrap().is_none());
+        assert_eq!(records.bytes_read, input.len() as u64);
+    }
+
+    #[test]
+    fn oversized_single_line_is_drained_without_oom_and_scratch_shrinks() {
+        struct OversizedLineReader {
+            prefix: &'static [u8],
+            prefix_pos: usize,
+            filler_remaining: usize,
+            suffix: &'static [u8],
+            suffix_pos: usize,
+        }
+        impl Read for OversizedLineReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.prefix_pos < self.prefix.len() {
+                    let n = buf.len().min(self.prefix.len() - self.prefix_pos);
+                    buf[..n].copy_from_slice(&self.prefix[self.prefix_pos..self.prefix_pos + n]);
+                    self.prefix_pos += n;
+                    return Ok(n);
+                }
+                if self.filler_remaining > 0 {
+                    let n = buf.len().min(self.filler_remaining);
+                    buf[..n].fill(b'a');
+                    self.filler_remaining -= n;
+                    return Ok(n);
+                }
+                if self.suffix_pos < self.suffix.len() {
+                    let n = buf.len().min(self.suffix.len() - self.suffix_pos);
+                    buf[..n].copy_from_slice(&self.suffix[self.suffix_pos..self.suffix_pos + n]);
+                    self.suffix_pos += n;
+                    return Ok(n);
+                }
+                Ok(0)
+            }
+        }
+
+        let filler_len = MAX_RECORD_LINE_BYTES + 4096;
+        let prefix = b"{\"oversized\":\"";
+        let suffix = b"\"}\n{\"after\":true}\n";
+        let expected_total = (prefix.len() + filler_len + suffix.len()) as u64;
+        let reader = OversizedLineReader {
+            prefix,
+            prefix_pos: 0,
+            filler_remaining: filler_len,
+            suffix,
+            suffix_pos: 0,
+        };
+        let mut records = Records::new(BufReader::new(reader), None);
+        assert_eq!(
+            records.next_record().unwrap(),
+            Some((1, serde_json::json!({"after": true})))
+        );
+        assert!(
+            records.line_buf.capacity() <= MAX_REUSABLE_LINE_CAPACITY,
+            "scratch buffer capacity {} should shrink to <= {}",
+            records.line_buf.capacity(),
+            MAX_REUSABLE_LINE_CAPACITY
+        );
+        assert!(records.next_record().unwrap().is_none());
+        assert_eq!(records.bytes_read, expected_total);
     }
 
     #[test]
@@ -594,6 +1011,193 @@ mod tests {
                 panic!("a declared length past the budget is refused");
             };
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+
+        fn skippable_frame(magic: u32, payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&magic.to_le_bytes());
+            out.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+
+        /// Builds a minimal RFC 8878 single-raw-block zstd frame with explicit
+        /// `Window_Descriptor` exponent (`windowLog = 10 + exponent`), optional
+        /// 4-byte checksum flag, and no `Frame_Content_Size`.
+        fn raw_frame_with_window_log(window_log: u8, payload: &[u8], checksum: bool) -> Vec<u8> {
+            assert!(window_log >= 10);
+            assert!(payload.len() < (1 << 21));
+            let exponent = window_log - 10;
+            let fhd = if checksum { 0x04 } else { 0x00 };
+            let window_desc = exponent << 3;
+            let block_header = 1u32 | (u32::try_from(payload.len()).unwrap() << 3);
+            let mut out = Vec::with_capacity(9 + payload.len() + if checksum { 4 } else { 0 });
+            out.extend_from_slice(&ZSTD_FRAME_MAGIC.to_le_bytes());
+            out.push(fhd);
+            out.push(window_desc);
+            out.extend_from_slice(&block_header.to_le_bytes()[..3]);
+            out.extend_from_slice(payload);
+            if checksum {
+                out.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+            }
+            out
+        }
+
+        #[test]
+        fn skippable_frame_prefix_and_multi_frame_sum_declared_lengths() {
+            let part1 = TEXT.to_string();
+            // >256 bytes exercises the 2-byte Frame_Content_Size (+256 offset) path.
+            let part2 = "{\"second\":true}\n".repeat(30);
+            let mut stream = Vec::new();
+            stream.extend_from_slice(&skippable_frame(ZSTD_SKIPPABLE_MAGIC_MIN, b"meta-header!"));
+            stream.extend_from_slice(&declared(part1.as_bytes()));
+            stream.extend_from_slice(&skippable_frame(ZSTD_SKIPPABLE_MAGIC_MAX, b""));
+            stream.extend_from_slice(&declared(part2.as_bytes()));
+
+            let expected_len = (part1.len() + part2.len()) as u64;
+            let mut source = Cursor::new(stream.clone());
+            assert_eq!(
+                compressed_rollout_declared_len(&mut source).unwrap(),
+                Some(expected_len)
+            );
+            assert_eq!(source.stream_position().unwrap(), 0);
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("rollout-multi.jsonl.zst");
+            fs::write(&path, &stream).unwrap();
+            let joined = format!("{part1}{part2}");
+            assert_eq!(
+                read_file(&path).unwrap(),
+                records(Cursor::new(joined)).unwrap()
+            );
+
+            // Summed declared length over budget is refused before decoding.
+            let file = File::open(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            let Err(error) = compressed_input(file.take(len), expected_len - 1) else {
+                panic!("multi-frame declared length past budget must be refused");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+
+        #[test]
+        fn multi_frame_omitted_content_size_returns_none_and_enforces_streaming_budget() {
+            let part1 = TEXT.as_bytes();
+            let part2 = b"{\"second\":true}\n";
+
+            let mut declared_then_undeclared = declared(part1);
+            declared_then_undeclared.extend_from_slice(&undeclared(part2));
+            let mut source = Cursor::new(declared_then_undeclared.clone());
+            assert_eq!(compressed_rollout_declared_len(&mut source).unwrap(), None);
+
+            let mut undeclared_then_declared = undeclared(part1);
+            undeclared_then_declared.extend_from_slice(&declared(part2));
+            let mut source = Cursor::new(undeclared_then_declared);
+            assert_eq!(compressed_rollout_declared_len(&mut source).unwrap(), None);
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("rollout-mixed.jsonl.zst");
+            fs::write(&path, &declared_then_undeclared).unwrap();
+            let file = File::open(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            let total_text_len = (part1.len() + part2.len()) as u64;
+            let mut reader = compressed_input(file.take(len), total_text_len - 1).unwrap();
+            let err = reader.read_to_end(&mut Vec::new()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+        }
+
+        #[test]
+        fn truncated_or_invalid_skippable_frame_and_block_headers_fail() {
+            // Truncated skippable header (6 bytes) -> UnexpectedEof.
+            let skip = skippable_frame(ZSTD_SKIPPABLE_MAGIC_MIN, b"payload");
+            let mut source = Cursor::new(&skip[..6]);
+            assert_eq!(
+                compressed_rollout_declared_len(&mut source)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+
+            // Truncated skippable payload -> UnexpectedEof.
+            let mut source = Cursor::new(&skip[..skip.len() - 2]);
+            assert_eq!(
+                compressed_rollout_declared_len(&mut source)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+
+            // Trailing non-zstd bytes after a skippable frame -> InvalidData.
+            let mut skip_then_garbage = skippable_frame(ZSTD_SKIPPABLE_MAGIC_MIN, b"ok");
+            skip_then_garbage.extend_from_slice(b"junk");
+            let mut source = Cursor::new(skip_then_garbage);
+            assert_eq!(
+                compressed_rollout_declared_len(&mut source)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+
+            // Truncated block payload before Block_Last -> UnexpectedEof.
+            let raw = raw_frame_with_window_log(16, b"hello world", false);
+            let mut source = Cursor::new(&raw[..raw.len() - 3]);
+            assert_eq!(
+                compressed_rollout_declared_len(&mut source)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+
+            // Truncated 4-byte frame checksum after Block_Last -> UnexpectedEof.
+            let with_csum = raw_frame_with_window_log(16, b"hello", true);
+            let mut source = Cursor::new(&with_csum[..with_csum.len() - 2]);
+            assert_eq!(
+                compressed_rollout_declared_len(&mut source)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+
+            // Reserved block type (block_type == 3 -> bits 2..=1 == 0b11 -> 0x07 with last_block=1).
+            let mut reserved_block = Vec::new();
+            reserved_block.extend_from_slice(&ZSTD_FRAME_MAGIC.to_le_bytes());
+            reserved_block.push(0x00); // fhd: window descriptor present
+            reserved_block.push(0x00); // window descriptor
+            reserved_block.extend_from_slice(&[0x07, 0x00, 0x00]); // last=1, type=3 (reserved)
+            let mut source = Cursor::new(reserved_block);
+            assert_eq!(
+                compressed_rollout_declared_len(&mut source)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+
+        #[test]
+        fn window_log_max_rejects_windows_above_64_mib() {
+            // windowLog = 26 (64 MiB) is within the cap and decodes cleanly.
+            let ok_frame = raw_frame_with_window_log(26, b"{}\n", false);
+            let mut decoded = Vec::new();
+            decompressed_rollout(Cursor::new(&ok_frame), 1024)
+                .unwrap()
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, b"{}\n");
+
+            // windowLog = 27 (128 MiB, which libzstd's default 27 allows) and
+            // windowLog = 28 (256 MiB) must both be rejected by window_log_max(26).
+            for window_log in [27u8, 28u8] {
+                let oversized = raw_frame_with_window_log(window_log, b"{}\n", false);
+                let err = decompressed_rollout(Cursor::new(&oversized), 1024)
+                    .unwrap()
+                    .read_to_end(&mut Vec::new())
+                    .expect_err("window above 64 MiB must be rejected");
+                assert_ne!(
+                    err.kind(),
+                    io::ErrorKind::FileTooLarge,
+                    "windowLog={window_log} should fail on decoder window cap, not budget"
+                );
+            }
         }
 
         #[test]

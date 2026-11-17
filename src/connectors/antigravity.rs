@@ -16,10 +16,15 @@
 //! - `conversations/<uuid>.db` — one stock-SQLite database per conversation. The
 //!   payload columns are an undocumented protobuf trajectory/steps model; this is
 //!   the durable source of truth but expensive to read.
-//! - `brain/<uuid>/.system_generated/logs/transcript.jsonl` — a **clean JSONL
-//!   transcript** of the same conversation. This is the connector's primary read
-//!   path: a simple, stable line-per-step JSON shape, no protobuf required. (A
-//!   fuller `transcript_full.jsonl` sits beside it.)
+//! - `brain/<uuid>/.system_generated/logs/transcript*.jsonl` — **clean JSONL
+//!   transcripts** of the same conversation: the connector's primary read
+//!   path, a simple, stable line-per-step JSON shape, no protobuf required.
+//!   When both `transcript_full.jsonl` (the fuller variant) and
+//!   `transcript.jsonl` exist, the parse source is picked with the native
+//!   `get_best_log_file` rule — `(mtime desc, priority desc)` — so the
+//!   fuller transcript wins on ties and a fresher short transcript beats a
+//!   stale full one; the first candidate that yields records wins, with no
+//!   stitching across the pair.
 //!
 //! The `<uuid>` keying `conversations/<uuid>.db` and `brain/<uuid>/` is the same
 //! id used by `agy --conversation <uuid>`.
@@ -48,14 +53,18 @@
 //!   - `USER_INPUT` (`USER_EXPLICIT`) → `role: "user"`. The real prompt is wrapped
 //!     in `<USER_REQUEST>…</USER_REQUEST>`; `<ADDITIONAL_METADATA>` (local time)
 //!     and `<USER_SETTINGS_CHANGE>` (records the model) are appended. We extract
-//!     the request body and keep the wrappers in `extra`.
+//!     the request body and keep the wrappers in `extra`. An attachment-only
+//!     turn (empty request body, non-empty `media`) still emits a `user`
+//!     message, matching native.
 //!   - `PLANNER_RESPONSE` (`MODEL`) → `role: "assistant"`. `content` is the visible
 //!     reply; `thinking` is the model's reasoning, preserved in `extra.thinking`.
 //!   - any other `MODEL` kind (`VIEW_FILE`, `EDIT_FILE`, `RUN_COMMAND`, …) → a
 //!     `role: "tool"` step. `content` is the tool result; `tool_calls` (when
 //!     present) are the structured calls. We synthesize a [`NormalizedInvocation`]
 //!     named after the step so the tool is searchable even when `tool_calls` is
-//!     absent. The raw `type` is preserved in `extra.agy_type`.
+//!     absent. The raw `type` is preserved in `extra.agy_type`. An error-only
+//!     step (no `content`, `thinking` or calls) lifts its `error` text as the
+//!     message content instead of being dropped, like `ERROR_MESSAGE` does.
 //!   - `EPHEMERAL_MESSAGE` / `SYSTEM_MESSAGE` (`SYSTEM`) → `role: "system"`
 //!     (preserved faithfully; tagged in `extra` so consumers can down-rank the
 //!     repetitive ephemeral reminders).
@@ -94,8 +103,9 @@
 //! structural metadata) instead of treating every canonicalized record as
 //! structurally unverifiable. The clone happens in
 //! [`insert_passthrough_extras`], so all eight record arms archive the same
-//! way; records the connector drops whole (empty-body `USER_INPUT` turns,
-//! content-less markers) still emit no message and therefore no archive.
+//! way; records the connector drops whole (empty-body `USER_INPUT` turns with
+//! no attachments, content-less markers) still emit no message and therefore
+//! no archive.
 
 use std::collections::HashMap;
 use std::fs;
@@ -249,10 +259,39 @@ impl AntigravityConnector {
             .join("transcript_full.jsonl")
     }
 
-    /// A conversation directory is recognized by the presence of its
-    /// `transcript.jsonl` (the primary read path).
+    /// Transcript candidates for a `brain/<uuid>` conversation directory, in
+    /// the native `get_best_log_file` selection order (`claude_viewer`
+    /// `providers/antigravity/discovery.py`): `transcript_full.jsonl`
+    /// (priority 3) and `transcript.jsonl` (priority 2), filtered to existing
+    /// non-empty files under the 100 MiB scan cap and ordered by
+    /// `(mtime desc, priority desc)` — so the fuller transcript wins on ties
+    /// while a fresher short transcript beats a stale full one.
+    fn transcript_candidates(conversation_dir: &Path) -> Vec<PathBuf> {
+        /// The connector's transcript scan cap (mirrors `read_transcript_records`).
+        const MAX_TRANSCRIPT_BYTES: u64 = 100 * 1024 * 1024;
+        let mut candidates = [
+            (3_u8, Self::transcript_full_path(conversation_dir)),
+            (2_u8, Self::transcript_path(conversation_dir)),
+        ]
+        .into_iter()
+        .filter_map(|(priority, path)| {
+            let meta = fs::metadata(&path).ok()?;
+            if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_TRANSCRIPT_BYTES {
+                return None;
+            }
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            Some((mtime, priority, path))
+        })
+        .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        candidates.into_iter().map(|entry| entry.2).collect()
+    }
+
+    /// A conversation directory is recognized by the presence of EITHER
+    /// transcript variant — the same pair native `get_best_log_file`
+    /// considers.
     fn is_conversation_dir(path: &Path) -> bool {
-        Self::transcript_path(path).is_file()
+        Self::transcript_path(path).is_file() || Self::transcript_full_path(path).is_file()
     }
 
     /// The `<uuid>` for a conversation directory (its directory name).
@@ -324,7 +363,7 @@ impl AntigravityConnector {
         }
 
         let mut out = Vec::new();
-        // The transcript sits at <conv>/.system_generated/logs/transcript.jsonl,
+        // The transcript sits at <conv>/.system_generated/logs/transcript*.jsonl,
         // so the conversation dir is three levels above the file. From the
         // base directory it is at depth 5; the cap is set higher so a scan
         // root one or two levels above (e.g. ~ or ~/.gemini, as remote mirrors
@@ -336,7 +375,10 @@ impl AntigravityConnector {
             .into_iter()
             .flatten()
         {
-            if !entry.file_type().is_file() || entry.file_name() != "transcript.jsonl" {
+            let file_name = entry.file_name();
+            if !entry.file_type().is_file()
+                || (file_name != "transcript.jsonl" && file_name != "transcript_full.jsonl")
+            {
                 continue;
             }
             let path = entry.path();
@@ -646,7 +688,14 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
     match step_type {
         "USER_INPUT" => {
             let (body, settings, metadata) = extract_user_request(&content);
-            if body.trim().is_empty() {
+            // An attachment-only turn (empty <USER_REQUEST> with `media`) is
+            // real user input in native — emit it with an empty body rather
+            // than dropping the record whole.
+            let has_media = rec
+                .get("media")
+                .and_then(Value::as_array)
+                .is_some_and(|media| !media.is_empty());
+            if body.trim().is_empty() && !has_media {
                 return None;
             }
             let mut extra = Map::new();
@@ -761,9 +810,18 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
                 } else {
                     parse_tool_calls(tool_calls, step_type)
                 };
-                if content.trim().is_empty() && thinking.is_none() && invocations.is_empty() {
-                    return None;
-                }
+                // An error-only step (e.g. a failed GENERIC result with no
+                // content, thinking or calls) lifts its `error` text as the
+                // message content, the same way ERROR_MESSAGE does.
+                let body =
+                    if content.trim().is_empty() && thinking.is_none() && invocations.is_empty() {
+                        rec.get("error")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.trim().is_empty())?
+                            .to_string()
+                    } else {
+                        content
+                    };
                 let mut extra = Map::new();
                 extra.insert("agy_type".to_string(), Value::String(step_type.to_string()));
                 if let Some(t) = thinking {
@@ -781,7 +839,7 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
                     "tool",
                     Some(author.as_str()),
                     created,
-                    content,
+                    body,
                     extra,
                     invocations,
                 ))
@@ -1024,11 +1082,17 @@ fn parse_conversation(
     descriptors: &HashMap<String, SubagentDescriptor>,
     index_complete: bool,
 ) -> Option<NormalizedConversation> {
-    let transcript = AntigravityConnector::transcript_path(conversation_dir);
-    let records = AntigravityConnector::read_transcript_records(&transcript);
-    if records.is_empty() {
-        return None;
-    }
+    // Native `get_best_log_file` order: try each transcript candidate until
+    // one yields records — a torn read or empty fuller transcript falls back
+    // to the next file rather than losing the conversation. Records are read
+    // from exactly one file; lines are never stitched across the pair.
+    let (transcript, records) = AntigravityConnector::transcript_candidates(conversation_dir)
+        .into_iter()
+        .map(|path| {
+            let records = AntigravityConnector::read_transcript_records(&path);
+            (path, records)
+        })
+        .find(|(_, records)| !records.is_empty())?;
 
     // Sort by step_index (gaps are expected; ties keep input order via stable sort).
     let mut ordered: Vec<&Value> = records.iter().collect();
@@ -1177,7 +1241,14 @@ fn scan_antigravity_with_exclusions(
         // descriptor still classifies a fresh child on an incremental scan.
         let (descriptors, index_complete) = subagent_descriptor_index(&root.path, excluded_paths);
         for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
-            let transcript = AntigravityConnector::transcript_path(&conversation_dir);
+            // The boundary hooks track the file the parser tries first in
+            // native selection order; when no transcript is parseable yet,
+            // fall back to the canonical short path so exclusion handling
+            // stays stable.
+            let transcript = AntigravityConnector::transcript_candidates(&conversation_dir)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| AntigravityConnector::transcript_path(&conversation_dir));
             if path_is_excluded(&conversation_dir, excluded_paths)
                 || path_is_excluded(&transcript, excluded_paths)
             {
@@ -1243,37 +1314,26 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
                 continue;
             }
 
-            // The transcript we actually parse — required for reconstruction.
-            let transcript = AntigravityConnector::transcript_path(&conversation_dir);
-            if transcript.is_file()
-                && !path_is_excluded(&transcript, &excluded_paths)
-                && seen.insert(dedupe_path_key(&transcript))
-            {
+            // The transcripts the parser can use, in native selection order.
+            // The first discovered candidate is the file the parser reads —
+            // required for reconstruction; the other is a fallback worth
+            // mirroring (optional).
+            let mut primary_taken = false;
+            for transcript in AntigravityConnector::transcript_candidates(&conversation_dir) {
+                if path_is_excluded(&transcript, &excluded_paths)
+                    || !seen.insert(dedupe_path_key(&transcript))
+                {
+                    continue;
+                }
+                let required = !primary_taken;
+                primary_taken = true;
                 out.push(
                     DiscoveredSourceFile::new(
                         AGENT_SLUG,
                         &root,
                         transcript,
                         DiscoveredSourceRole::PrimarySessionLog,
-                        true,
-                    )
-                    .with_fs_metadata(),
-                );
-            }
-
-            // The fuller transcript variant, if present (optional).
-            let transcript_full = AntigravityConnector::transcript_full_path(&conversation_dir);
-            if transcript_full.is_file()
-                && !path_is_excluded(&transcript_full, &excluded_paths)
-                && seen.insert(dedupe_path_key(&transcript_full))
-            {
-                out.push(
-                    DiscoveredSourceFile::new(
-                        AGENT_SLUG,
-                        &root,
-                        transcript_full,
-                        DiscoveredSourceRole::PrimarySessionLog,
-                        false,
+                        required,
                     )
                     .with_fs_metadata(),
                 );
@@ -1474,6 +1534,10 @@ mod tests {
         assert!(!AntigravityConnector::is_conversation_dir(dir.path()));
         let logs = dir.path().join(".system_generated").join("logs");
         fs::create_dir_all(&logs).unwrap();
+        // Either transcript variant marks the directory (native parity):
+        // transcript_full.jsonl alone is enough, transcript.jsonl too.
+        fs::write(logs.join("transcript_full.jsonl"), "{}\n").unwrap();
+        assert!(AntigravityConnector::is_conversation_dir(dir.path()));
         fs::write(logs.join("transcript.jsonl"), "{}\n").unwrap();
         assert!(AntigravityConnector::is_conversation_dir(dir.path()));
     }
@@ -1570,9 +1634,11 @@ mod tests {
         assert_eq!(conv.metadata["source"], "antigravity");
         assert!(conv.title.as_deref().unwrap().starts_with("Read data.txt"));
         assert!(conv.started_at.unwrap() <= conv.ended_at.unwrap());
+        // The fixture's transcript_full.jsonl is as fresh as transcript.jsonl,
+        // so the native priority rule selects it as the parse source.
         assert_eq!(
             conv.source_path,
-            AntigravityConnector::transcript_path(&fixture_conversation_dir())
+            AntigravityConnector::transcript_full_path(&fixture_conversation_dir())
         );
 
         // CONVERSATION_HISTORY is dropped; every other record becomes a message.
@@ -2041,6 +2107,93 @@ mod tests {
     }
 
     #[test]
+    fn media_only_user_input_is_emitted_not_dropped() {
+        // Native renders attachment turns whose <USER_REQUEST> body is empty;
+        // the record must emit a user message carrying the media refs instead
+        // of vanishing.
+        let rec = serde_json::json!({
+            "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": "2026-06-11T20:14:42Z",
+            "content": "<USER_REQUEST>\n\n</USER_REQUEST>",
+            "media": [{"mime_type": "image/png", "uri": "file:///tmp/synthetic-shot.png"}]
+        });
+        let msg = record_to_message(&rec).expect("media-only USER_INPUT must not vanish");
+        assert_eq!(msg.role, "user");
+        assert!(msg.content.is_empty());
+        assert_eq!(
+            msg.extra["media"],
+            serde_json::json!([
+                {"mime_type": "image/png", "uri": "file:///tmp/synthetic-shot.png"}
+            ])
+        );
+        assert_eq!(msg.extra["agy_raw"], rec);
+
+        // The wrappers that rode along on the attachment turn still reach extras.
+        let rec = serde_json::json!({
+            "step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": "2026-06-11T20:14:43Z",
+            "content": "<USER_REQUEST></USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal noon\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nchanged to Gemini 3.1 Pro (High). ok\n</USER_SETTINGS_CHANGE>",
+            "media": [{"mime_type": "image/png", "uri": "file:///tmp/synthetic-shot-2.png"}]
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.role, "user");
+        assert!(msg.content.is_empty());
+        assert!(
+            msg.extra["settings_change"]
+                .as_str()
+                .unwrap()
+                .contains("Gemini 3.1 Pro (High)")
+        );
+        assert_eq!(msg.extra["additional_metadata"], "local noon");
+
+        // A truly empty turn (no body, no media) is still dropped.
+        let rec = serde_json::json!({
+            "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": "2026-06-11T20:14:44Z",
+            "content": "<USER_REQUEST>\n\n</USER_REQUEST>"
+        });
+        assert!(record_to_message(&rec).is_none());
+    }
+
+    #[test]
+    fn error_only_model_step_is_emitted_with_error_text() {
+        // An error-only GENERIC step (no content, thinking or tool_calls)
+        // carries its failure text in `error`; emit it like ERROR_MESSAGE
+        // does instead of dropping the record.
+        let rec = serde_json::json!({
+            "step_index": 6, "source": "MODEL", "type": "GENERIC",
+            "status": "ERROR", "created_at": "2026-06-11T20:14:46Z",
+            "error": "the widget pipeline collapsed"
+        });
+        let msg = record_to_message(&rec).expect("error-only MODEL step must not vanish");
+        assert_eq!(msg.role, "tool");
+        assert_eq!(msg.author.as_deref(), Some("generic"));
+        assert_eq!(msg.content, "the widget pipeline collapsed");
+        assert_eq!(msg.extra["agy_type"], "GENERIC");
+        assert_eq!(msg.extra["error"], "the widget pipeline collapsed");
+        assert_eq!(msg.extra["agy_raw"], rec);
+        assert!(msg.invocations.is_empty());
+
+        // Whitespace-only error text still leaves nothing to emit.
+        let rec = serde_json::json!({
+            "source": "MODEL", "type": "GENERIC",
+            "status": "ERROR", "created_at": "2026-06-11T20:14:47Z",
+            "error": "   "
+        });
+        assert!(record_to_message(&rec).is_none());
+
+        // Content keeps precedence over a same-record error field.
+        let rec = serde_json::json!({
+            "source": "MODEL", "type": "GENERIC",
+            "status": "ERROR", "created_at": "2026-06-11T20:14:48Z",
+            "content": "partial output before the failure",
+            "error": "the widget pipeline collapsed"
+        });
+        let msg = record_to_message(&rec).unwrap();
+        assert_eq!(msg.content, "partial output before the failure");
+    }
+
+    #[test]
     fn conversation_history_content_is_emitted() {
         // Real shape: CONVERSATION_HISTORY is a marker record, but one real
         // record carries text — that text must reach the packet (F10 item 5).
@@ -2169,19 +2322,22 @@ mod tests {
         let discovered = connector.discover_source_files(&fixture_ctx()).unwrap();
 
         assert!(discovered.iter().all(|d| d.provider_slug == "antigravity"));
+        // The fixture's transcript_full.jsonl is the freshest transcript, so
+        // it is the required primary source; transcript.jsonl stays
+        // discovered as the optional fallback.
         assert!(
             discovered
                 .iter()
-                .any(|d| d.source_path.ends_with("transcript.jsonl")
+                .any(|d| d.source_path.ends_with("transcript_full.jsonl")
                     && d.role == DiscoveredSourceRole::PrimarySessionLog
                     && d.required_for_reconstruction),
-            "transcript.jsonl must be a required primary source"
+            "transcript_full.jsonl must be the required primary source"
         );
         assert!(
             discovered
                 .iter()
-                .any(|d| d.source_path.ends_with("transcript_full.jsonl")),
-            "transcript_full.jsonl should be discovered"
+                .any(|d| d.source_path.ends_with("transcript.jsonl")),
+            "transcript.jsonl should still be discovered as a fallback"
         );
         assert!(
             discovered
@@ -2589,6 +2745,242 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["step_index"], 0);
         assert_eq!(records[1]["step_index"], 2);
+    }
+
+    // -----------------------------------------------------------------
+    // transcript_full.jsonl selection (native `get_best_log_file` parity,
+    // claude_viewer providers/antigravity/discovery.py): the fuller
+    // transcript is the higher-priority candidate and wins whenever it is
+    // not stale; the short transcript takes over when it is fresher or the
+    // full file cannot produce records.
+    // -----------------------------------------------------------------
+
+    /// Write `contents` as `brain/<uuid>/.system_generated/logs/<name>` inside
+    /// `base` and return the conversation directory.
+    fn write_named_transcript(base: &Path, uuid: &str, name: &str, contents: &str) -> PathBuf {
+        let conv_dir = base.join("brain").join(uuid);
+        let logs = conv_dir.join(".system_generated").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join(name), contents).unwrap();
+        conv_dir
+    }
+
+    fn set_file_mtime(path: &Path, secs_since_epoch: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_since_epoch))
+            .unwrap();
+    }
+
+    #[test]
+    fn transcript_full_is_preferred_on_equal_or_newer_mtime() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "10101010-1010-4101-8101-101010101010";
+        let conv_dir = write_named_transcript(
+            base,
+            uuid,
+            "transcript.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nshort transcript marker\n</USER_REQUEST>")
+            ),
+        );
+        write_named_transcript(
+            base,
+            uuid,
+            "transcript_full.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nfull transcript marker\n</USER_REQUEST>")
+            ),
+        );
+        let logs = conv_dir.join(".system_generated").join("logs");
+        // Equal mtime (priority wins), then a strictly newer full file.
+        for full_mtime in [1_000, 2_000] {
+            set_file_mtime(&logs.join("transcript.jsonl"), 1_000);
+            set_file_mtime(&logs.join("transcript_full.jsonl"), full_mtime);
+            let convs = ag_scan(base);
+            assert_eq!(convs.len(), 1);
+            assert_eq!(convs[0].external_id.as_deref(), Some(uuid));
+            assert_eq!(
+                convs[0].source_path,
+                logs.join("transcript_full.jsonl"),
+                "transcript_full must be the parse source at mtime {full_mtime}"
+            );
+            assert_eq!(convs[0].messages[0].content, "full transcript marker");
+            // The archived record proves the full file was read — records
+            // from the two transcripts are never stitched together.
+            assert_eq!(
+                convs[0].messages[0].extra["agy_raw"]["content"],
+                "<USER_REQUEST>\nfull transcript marker\n</USER_REQUEST>"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_transcript_full_falls_back_to_short() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "20202020-2020-4202-8202-202020202020";
+        let conv_dir = write_named_transcript(base, uuid, "transcript_full.jsonl", "");
+        write_named_transcript(
+            base,
+            uuid,
+            "transcript.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nshort marker\n</USER_REQUEST>")
+            ),
+        );
+        let logs = conv_dir.join(".system_generated").join("logs");
+        // Even with a newer mtime, a 0-byte full file produces no records.
+        set_file_mtime(&logs.join("transcript_full.jsonl"), 2_000);
+        set_file_mtime(&logs.join("transcript.jsonl"), 1_000);
+        let convs = ag_scan(base);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].source_path, logs.join("transcript.jsonl"));
+        assert_eq!(convs[0].messages[0].content, "short marker");
+    }
+
+    #[test]
+    fn stale_transcript_full_loses_to_fresher_short() {
+        // mtime dominates priority: a newer short transcript wins over a
+        // stale full one (native sort key order).
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "30303030-3030-4303-8303-303030303030";
+        let conv_dir = write_named_transcript(
+            base,
+            uuid,
+            "transcript.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nfresh short marker\n</USER_REQUEST>")
+            ),
+        );
+        write_named_transcript(
+            base,
+            uuid,
+            "transcript_full.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nstale full marker\n</USER_REQUEST>")
+            ),
+        );
+        let logs = conv_dir.join(".system_generated").join("logs");
+        set_file_mtime(&logs.join("transcript_full.jsonl"), 1_000);
+        set_file_mtime(&logs.join("transcript.jsonl"), 2_000);
+        let convs = ag_scan(base);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].source_path, logs.join("transcript.jsonl"));
+        assert_eq!(convs[0].messages[0].content, "fresh short marker");
+    }
+
+    #[test]
+    fn corrupt_or_oversized_transcript_full_falls_back_to_short() {
+        // A full file that yields no records — unreadable junk lines, or a
+        // size over the 100 MiB scan cap — is skipped for the next
+        // candidate instead of losing the conversation.
+        for label in ["corrupt", "oversized"] {
+            let dir = TempDir::new().unwrap();
+            let base = dir.path();
+            let uuid = "40404040-4040-4404-8404-404040404040";
+            let conv_dir = write_named_transcript(
+                base,
+                uuid,
+                "transcript.jsonl",
+                &format!(
+                    "{}\n",
+                    ag_user_step("<USER_REQUEST>\nshort marker\n</USER_REQUEST>")
+                ),
+            );
+            let logs = conv_dir.join(".system_generated").join("logs");
+            let full = logs.join("transcript_full.jsonl");
+            if label == "oversized" {
+                fs::File::create(&full)
+                    .unwrap()
+                    .set_len(101 * 1024 * 1024)
+                    .unwrap();
+            } else {
+                fs::write(&full, "this is not json\n{\"step_index\":0,\"unclosed\":").unwrap();
+            }
+            // Newer mtime: the full file is tried first and must fail over.
+            set_file_mtime(&full, 2_000);
+            set_file_mtime(&logs.join("transcript.jsonl"), 1_000);
+            let convs = ag_scan(base);
+            assert_eq!(
+                convs.len(),
+                1,
+                "{label}: the short transcript must still serve the conversation"
+            );
+            assert_eq!(
+                convs[0].source_path,
+                logs.join("transcript.jsonl"),
+                "{label}"
+            );
+            assert_eq!(convs[0].messages[0].content, "short marker", "{label}");
+        }
+    }
+
+    #[test]
+    fn transcript_full_only_directory_is_discovered_and_parsed() {
+        // A brain/<uuid> holding ONLY transcript_full.jsonl is still a
+        // conversation directory (native discovery parity).
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "50505050-5050-4505-8505-505050505050";
+        let conv_dir = write_named_transcript(
+            base,
+            uuid,
+            "transcript_full.jsonl",
+            &format!(
+                "{}\n{}\n",
+                ag_user_step("<USER_REQUEST>\nfull-only marker\n</USER_REQUEST>"),
+                ag_assistant_step()
+            ),
+        );
+        assert!(
+            AntigravityConnector::is_conversation_dir(&conv_dir),
+            "transcript_full.jsonl alone must mark a conversation dir"
+        );
+        assert_eq!(
+            AntigravityConnector::conversation_dirs(base),
+            vec![conv_dir.clone()],
+            "walk discovery must reach a full-only conversation dir"
+        );
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            None,
+        );
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some(uuid));
+        assert_eq!(
+            convs[0].source_path,
+            conv_dir
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript_full.jsonl")
+        );
+        assert_eq!(convs[0].messages.len(), 2);
+        assert_eq!(convs[0].messages[0].content, "full-only marker");
+
+        // Discovery lists the file the parser actually reads as required.
+        let discovered = AntigravityConnector::new()
+            .discover_source_files(&ctx)
+            .unwrap();
+        assert!(
+            discovered.iter().any(|d| {
+                d.source_path.ends_with("transcript_full.jsonl")
+                    && d.role == DiscoveredSourceRole::PrimarySessionLog
+                    && d.required_for_reconstruction
+            }),
+            "a full-only transcript is the required primary source"
+        );
     }
 
     // -----------------------------------------------------------------

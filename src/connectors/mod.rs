@@ -31,6 +31,7 @@ pub mod grok;
 pub mod grok_bot;
 #[cfg(feature = "hermes")]
 pub mod hermes;
+pub(crate) mod json_stream;
 pub(crate) mod jsonl;
 pub mod kimi;
 pub mod kiro;

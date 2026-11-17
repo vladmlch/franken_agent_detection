@@ -107,6 +107,17 @@
 //! way; records the connector drops whole (empty-body `USER_INPUT` turns with
 //! no attachments, content-less markers) still emit no message and therefore
 //! no archive.
+//!
+//! ## Workspace
+//!
+//! `conversation.workspace` is read ONLY from host-stamped metadata: a
+//! `<user_information>` block on a `USER_INPUT`/`SYSTEM` record's `content`
+//! or `prompt`. The first `Active Workspaces:` entry wins; `Command Working
+//! Directory:` is the fallback. Candidates must be absolute paths outside
+//! `.gemini`. No path is ever inferred from tool calls or request text — a
+//! `<user_information>` example pasted into `<USER_REQUEST>` is user-typed,
+//! not evidence — and `ScanRoot::apply_workspace_rewrite` still rewrites the
+//! result for remote mirrors.
 
 use std::collections::HashMap;
 use std::fs;
@@ -561,6 +572,142 @@ fn detect_model(records: &[Value]) -> Option<String> {
         {
             if let Some(model) = model_from_settings(&settings) {
                 return Some(model);
+            }
+        }
+    }
+    None
+}
+
+/// `content` with every `<TAG>…</TAG>` span removed. Unterminated opens keep
+/// their remainder verbatim.
+fn strip_tagged_blocks(content: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find(&open) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else {
+            break;
+        };
+        rest = &after[end + close.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A single workspace path candidate: trimmed, unquoted, `file://` URIs
+/// unwrapped, and required to be an absolute path — Unix `/...` (never the
+/// bare root `/`) or a Windows drive `X:\...` / `X:/...` (never the bare
+/// drive root). Anything inside a `.gemini` directory is the agent's own
+/// store, never a user workspace.
+fn workspace_path_candidate(raw: &str) -> Option<PathBuf> {
+    let mut path = raw
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`')
+        .trim();
+    if let Some(rest) = path.strip_prefix("file://") {
+        path = rest.trim();
+        // A `file:///C:/...`-style URI leaves a leading slash on the drive.
+        if let Some(rest) = path.strip_prefix('/') {
+            let b = rest.as_bytes();
+            if b.len() > 1 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                path = rest;
+            }
+        }
+    }
+    let bytes = path.as_bytes();
+    let is_unix_abs = bytes.first() == Some(&b'/') && bytes.len() > 1;
+    let is_win_drive = bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    if !is_unix_abs && !is_win_drive {
+        return None;
+    }
+    if path
+        .replace('\\', "/")
+        .split('/')
+        .any(|seg| seg == ".gemini")
+    {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// Parse one `<user_information>` body for the session's workspace. Two
+/// host-stamped markers carry it: the `Active Workspaces:` section (its
+/// first `- <path>` entry — the workspace folder list, the same notion
+/// `conversations.workspace_id` groups by) and `Command Working Directory:
+/// <path>` (the session cwd, the fallback when no list is stamped). Nothing
+/// else in the block is interpreted.
+fn workspace_from_user_information(info: &str) -> Option<PathBuf> {
+    let mut cwd = None;
+    let mut first_workspace = None;
+    let mut in_workspaces = false;
+    for line in info.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let is_list_item = trimmed.starts_with('-');
+        // Unwrap lightweight list/markdown dressing so `Active Workspaces:`,
+        // `- Active Workspaces:` and `**Active Workspaces**:` all register.
+        let entry = trimmed
+            .trim_start_matches('-')
+            .trim_start()
+            .trim_matches('*')
+            .trim();
+        if let Some(rest) = entry.strip_prefix("Command Working Directory:") {
+            if cwd.is_none() {
+                cwd = workspace_path_candidate(rest);
+            }
+            in_workspaces = false;
+        } else if entry == "Active Workspaces:" {
+            in_workspaces = true;
+        } else if in_workspaces && is_list_item {
+            if first_workspace.is_none() {
+                first_workspace = workspace_path_candidate(entry);
+            }
+        } else if !is_list_item {
+            in_workspaces = false;
+        }
+    }
+    first_workspace.or(cwd)
+}
+
+/// The conversation's workspace, read ONLY from host-stamped
+/// `<user_information>` metadata: a `<USER_INPUT>`/`SYSTEM` record's
+/// `content` or `prompt` field. For `USER_INPUT` records the `<USER_REQUEST>`
+/// bodies are removed first — the request text is user-typed, so a
+/// `<user_information>` example pasted into it is not evidence. Paths are
+/// never inferred from tool-call arguments or message text: an unrelated
+/// `read_file` must not mint a wrong `conversations.workspace_id`.
+fn extract_workspace_from_records(records: &[Value]) -> Option<PathBuf> {
+    for rec in records {
+        let is_user_input = rec.get("type").and_then(Value::as_str) == Some("USER_INPUT");
+        let is_system = rec.get("source").and_then(Value::as_str) == Some("SYSTEM");
+        if !is_user_input && !is_system {
+            continue;
+        }
+        for key in ["content", "prompt"] {
+            let Some(raw) = rec.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            let stripped;
+            let text = if is_user_input {
+                stripped = strip_tagged_blocks(raw, "USER_REQUEST");
+                &stripped
+            } else {
+                raw
+            };
+            for block in extract_tagged_blocks(text, "user_information") {
+                if let Some(workspace) = workspace_from_user_information(&block) {
+                    return Some(workspace);
+                }
             }
         }
     }
@@ -1127,6 +1274,7 @@ fn parse_conversation_from_transcript(
         .as_ref()
         .map(|uuid| layout.unwrap_or(AntigravityLayout::Cli).external_id(uuid));
     let model = detect_model(&records);
+    let workspace = extract_workspace_from_records(&records);
 
     let mut messages: Vec<NormalizedMessage> = Vec::new();
     let mut started_at: Option<i64> = None;
@@ -1217,7 +1365,7 @@ fn parse_conversation_from_transcript(
         agent_slug: AGENT_SLUG.to_string(),
         external_id,
         title,
-        workspace: None,
+        workspace,
         source_path: transcript.to_path_buf(),
         started_at,
         ended_at,
@@ -3834,5 +3982,205 @@ mod tests {
         let cm = ag_find(&convs, &format!("ide/{child}"));
         assert_eq!(cm["is_subagent"], serde_json::json!(true));
         assert_eq!(cm["parent_id"], serde_json::json!(format!("ide/{parent}")));
+    }
+
+    // -----------------------------------------------------------------
+    // Workspace extraction (<user_information>)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn workspace_extracts_from_user_information_block() {
+        // The host stamps <user_information> as a sibling of <USER_REQUEST>
+        // on the first user turn; both markers agree here.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "10101010-1010-4101-8101-101010101010";
+        ag_write_conversation(
+            base,
+            uuid,
+            &[
+                ag_user_step(
+                    "<user_information>\nEnvironment context\nActive Workspaces:\n- /Users/alice/proj\nCommand Working Directory: /Users/alice/proj\n</user_information>\n<USER_REQUEST>\ndo the thing\n</USER_REQUEST>",
+                ),
+                ag_assistant_step(),
+            ],
+        );
+        let convs = ag_scan(base);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].workspace, Some(PathBuf::from("/Users/alice/proj")));
+        // The wrapped request still normalizes to a clean user message.
+        let user = convs[0].messages.iter().find(|m| m.role == "user").unwrap();
+        assert_eq!(user.content, "do the thing");
+    }
+
+    #[test]
+    fn workspace_falls_back_to_command_working_directory() {
+        // No Active Workspaces section: the stamped cwd alone is the
+        // workspace. A SYSTEM record carries the block the same way.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "20202020-2020-4202-8202-202020202020";
+        ag_write_conversation(
+            base,
+            uuid,
+            &[
+                serde_json::json!({
+                    "step_index": 0, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+                    "status": "DONE", "created_at": "2026-11-12T00:00:00Z",
+                    "content": "<user_information>\nCommand Working Directory: /Users/carol/proj\n</user_information>"
+                })
+                .to_string(),
+                ag_user_step("<USER_REQUEST>\nhi\n</USER_REQUEST>"),
+                ag_assistant_step(),
+            ],
+        );
+        let convs = ag_scan(base);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].workspace, Some(PathBuf::from("/Users/carol/proj")));
+    }
+
+    #[test]
+    fn workspace_absent_without_user_information() {
+        // Conservative: request text and tool paths never mint a workspace.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "30303030-3030-4303-8303-303030303030";
+        ag_write_conversation(
+            base,
+            uuid,
+            &[
+                ag_user_step("<USER_REQUEST>\nedit /Users/dave/proj/src/main.rs\n</USER_REQUEST>"),
+                ag_assistant_step(),
+            ],
+        );
+        let convs = ag_scan(base);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].workspace, None);
+    }
+
+    #[test]
+    fn workspace_ignores_block_typed_inside_user_request() {
+        // A <user_information> example pasted into the request body is
+        // user-typed text, not host-stamped evidence — it must not mint a
+        // workspace either.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "40404040-4040-4404-8404-404040404040";
+        ag_write_conversation(
+            base,
+            uuid,
+            &[
+                ag_user_step(
+                    "<USER_REQUEST>\nexample: <user_information>\nActive Workspaces:\n- /Users/eve/fake\n</user_information>\n</USER_REQUEST>",
+                ),
+                ag_assistant_step(),
+            ],
+        );
+        let convs = ag_scan(base);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].workspace, None);
+    }
+
+    #[test]
+    fn workspace_rewrite_applies_to_extracted_workspace() {
+        // The extracted workspace flows through
+        // ScanRoot::apply_workspace_rewrite like every other connector's:
+        // remote-mirror prefixes are rewritten and the original is kept in
+        // metadata.cass.workspace_original.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "50505050-5050-4505-8505-505050505050";
+        ag_write_conversation(
+            base,
+            uuid,
+            &[
+                ag_user_step(
+                    "<user_information>\nActive Workspaces:\n- /remote/ws/proj\n</user_information>\n<USER_REQUEST>\nhi\n</USER_REQUEST>",
+                ),
+                ag_assistant_step(),
+            ],
+        );
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf()).with_rewrite("/remote/ws", "/local/mirror")],
+            None,
+        );
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].workspace,
+            Some(PathBuf::from("/local/mirror/proj"))
+        );
+        assert_eq!(
+            convs[0]
+                .metadata
+                .pointer("/cass/workspace_original")
+                .and_then(Value::as_str),
+            Some("/remote/ws/proj")
+        );
+    }
+
+    #[test]
+    fn workspace_prefers_first_active_workspace_entry() {
+        // The first listed workspace folder is the workspace identity; the
+        // Command Working Directory is the fallback when no list is stamped.
+        let info = "Active Workspaces:\n- /a/listed\n- /a/other\nCommand Working Directory: /a/cwd";
+        assert_eq!(
+            workspace_from_user_information(info),
+            Some(PathBuf::from("/a/listed"))
+        );
+        // Non-absolute list entries are skipped, not picked.
+        let info = "Active Workspaces:\n- rel/dir\n- /a/second\nCommand Working Directory: /a/cwd";
+        assert_eq!(
+            workspace_from_user_information(info),
+            Some(PathBuf::from("/a/second"))
+        );
+    }
+
+    #[test]
+    fn workspace_rejects_non_workspace_candidates() {
+        for info in [
+            // Bare filesystem roots are not workspaces.
+            "Active Workspaces:\n- /\n",
+            "Command Working Directory: /\n",
+            "Command Working Directory: C:\\\n",
+            // The agent's own ~/.gemini store is never a workspace.
+            "Active Workspaces:\n- /Users/x/.gemini/antigravity\n",
+            "Command Working Directory: /Users/x/.gemini/tmp\n",
+            // Relative paths carry no provenance.
+            "Command Working Directory: relative/path\n",
+        ] {
+            assert_eq!(workspace_from_user_information(info), None, "{info:?}");
+        }
+        // Windows drive paths are absolute too.
+        assert_eq!(
+            workspace_from_user_information("Command Working Directory: C:\\Users\\x\\proj"),
+            Some(PathBuf::from("C:\\Users\\x\\proj"))
+        );
+        assert_eq!(
+            workspace_from_user_information("Command Working Directory: D:/Users/x/proj"),
+            Some(PathBuf::from("D:/Users/x/proj"))
+        );
+        // `file://` URIs (the Windsurf-style workspace stamp) unwrap to the
+        // underlying absolute path, including the `/C:/...` drive form.
+        assert_eq!(
+            workspace_from_user_information("Active Workspaces:\n- file:///Users/alice/proj\n"),
+            Some(PathBuf::from("/Users/alice/proj"))
+        );
+        assert_eq!(
+            workspace_from_user_information("Command Working Directory: file:///C:/Users/x/proj"),
+            Some(PathBuf::from("C:/Users/x/proj"))
+        );
+        assert_eq!(
+            workspace_from_user_information("Active Workspaces:\n- file://relative/path\n"),
+            None
+        );
+        // An empty section falls through to the cwd line.
+        assert_eq!(
+            workspace_from_user_information(
+                "Active Workspaces:\nCommand Working Directory: /a/cwd\n"
+            ),
+            Some(PathBuf::from("/a/cwd"))
+        );
     }
 }

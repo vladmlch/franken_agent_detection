@@ -565,6 +565,20 @@ pub fn normalize_model(raw: &str) -> ModelInfo {
     }
 }
 
+/// Extract billed Anthropic `server_tool_use.web_search_requests` count
+/// from Claude Code / Qoder message `extra` payloads.
+#[must_use]
+pub fn extract_web_search_requests(extra: &Value) -> Option<u32> {
+    extra
+        .pointer("/cass/web_search_requests")
+        .or_else(|| extra.pointer("/cass/token_usage/server_tool_use/web_search_requests"))
+        .or_else(|| extra.pointer("/cass/token_usage/web_search_requests"))
+        .or_else(|| extra.pointer("/message/usage/server_tool_use/web_search_requests"))
+        .or_else(|| extra.pointer("/usage/server_tool_use/web_search_requests"))
+        .and_then(Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok())
+}
+
 /// Extract token usage from a Claude Code message's raw data.
 #[must_use]
 pub fn extract_claude_code_tokens(extra: &Value) -> ExtractedTokenUsage {
@@ -659,44 +673,182 @@ pub fn extract_claude_code_tokens(extra: &Value) -> ExtractedTokenUsage {
     }
 }
 
+#[derive(Default)]
+struct CodexUsageFields {
+    input_tokens: Option<i64>,
+    uncached_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+    thinking_tokens: Option<i64>,
+    service_tier: Option<String>,
+}
+
+impl CodexUsageFields {
+    const fn has_any_counts(&self) -> bool {
+        self.input_tokens.is_some()
+            || self.uncached_input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_creation_tokens.is_some()
+            || self.thinking_tokens.is_some()
+    }
+}
+
+fn read_nonneg_i64(obj: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| obj.get(*key))
+        .and_then(Value::as_i64)
+        .filter(|count| *count >= 0)
+}
+
+fn read_nonempty_str(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn read_codex_usage_block(block: &Value) -> CodexUsageFields {
+    CodexUsageFields {
+        input_tokens: read_nonneg_i64(block, &["input_tokens"]),
+        uncached_input_tokens: read_nonneg_i64(block, &["uncached_input_tokens"]),
+        output_tokens: read_nonneg_i64(block, &["output_tokens", "tokens"]),
+        cache_read_tokens: read_nonneg_i64(
+            block,
+            &[
+                "cached_input_tokens",
+                "cache_read_input_tokens",
+                "cache_read_tokens",
+            ],
+        ),
+        cache_creation_tokens: read_nonneg_i64(
+            block,
+            &[
+                "cache_write_input_tokens",
+                "cache_creation_input_tokens",
+                "cache_creation_tokens",
+            ],
+        ),
+        thinking_tokens: read_nonneg_i64(
+            block,
+            &[
+                "reasoning_output_tokens",
+                "reasoning_tokens",
+                "thinking_tokens",
+            ],
+        ),
+        service_tier: read_nonempty_str(block.get("service_tier")),
+    }
+}
+
+fn codex_tool_call_count(extra: &Value) -> u32 {
+    if let Some(count) = extra
+        .pointer("/cass/tool_call_count")
+        .and_then(Value::as_u64)
+    {
+        return u32::try_from(count).unwrap_or(u32::MAX);
+    }
+    let entry_type = extra.get("type").and_then(Value::as_str);
+    let payload = extra.get("payload");
+    let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
+    if matches!(
+        (entry_type, payload_type),
+        (
+            Some("response_item"),
+            Some("function_call" | "custom_tool_call")
+        ) | (Some("event_msg"), Some("tool_call"))
+    ) || matches!(entry_type, Some("function_call" | "custom_tool_call"))
+    {
+        return 1;
+    }
+    payload
+        .and_then(|p| p.get("content"))
+        .or_else(|| extra.get("content"))
+        .and_then(Value::as_array)
+        .map_or(0, |blocks| {
+            u32::try_from(
+                blocks
+                    .iter()
+                    .filter(|block| {
+                        matches!(
+                            block.get("type").and_then(Value::as_str),
+                            Some("tool_use" | "function_call" | "tool_call")
+                        )
+                    })
+                    .count(),
+            )
+            .unwrap_or(u32::MAX)
+        })
+}
+
 /// Extract token usage from a Codex message's raw data.
+///
+/// **CRITICAL INVARIANT**: `input_tokens` MUST remain *inclusive* of
+/// `cache_read_tokens` and `cache_creation_tokens`. `cass`'s `compute_cost`
+/// subtracts `cache_read_tokens + cache_creation_tokens` from `input_tokens`
+/// to derive uncached input cost. Codex's native `input_tokens` already
+/// includes cached tokens, so we preserve it verbatim when present; when
+/// `uncached_input_tokens` is provided separately (or raw `input_tokens` is
+/// smaller than `cache_read + cache_creation`), we reconstruct
+/// `input_tokens = uncached + cache_read + cache_creation` so
+/// `input_tokens >= cache_read + cache_creation` holds.
 #[must_use]
 pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
-    let mut input_tokens = None;
-    let mut output_tokens = None;
+    let mut fields = CodexUsageFields::default();
     let mut data_source = TokenDataSource::Estimated;
 
     if let Some(attached) = extra.pointer("/cass/token_usage") {
-        input_tokens = attached.get("input_tokens").and_then(Value::as_i64);
-        output_tokens = attached
-            .get("output_tokens")
-            .and_then(Value::as_i64)
-            .or_else(|| attached.get("tokens").and_then(Value::as_i64));
-
-        let source = attached.get("data_source").and_then(|v| v.as_str());
-        if source == Some("api") || input_tokens.is_some() || output_tokens.is_some() {
+        fields = read_codex_usage_block(attached);
+        if attached.get("data_source").and_then(Value::as_str) == Some("api")
+            || fields.has_any_counts()
+        {
             data_source = TokenDataSource::Api;
         }
     }
 
-    if input_tokens.is_none()
-        && output_tokens.is_none()
-        && extra.get("type").and_then(|v| v.as_str()) == Some("event_msg")
+    if !fields.has_any_counts()
+        && extra.get("type").and_then(Value::as_str) == Some("event_msg")
         && let Some(payload) = extra.get("payload")
-        && payload.get("type").and_then(|v| v.as_str()) == Some("token_count")
+        && payload.get("type").and_then(Value::as_str) == Some("token_count")
     {
         // Real rollouts nest per-turn usage at info.last_token_usage
         // (info.total_token_usage is cumulative — never attach it).
         let usage_block = payload.pointer("/info/last_token_usage").unwrap_or(payload);
-        input_tokens = usage_block.get("input_tokens").and_then(Value::as_i64);
-        output_tokens = usage_block
-            .get("output_tokens")
-            .and_then(Value::as_i64)
-            .or_else(|| usage_block.get("tokens").and_then(Value::as_i64));
-        if input_tokens.is_some() || output_tokens.is_some() {
+        let fallback = read_codex_usage_block(usage_block);
+        if fields.service_tier.is_none() {
+            fields.service_tier = fallback.service_tier;
+        }
+        fields.input_tokens = fallback.input_tokens;
+        fields.uncached_input_tokens = fallback.uncached_input_tokens;
+        fields.output_tokens = fallback.output_tokens;
+        fields.cache_read_tokens = fallback.cache_read_tokens;
+        fields.cache_creation_tokens = fallback.cache_creation_tokens;
+        fields.thinking_tokens = fallback.thinking_tokens;
+        if fields.has_any_counts() {
             data_source = TokenDataSource::Api;
         }
     }
+
+    let cache_sum = fields
+        .cache_read_tokens
+        .unwrap_or(0)
+        .saturating_add(fields.cache_creation_tokens.unwrap_or(0));
+    let mut input_tokens = fields.input_tokens;
+    if let Some(uncached) = fields.uncached_input_tokens {
+        let inclusive = uncached.saturating_add(cache_sum);
+        input_tokens = Some(match input_tokens {
+            Some(raw) if raw >= cache_sum => raw,
+            _ => inclusive,
+        });
+    }
+
+    let service_tier = fields
+        .service_tier
+        .or_else(|| read_nonempty_str(extra.pointer("/cass/service_tier")))
+        .or_else(|| read_nonempty_str(extra.get("service_tier")))
+        .or_else(|| read_nonempty_str(extra.pointer("/payload/service_tier")))
+        .or_else(|| read_nonempty_str(extra.pointer("/response/service_tier")));
 
     let model_name = extra
         .get("model")
@@ -708,54 +860,20 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
     let provider = model_name
         .as_deref()
         .map(|name| normalize_model(name).provider);
-    let tool_call_count = extra
-        .pointer("/cass/tool_call_count")
-        .and_then(Value::as_u64)
-        .and_then(|count| u32::try_from(count).ok())
-        .unwrap_or_else(|| {
-            let entry_type = extra.get("type").and_then(Value::as_str);
-            let payload = extra.get("payload");
-            let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
-            if matches!(
-                (entry_type, payload_type),
-                (
-                    Some("response_item"),
-                    Some("function_call" | "custom_tool_call")
-                ) | (Some("event_msg"), Some("tool_call"))
-            ) || matches!(entry_type, Some("function_call" | "custom_tool_call"))
-            {
-                1
-            } else {
-                payload
-                    .and_then(|p| p.get("content"))
-                    .or_else(|| extra.get("content"))
-                    .and_then(Value::as_array)
-                    .map_or(0, |blocks| {
-                        u32::try_from(
-                            blocks
-                                .iter()
-                                .filter(|block| {
-                                    matches!(
-                                        block.get("type").and_then(Value::as_str),
-                                        Some("tool_use" | "function_call" | "tool_call")
-                                    )
-                                })
-                                .count(),
-                        )
-                        .unwrap_or(u32::MAX)
-                    })
-            }
-        });
+    let tool_call_count = codex_tool_call_count(extra);
 
     ExtractedTokenUsage {
         model_name,
         provider,
         input_tokens,
-        output_tokens,
+        output_tokens: fields.output_tokens,
+        cache_read_tokens: fields.cache_read_tokens,
+        cache_creation_tokens: fields.cache_creation_tokens,
+        thinking_tokens: fields.thinking_tokens,
+        service_tier,
         has_tool_calls: tool_call_count > 0,
         tool_call_count,
         data_source,
-        ..Default::default()
     }
 }
 
@@ -1068,6 +1186,156 @@ fn extract_opencode_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
     extracted
 }
 
+fn extract_generic_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
+    let model_name = extra
+        .get("model")
+        .or_else(|| extra.pointer("/cass/model"))
+        .or_else(|| extra.pointer("/message/model"))
+        .or_else(|| extra.pointer("/modelConfig/modelName"))
+        .or_else(|| extra.pointer("/modelInfo/modelName"))
+        .or_else(|| extra.get("modelType"))
+        .or_else(|| extra.get("modelID"))
+        .or_else(|| extra.get("model_name"))
+        .or_else(|| extra.pointer("/_meta/modelId"))
+        .or_else(|| extra.pointer("/metadata/model_slug"))
+        .or_else(|| extra.pointer("/data/model"))
+        .or_else(|| extra.pointer("/payload/model"))
+        .or_else(|| extra.pointer("/session_state/model_info/model_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from);
+    let provider = extra
+        .get("provider")
+        .or_else(|| extra.get("provider_name"))
+        .or_else(|| extra.pointer("/message/provider"))
+        .or_else(|| extra.pointer("/modelInfo/provider"))
+        .or_else(|| extra.pointer("/cass/provider"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .or_else(|| {
+            model_name
+                .as_deref()
+                .map(|name| normalize_model(name).provider)
+        });
+    let tool_call_count = extra
+        .pointer("/cass/tool_call_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok())
+        .unwrap_or_else(|| {
+            if extra.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call")
+                || (role == "tool" && extra.get("agy_type").is_some())
+            {
+                1
+            } else if extra.get("role").and_then(Value::as_str) == Some("assistant") {
+                extra
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .map_or(0, |calls| {
+                        u32::try_from(
+                            calls
+                                .iter()
+                                .filter(|call| {
+                                    call.as_object().is_some_and(|obj| {
+                                        matches!(obj.get("type"), None | Some(Value::Null))
+                                            || obj.get("type").and_then(Value::as_str)
+                                                == Some("function")
+                                    }) && call
+                                        .pointer("/function/name")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|name| !name.trim().is_empty())
+                                })
+                                .count(),
+                        )
+                        .unwrap_or(u32::MAX)
+                    })
+            } else {
+                0
+            }
+        });
+    ExtractedTokenUsage {
+        model_name,
+        provider,
+        has_tool_calls: tool_call_count > 0,
+        tool_call_count,
+        ..Default::default()
+    }
+}
+
+/// Extract API token usage from a Devin message's raw `extra` payload.
+///
+/// Reads `extra.metrics` (or `extra.metadata.metrics`, `extra.cass.token_usage`,
+/// `extra.token_usage`) for `input_tokens`, `output_tokens`, `cache_read_tokens`,
+/// and `cache_creation_tokens`, ignoring JSON `null` values, and prefers
+/// `extra.generation_model` over `extra.model`. Falls back to
+/// [`extract_generic_tokens`] when no API metrics are present.
+#[must_use]
+pub fn extract_devin_tokens(extra: &Value) -> ExtractedTokenUsage {
+    let role = extra.get("role").and_then(Value::as_str).unwrap_or("");
+    extract_devin_tokens_with_role(extra, role)
+}
+
+fn extract_devin_tokens_with_role(extra: &Value, role: &str) -> ExtractedTokenUsage {
+    let mut extracted = extract_generic_tokens(extra, role);
+
+    let explicit_provider = extra
+        .get("provider")
+        .or_else(|| extra.get("provider_name"))
+        .or_else(|| extra.pointer("/message/provider"))
+        .or_else(|| extra.pointer("/modelInfo/provider"))
+        .or_else(|| extra.pointer("/cass/provider"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+
+    let generation_model = read_nonempty_str(
+        extra
+            .get("generation_model")
+            .or_else(|| extra.pointer("/metadata/generation_model")),
+    );
+
+    if let Some(gen_model) = generation_model {
+        if !explicit_provider {
+            extracted.provider = Some(normalize_model(&gen_model).provider);
+        }
+        extracted.model_name = Some(gen_model);
+    }
+
+    for metrics in [
+        extra.get("metrics"),
+        extra.pointer("/metadata/metrics"),
+        extra.pointer("/cass/token_usage"),
+        extra.get("token_usage"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|v| v.is_object())
+    {
+        let input_tokens = read_nonneg_i64(metrics, &["input_tokens"]);
+        let output_tokens = read_nonneg_i64(metrics, &["output_tokens"]);
+        let cache_read_tokens =
+            read_nonneg_i64(metrics, &["cache_read_tokens", "cache_read_input_tokens"]);
+        let cache_creation_tokens = read_nonneg_i64(
+            metrics,
+            &["cache_creation_tokens", "cache_creation_input_tokens"],
+        );
+
+        if input_tokens.is_some()
+            || output_tokens.is_some()
+            || cache_read_tokens.is_some()
+            || cache_creation_tokens.is_some()
+        {
+            extracted.input_tokens = input_tokens;
+            extracted.output_tokens = output_tokens;
+            extracted.cache_read_tokens = cache_read_tokens;
+            extracted.cache_creation_tokens = cache_creation_tokens;
+            extracted.data_source = TokenDataSource::Api;
+            break;
+        }
+    }
+
+    extracted
+}
+
 /// Extract token usage from a message, dispatching by agent type.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -1356,83 +1624,10 @@ pub fn extract_tokens_for_agent(
                 }
             }
         }
+        "devin" => extract_devin_tokens_with_role(extra, role),
         "cursor" | "factory" | "antigravity" | "grok" | "goose" | "vibe" | "clawdbot"
-        | "codebuff" | "copilot_cli" | "hermes" | "devin" | "chatgpt" | "kiro" | "muse"
-        | "openhands" | "aider" | "grok_bot" => {
-            let model_name = extra
-                .get("model")
-                .or_else(|| extra.pointer("/cass/model"))
-                .or_else(|| extra.pointer("/message/model"))
-                .or_else(|| extra.pointer("/modelConfig/modelName"))
-                .or_else(|| extra.pointer("/modelInfo/modelName"))
-                .or_else(|| extra.get("modelType"))
-                .or_else(|| extra.get("modelID"))
-                .or_else(|| extra.get("model_name"))
-                .or_else(|| extra.pointer("/_meta/modelId"))
-                .or_else(|| extra.pointer("/metadata/model_slug"))
-                .or_else(|| extra.pointer("/data/model"))
-                .or_else(|| extra.pointer("/payload/model"))
-                .or_else(|| extra.pointer("/session_state/model_info/model_id"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(String::from);
-            let provider = extra
-                .get("provider")
-                .or_else(|| extra.get("provider_name"))
-                .or_else(|| extra.pointer("/message/provider"))
-                .or_else(|| extra.pointer("/modelInfo/provider"))
-                .or_else(|| extra.pointer("/cass/provider"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .map(String::from)
-                .or_else(|| {
-                    model_name
-                        .as_deref()
-                        .map(|name| normalize_model(name).provider)
-                });
-            let tool_call_count = extra
-                .pointer("/cass/tool_call_count")
-                .and_then(Value::as_u64)
-                .and_then(|count| u32::try_from(count).ok())
-                .unwrap_or_else(|| {
-                    if extra.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call")
-                        || (role == "tool" && extra.get("agy_type").is_some())
-                    {
-                        1
-                    } else if extra.get("role").and_then(Value::as_str) == Some("assistant") {
-                        extra
-                            .get("tool_calls")
-                            .and_then(Value::as_array)
-                            .map_or(0, |calls| {
-                                u32::try_from(
-                                    calls
-                                        .iter()
-                                        .filter(|call| {
-                                            call.as_object().is_some_and(|obj| {
-                                                matches!(obj.get("type"), None | Some(Value::Null))
-                                                    || obj.get("type").and_then(Value::as_str)
-                                                        == Some("function")
-                                            }) && call
-                                                .pointer("/function/name")
-                                                .and_then(Value::as_str)
-                                                .is_some_and(|name| !name.trim().is_empty())
-                                        })
-                                        .count(),
-                                )
-                                .unwrap_or(u32::MAX)
-                            })
-                    } else {
-                        0
-                    }
-                });
-            ExtractedTokenUsage {
-                model_name,
-                provider,
-                has_tool_calls: tool_call_count > 0,
-                tool_call_count,
-                ..Default::default()
-            }
-        }
+        | "codebuff" | "copilot_cli" | "hermes" | "chatgpt" | "kiro" | "muse" | "openhands"
+        | "aider" | "grok_bot" => extract_generic_tokens(extra, role),
         // Crush and Muse record API token counters only at the session level
         // (`conversation.metadata.prompt_tokens`/`completion_tokens` for Crush;
         // `conversation.metadata.usage` for Muse, because Muse's
@@ -2200,5 +2395,250 @@ mod tests {
         assert_eq!(kimi_usage.output_tokens, Some(45));
         assert!(kimi_usage.has_tool_calls);
         assert_eq!(kimi_usage.tool_call_count, 1);
+    }
+
+    #[test]
+    fn extract_devin_tokens_reads_api_metrics_nulls_zero_and_nonzero_cache() {
+        let with_cache = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "generation_model": "claude-opus-4-6",
+            "metrics": {
+                "input_tokens": 1200,
+                "output_tokens": 350,
+                "cache_read_tokens": 800,
+                "cache_creation_tokens": 200
+            },
+            "cass": {
+                "tool_call_count": 2
+            }
+        });
+        let usage = extract_tokens_for_agent("devin", &with_cache, "Answer", "assistant");
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+        assert_eq!(usage.model_name.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(usage.provider.as_deref(), Some("anthropic"));
+        assert_eq!(usage.input_tokens, Some(1200));
+        assert_eq!(usage.output_tokens, Some(350));
+        assert_eq!(usage.cache_read_tokens, Some(800));
+        assert_eq!(usage.cache_creation_tokens, Some(200));
+        assert!(usage.has_tool_calls);
+        assert_eq!(usage.tool_call_count, 2);
+
+        let with_nulls_and_zeros = serde_json::json!({
+            "model": "gpt-4o",
+            "metrics": {
+                "input_tokens": 500,
+                "output_tokens": 125,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": null
+            }
+        });
+        let zero_cache =
+            extract_tokens_for_agent("devin", &with_nulls_and_zeros, "Answer", "assistant");
+        assert_eq!(zero_cache.data_source, TokenDataSource::Api);
+        assert_eq!(zero_cache.model_name.as_deref(), Some("gpt-4o"));
+        assert_eq!(zero_cache.provider.as_deref(), Some("openai"));
+        assert_eq!(zero_cache.input_tokens, Some(500));
+        assert_eq!(zero_cache.output_tokens, Some(125));
+        assert_eq!(zero_cache.cache_read_tokens, Some(0));
+        assert_eq!(zero_cache.cache_creation_tokens, None);
+
+        let via_cass_token_usage = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "cass": {
+                "token_usage": {
+                    "input_tokens": 42,
+                    "output_tokens": 18,
+                    "cache_read_tokens": null,
+                    "cache_creation_tokens": 0
+                }
+            }
+        });
+        let direct = extract_devin_tokens(&via_cass_token_usage);
+        assert_eq!(direct.data_source, TokenDataSource::Api);
+        assert_eq!(direct.input_tokens, Some(42));
+        assert_eq!(direct.output_tokens, Some(18));
+        assert_eq!(direct.cache_read_tokens, None);
+        assert_eq!(direct.cache_creation_tokens, Some(0));
+    }
+
+    #[test]
+    fn extract_devin_tokens_falls_back_to_generic_estimated_when_metrics_absent_or_null() {
+        let all_null_metrics = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "metrics": {
+                "input_tokens": null,
+                "output_tokens": null,
+                "cache_read_tokens": null,
+                "cache_creation_tokens": null
+            },
+            "cass": {
+                "tool_call_count": 1
+            }
+        });
+        let fallback = extract_tokens_for_agent(
+            "devin",
+            &all_null_metrics,
+            "Estimated assistant response text.",
+            "assistant",
+        );
+        assert_eq!(fallback.data_source, TokenDataSource::Estimated);
+        assert_eq!(fallback.model_name.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(fallback.provider.as_deref(), Some("anthropic"));
+        assert!(fallback.has_tool_calls);
+        assert_eq!(fallback.tool_call_count, 1);
+        assert!(fallback.output_tokens.unwrap() > 0);
+        assert_eq!(fallback.input_tokens, None);
+    }
+
+    #[test]
+    fn extract_codex_tokens_populates_cache_reasoning_tier_and_keeps_input_inclusive() {
+        // Native Codex `last_token_usage` where `input_tokens` already includes cached tokens.
+        let native_event = serde_json::json!({
+            "type": "event_msg",
+            "model": "gpt-5-codex",
+            "service_tier": "priority",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 600,
+                        "cache_write_input_tokens": 150,
+                        "output_tokens": 300,
+                        "reasoning_output_tokens": 120
+                    }
+                }
+            }
+        });
+        let usage = extract_codex_tokens(&native_event);
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+        assert_eq!(usage.input_tokens, Some(1000));
+        assert_eq!(usage.output_tokens, Some(300));
+        assert_eq!(usage.cache_read_tokens, Some(600));
+        assert_eq!(usage.cache_creation_tokens, Some(150));
+        assert_eq!(usage.thinking_tokens, Some(120));
+        assert_eq!(usage.service_tier.as_deref(), Some("priority"));
+        assert!(
+            usage.input_tokens.unwrap()
+                >= usage.cache_read_tokens.unwrap() + usage.cache_creation_tokens.unwrap()
+        );
+
+        // Attached `/cass/token_usage` with Anthropic-style cache keys and tier override.
+        let attached_usage = serde_json::json!({
+            "service_tier": "default",
+            "cass": {
+                "model": "gpt-5-codex",
+                "service_tier": "flex",
+                "token_usage": {
+                    "input_tokens": 2000,
+                    "output_tokens": 400,
+                    "cache_read_input_tokens": 1200,
+                    "cache_creation_input_tokens": 300,
+                    "reasoning_output_tokens": 80,
+                    "service_tier": "scale"
+                }
+            }
+        });
+        let attached = extract_codex_tokens(&attached_usage);
+        assert_eq!(attached.input_tokens, Some(2000));
+        assert_eq!(attached.cache_read_tokens, Some(1200));
+        assert_eq!(attached.cache_creation_tokens, Some(300));
+        assert_eq!(attached.thinking_tokens, Some(80));
+        assert_eq!(attached.service_tier.as_deref(), Some("scale"));
+
+        // Separate `uncached_input_tokens` reconstructs inclusive `input_tokens >= cache_read + cache_creation`.
+        let uncached_only = serde_json::json!({
+            "cass": {
+                "service_tier": "standard",
+                "token_usage": {
+                    "uncached_input_tokens": 250,
+                    "output_tokens": 100,
+                    "cached_input_tokens": 600,
+                    "cache_write_input_tokens": 150,
+                    "reasoning_output_tokens": 40
+                }
+            }
+        });
+        let reconstructed = extract_codex_tokens(&uncached_only);
+        assert_eq!(reconstructed.input_tokens, Some(1000));
+        assert_eq!(reconstructed.cache_read_tokens, Some(600));
+        assert_eq!(reconstructed.cache_creation_tokens, Some(150));
+        assert_eq!(reconstructed.thinking_tokens, Some(40));
+        assert_eq!(reconstructed.service_tier.as_deref(), Some("standard"));
+        assert!(
+            reconstructed.input_tokens.unwrap()
+                >= reconstructed.cache_read_tokens.unwrap()
+                    + reconstructed.cache_creation_tokens.unwrap()
+        );
+
+        // Pre-stripped `input_tokens` paired with `uncached_input_tokens` also enforces inclusive invariant.
+        let pre_stripped = serde_json::json!({
+            "cass": {
+                "token_usage": {
+                    "input_tokens": 250,
+                    "uncached_input_tokens": 250,
+                    "cached_input_tokens": 600,
+                    "cache_write_input_tokens": 150
+                }
+            }
+        });
+        let repaired = extract_codex_tokens(&pre_stripped);
+        assert_eq!(repaired.input_tokens, Some(1000));
+    }
+
+    #[test]
+    fn extract_web_search_requests_reads_claude_and_cass_paths() {
+        let native = serde_json::json!({
+            "message": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "server_tool_use": {
+                        "web_search_requests": 3
+                    }
+                }
+            }
+        });
+        assert_eq!(extract_web_search_requests(&native), Some(3));
+
+        let cass_override = serde_json::json!({
+            "cass": {
+                "web_search_requests": 5
+            },
+            "message": {
+                "usage": {
+                    "server_tool_use": {
+                        "web_search_requests": 2
+                    }
+                }
+            }
+        });
+        assert_eq!(extract_web_search_requests(&cass_override), Some(5));
+
+        let zero_count = serde_json::json!({
+            "message": {
+                "usage": {
+                    "server_tool_use": {
+                        "web_search_requests": 0
+                    }
+                }
+            }
+        });
+        assert_eq!(extract_web_search_requests(&zero_count), Some(0));
+
+        let invalid_or_missing = serde_json::json!({
+            "message": {
+                "usage": {
+                    "server_tool_use": {
+                        "web_search_requests": null
+                    }
+                }
+            }
+        });
+        assert_eq!(extract_web_search_requests(&invalid_or_missing), None);
+        assert_eq!(
+            extract_web_search_requests(&serde_json::json!({"cass": {"web_search_requests": -1}})),
+            None
+        );
     }
 }

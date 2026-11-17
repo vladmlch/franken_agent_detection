@@ -62,7 +62,10 @@ pub use connectors::opencode::OpenCodeConnector;
 #[cfg(feature = "shelley")]
 pub use connectors::shelley::ShelleyConnector;
 #[cfg(feature = "connectors")]
-pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenDataSource};
+pub use connectors::token_extraction::{
+    ExtractedTokenUsage, ModelInfo, TokenDataSource, extract_devin_tokens,
+    extract_web_search_requests,
+};
 #[cfg(feature = "connectors")]
 pub use connectors::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanProgressTick,
@@ -225,7 +228,9 @@ pub fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "pi_agent" | "pi-agent" | "piagent" | "pi_mono" | "pi-mono" => Some("pi_agent"),
         "pi_durable" | "pi-durable" | "pidurable" => Some("pi_durable"),
         "prime_agent" | "prime-agent" | "primeagent" => Some("prime_agent"),
-        "qoder" | "qoder-cli" | "qoder_cli" => Some("qoder"),
+        "qoder" | "qoder-cli" | "qoder_cli" | "qoder-cn" | "qoder_cn" | "qoderwork" => {
+            Some("qoder")
+        }
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
         "shelley" | "shelley-db" => Some("shelley"),
         "vibe" | "vibe-cli" => Some("vibe"),
@@ -596,14 +601,11 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root).join("sessions")])
         }
-        "qoder" => {
-            let root = read("QODER_HOME")?;
-            if root.is_empty() {
-                return None;
-            }
-            let home = expand_leading_tilde(&root, dirs::home_dir().as_deref());
-            Some(vec![home.join("projects"), home])
-        }
+        "qoder" => qoder_env_override_roots(
+            read("QODER_PROJECTS_DIR").as_deref(),
+            read("QODER_HOME").as_deref(),
+            dirs::home_dir().as_deref(),
+        ),
         "qwen" => {
             let root = qwen_runtime_root_from_env()?;
             // The runtime override replaces the default store even when it
@@ -779,6 +781,28 @@ fn is_gemini_session_file(path: &Path) -> bool {
             == Some("chats")
 }
 
+fn qoder_env_override_roots(
+    qoder_projects_dir: Option<&str>,
+    qoder_home: Option<&str>,
+    home: Option<&Path>,
+) -> Option<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let push_unique = |out: &mut Vec<PathBuf>, path: PathBuf| {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    };
+    if let Some(dir) = qoder_projects_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        push_unique(&mut roots, expand_leading_tilde(dir, home));
+    }
+    if let Some(root) = qoder_home.map(str::trim).filter(|s| !s.is_empty()) {
+        let resolved = expand_leading_tilde(root, home);
+        push_unique(&mut roots, resolved.join("projects"));
+        push_unique(&mut roots, resolved);
+    }
+    (!roots.is_empty()).then_some(roots)
+}
+
 /// Claude Code detection roots when `CLAUDE_CONFIG_DIR` is set (cass #448).
 ///
 /// Mirrors `ClaudeCodeConnector::projects_root_resolved`: an explicit
@@ -820,6 +844,22 @@ fn claude_default_probe_roots(
         .join("Claude");
     out.push(claude_support.join("claude-code-sessions"));
     out.push(claude_support.join("local-agent-mode-sessions"));
+    let claude_linux = home.join(".config").join("Claude");
+    out.push(claude_linux.join("claude-code-sessions"));
+    out.push(claude_linux.join("local-agent-mode-sessions"));
+    let claude_win_msix = home
+        .join("AppData")
+        .join("Local")
+        .join("Packages")
+        .join("Claude_pzs8sxrjxfjjc")
+        .join("LocalCache")
+        .join("Roaming")
+        .join("Claude");
+    out.push(claude_win_msix.join("claude-code-sessions"));
+    out.push(claude_win_msix.join("local-agent-mode-sessions"));
+    let claude_win_roaming = home.join("AppData").join("Roaming").join("Claude");
+    out.push(claude_win_roaming.join("claude-code-sessions"));
+    out.push(claude_win_roaming.join("local-agent-mode-sessions"));
     out
 }
 
@@ -962,6 +1002,32 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
                 xdg_config_home.as_deref(),
                 dirs::home_dir().as_deref(),
             ));
+            for env_base in [
+                std::env::var_os("LOCALAPPDATA")
+                    .map(PathBuf::from)
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(|p| {
+                        p.join("Packages")
+                            .join("Claude_pzs8sxrjxfjjc")
+                            .join("LocalCache")
+                            .join("Roaming")
+                            .join("Claude")
+                    }),
+                std::env::var_os("APPDATA")
+                    .map(PathBuf::from)
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(|p| p.join("Claude")),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for leaf in ["claude-code-sessions", "local-agent-mode-sessions"] {
+                    let candidate = env_base.join(leaf);
+                    if !out.contains(&candidate) {
+                        out.push(candidate);
+                    }
+                }
+            }
         }
         "clawdbot" => {
             maybe_push(&mut out, &[".clawdbot"]);
@@ -1286,6 +1352,47 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         }
         "qoder" => {
             maybe_push(&mut out, &[".qoder", "projects"]);
+            maybe_push(&mut out, &[".qoderwork", "projects"]);
+            maybe_push(&mut out, &[".qoder-cn", "projects"]);
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "Qoder",
+                    "SharedClientCache",
+                    "cli",
+                    "projects",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[".config", "Qoder", "SharedClientCache", "cli", "projects"],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "AppData",
+                    "Roaming",
+                    "Qoder",
+                    "SharedClientCache",
+                    "cli",
+                    "projects",
+                ],
+            );
+            if let Some(appdata) = std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty())
+            {
+                let candidate = appdata
+                    .join("Qoder")
+                    .join("SharedClientCache")
+                    .join("cli")
+                    .join("projects");
+                if !out.contains(&candidate) {
+                    out.push(candidate);
+                }
+            }
             maybe_push(&mut out, &[".qoder"]);
         }
         "qwen" => {
@@ -1585,6 +1692,30 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                         "Claude",
                         "local-agent-mode-sessions",
                     ]),
+                    tilde(&[".config", "Claude", "claude-code-sessions"]),
+                    tilde(&[".config", "Claude", "local-agent-mode-sessions"]),
+                    tilde(&[
+                        "AppData",
+                        "Local",
+                        "Packages",
+                        "Claude_pzs8sxrjxfjjc",
+                        "LocalCache",
+                        "Roaming",
+                        "Claude",
+                        "claude-code-sessions",
+                    ]),
+                    tilde(&[
+                        "AppData",
+                        "Local",
+                        "Packages",
+                        "Claude_pzs8sxrjxfjjc",
+                        "LocalCache",
+                        "Roaming",
+                        "Claude",
+                        "local-agent-mode-sessions",
+                    ]),
+                    tilde(&["AppData", "Roaming", "Claude", "claude-code-sessions"]),
+                    tilde(&["AppData", "Roaming", "Claude", "local-agent-mode-sessions"]),
                 ],
                 "clawdbot" => vec![tilde(&[".clawdbot", "sessions"]), tilde(&[".clawdbot"])],
                 "cline" => {
@@ -1872,7 +2003,29 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 // the wildcard) documents that this emptiness is deliberate.
                 #[allow(clippy::match_same_arms)]
                 "shelley" => vec![],
-                "qoder" => vec![tilde(&[".qoder", "projects"]), tilde(&[".qoder"])],
+                "qoder" => vec![
+                    tilde(&[".qoder", "projects"]),
+                    tilde(&[".qoderwork", "projects"]),
+                    tilde(&[".qoder-cn", "projects"]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "Qoder",
+                        "SharedClientCache",
+                        "cli",
+                        "projects",
+                    ]),
+                    tilde(&[".config", "Qoder", "SharedClientCache", "cli", "projects"]),
+                    tilde(&[
+                        "AppData",
+                        "Roaming",
+                        "Qoder",
+                        "SharedClientCache",
+                        "cli",
+                        "projects",
+                    ]),
+                    tilde(&[".qoder"]),
+                ],
                 "qwen" => vec![
                     tilde(&[".qwen", "projects"]),
                     tilde(&[".qwen", "tmp"]),
@@ -2028,11 +2181,83 @@ mod tests {
         assert!(roots.contains(&PathBuf::from(
             "/home/u/Library/Application Support/Claude/local-agent-mode-sessions"
         )));
+        assert!(roots.contains(&PathBuf::from(
+            "/home/u/.config/Claude/claude-code-sessions"
+        )));
+        assert!(roots.contains(&PathBuf::from(
+            "/home/u/.config/Claude/local-agent-mode-sessions"
+        )));
+        assert!(roots.contains(&PathBuf::from(
+            "/home/u/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/claude-code-sessions"
+        )));
+        assert!(roots.contains(&PathBuf::from(
+            "/home/u/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/local-agent-mode-sessions"
+        )));
+        assert!(roots.contains(&PathBuf::from(
+            "/home/u/AppData/Roaming/Claude/claude-code-sessions"
+        )));
+        assert!(roots.contains(&PathBuf::from(
+            "/home/u/AppData/Roaming/Claude/local-agent-mode-sessions"
+        )));
         // XDG is additive: the legacy home roots survive a globally exported
         // XDG_CONFIG_HOME.
         let without_xdg = claude_default_probe_roots(None, Some(&home));
         assert_eq!(&roots[1..], &without_xdg[..]);
         assert_eq!(without_xdg[0], PathBuf::from("/home/u/.claude"));
+    }
+
+    #[test]
+    fn qoder_slugs_env_overrides_and_probe_roots_cover_all_variants() {
+        for alias in [
+            "qoder",
+            "qoder-cli",
+            "qoder_cli",
+            "qoder-cn",
+            "qoder_cn",
+            "qoderwork",
+        ] {
+            assert_eq!(canonical_connector_slug(alias), Some("qoder"), "{alias}");
+        }
+
+        let home = PathBuf::from("/home/u");
+        assert_eq!(
+            qoder_env_override_roots(Some("~/.qoder-custom/projects"), None, Some(&home)),
+            Some(vec![PathBuf::from("/home/u/.qoder-custom/projects")])
+        );
+        assert_eq!(
+            qoder_env_override_roots(None, Some("/opt/qoder"), Some(&home)),
+            Some(vec![
+                PathBuf::from("/opt/qoder/projects"),
+                PathBuf::from("/opt/qoder")
+            ])
+        );
+        assert_eq!(
+            qoder_env_override_roots(Some("/direct/projects"), Some("/opt/qoder"), Some(&home)),
+            Some(vec![
+                PathBuf::from("/direct/projects"),
+                PathBuf::from("/opt/qoder/projects"),
+                PathBuf::from("/opt/qoder"),
+            ])
+        );
+        assert!(qoder_env_override_roots(Some("   "), Some(""), Some(&home)).is_none());
+
+        let probe_roots = default_probe_roots("qoder");
+        if let Some(real_home) = dirs::home_dir() {
+            assert!(probe_roots.contains(&real_home.join(".qoderwork/projects")));
+            assert!(probe_roots.contains(&real_home.join(".qoder-cn/projects")));
+            assert!(probe_roots.contains(
+                &real_home.join("Library/Application Support/Qoder/SharedClientCache/cli/projects")
+            ));
+            assert!(
+                probe_roots
+                    .contains(&real_home.join(".config/Qoder/SharedClientCache/cli/projects"))
+            );
+            assert!(
+                probe_roots.contains(
+                    &real_home.join("AppData/Roaming/Qoder/SharedClientCache/cli/projects")
+                )
+            );
+        }
     }
 
     #[test]
@@ -2449,6 +2674,30 @@ mod tests {
         assert!(cline.contains(
             &"~/AppData/Roaming/Cursor/User/globalStorage/rooveterinaryinc.roo-cline".to_string()
         ));
+
+        let qoder = by_slug.get("qoder").expect("qoder paths");
+        assert!(qoder.contains(&"~/.qoder/projects".to_string()));
+        assert!(qoder.contains(&"~/.qoderwork/projects".to_string()));
+        assert!(qoder.contains(&"~/.qoder-cn/projects".to_string()));
+        assert!(qoder.contains(
+            &"~/Library/Application Support/Qoder/SharedClientCache/cli/projects".to_string()
+        ));
+        assert!(qoder.contains(&"~/.config/Qoder/SharedClientCache/cli/projects".to_string()));
+        assert!(
+            qoder.contains(&"~/AppData/Roaming/Qoder/SharedClientCache/cli/projects".to_string())
+        );
+
+        let claude = by_slug.get("claude").expect("claude paths");
+        assert!(claude.contains(&"~/.config/Claude/claude-code-sessions".to_string()));
+        assert!(claude.contains(&"~/.config/Claude/local-agent-mode-sessions".to_string()));
+        assert!(claude.contains(
+            &"~/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/claude-code-sessions".to_string()
+        ));
+        assert!(claude.contains(
+            &"~/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/local-agent-mode-sessions".to_string()
+        ));
+        assert!(claude.contains(&"~/AppData/Roaming/Claude/claude-code-sessions".to_string()));
+        assert!(claude.contains(&"~/AppData/Roaming/Claude/local-agent-mode-sessions".to_string()));
     }
 
     /// Registry invariants: the five registration points

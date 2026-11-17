@@ -1,13 +1,12 @@
 //! Enforce the byte budget during I/O, not after an unbounded allocation.
 
-use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
 use super::MAX_SCAN_FILE_BYTES;
 
 pub(super) fn read_capped(path: &Path) -> io::Result<Option<String>> {
-    let file = File::open(path)?;
+    let file = super::open_regular_no_follow(path)?;
     // Inspect the opened object, not a potentially replaced pathname. Metadata
     // is only an optimization: the reader below enforces the limit even when
     // metadata fails, underreports size, or the file grows after this check.
@@ -39,6 +38,7 @@ fn read_limited(reader: impl Read, limit: u64) -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::{Cursor, Seek, Write};
 
     #[derive(Default)]
@@ -134,5 +134,22 @@ mod tests {
     fn capped_read_rejects_unrepresentable_probe_limit() {
         let error = read_limited(&b""[..], u64::MAX).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_capped_rejects_directory_and_symlink() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dir_err = read_capped(dir.path()).unwrap_err();
+        assert_eq!(dir_err.kind(), io::ErrorKind::InvalidInput);
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("target.txt");
+            std::fs::write(&target, b"hello")?;
+            let link = dir.path().join("link.txt");
+            std::os::unix::fs::symlink(&target, &link)?;
+            assert!(read_capped(&link).is_err());
+        }
+        Ok(())
     }
 }

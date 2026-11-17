@@ -1079,29 +1079,21 @@ fn subagent_verdict(
     }
 }
 
+/// Parse a conversation from ONE specific transcript file. Returns `None`
+/// when the file yields no usable records; the caller owns candidate order
+/// and fallback policy.
 #[allow(clippy::too_many_lines)]
-fn parse_conversation(
+fn parse_conversation_from_transcript(
+    transcript: &Path,
     conversation_dir: &Path,
     _scan_root: &ScanRoot,
     descriptors: &HashMap<String, SubagentDescriptor>,
     index_complete: bool,
-    excluded_paths: &[PathBuf],
 ) -> Option<NormalizedConversation> {
-    // Native `get_best_log_file` order: try each non-excluded transcript
-    // candidate until one yields records — a torn read or empty fuller
-    // transcript falls back to the next file rather than losing the
-    // conversation. Records are read from exactly one file; lines are never
-    // stitched across the pair.
-    let (transcript, records) =
-        AntigravityConnector::transcript_candidates(conversation_dir, excluded_paths)
-            .into_iter()
-            .map(|path| {
-                (
-                    path.clone(),
-                    AntigravityConnector::read_transcript_records(&path),
-                )
-            })
-            .find(|(_, records)| !records.is_empty())?;
+    let records = AntigravityConnector::read_transcript_records(transcript);
+    if records.is_empty() {
+        return None;
+    }
 
     // Sort by step_index (gaps are expected; ties keep input order via stable sort).
     let mut ordered: Vec<&Value> = records.iter().collect();
@@ -1209,12 +1201,40 @@ fn parse_conversation(
         external_id,
         title,
         workspace: None,
-        source_path: transcript,
+        source_path: transcript.to_path_buf(),
         started_at,
         ended_at,
         metadata: Value::Object(metadata),
         messages,
     })
+}
+
+/// Parse a conversation using the native `get_best_log_file` order over the
+/// non-excluded candidates — a torn read or empty fuller transcript falls
+/// back to the next file rather than losing the conversation. Records are
+/// read from exactly one file; lines are never stitched across the pair.
+/// Kept for non-hook callers and tests; the hook-driven scan loop calls
+/// `parse_conversation_from_transcript` per admitted candidate so the
+/// completion ledger always keys on the file actually read.
+#[allow(dead_code)]
+fn parse_conversation(
+    conversation_dir: &Path,
+    scan_root: &ScanRoot,
+    descriptors: &HashMap<String, SubagentDescriptor>,
+    index_complete: bool,
+    excluded_paths: &[PathBuf],
+) -> Option<NormalizedConversation> {
+    AntigravityConnector::transcript_candidates(conversation_dir, excluded_paths)
+        .into_iter()
+        .find_map(|transcript| {
+            parse_conversation_from_transcript(
+                &transcript,
+                conversation_dir,
+                scan_root,
+                descriptors,
+                index_complete,
+            )
+        })
 }
 
 fn scan_antigravity_with_callback(
@@ -1259,11 +1279,11 @@ fn scan_antigravity_with_exclusions(
             if !AntigravityConnector::conversation_modified_since(&conversation_dir, ctx.since_ts) {
                 continue;
             }
-            // Snapshot every usable transcript before parsing: the boundary
-            // hooks must watch whichever candidate the parser may read, not
-            // just the preferred one — a mid-parse change to any of them
-            // invalidates the completion, and the actual fallback pick owns
-            // the ledger.
+            // Snapshot every usable transcript before parsing. The boundary
+            // hooks are consulted on each candidate IN SELECTION ORDER only:
+            // `should_scan` is stateful per source path (a CASS ledger
+            // records whichever source it admits), so asking about a fallback
+            // the parser never reads would corrupt the admission tracking.
             let discovered_candidates: Vec<DiscoveredSourceFile> =
                 AntigravityConnector::transcript_candidates(&conversation_dir, excluded_paths)
                     .into_iter()
@@ -1278,54 +1298,58 @@ fn scan_antigravity_with_exclusions(
                         .with_fs_metadata()
                     })
                     .collect();
-            if discovered_candidates.is_empty()
-                || !discovered_candidates
-                    .iter()
-                    .any(|source| hooks.should_scan(source))
-            {
-                continue;
-            }
-            ctx.tick();
-            if let Some(mut conversation) = parse_conversation(
-                &conversation_dir,
-                &root,
-                &descriptors,
-                index_complete,
-                excluded_paths,
-            ) {
+            for (idx, candidate) in discovered_candidates.iter().enumerate() {
+                // A `false` means this candidate already has a valid
+                // completion (primary + sidecars unchanged — the recorded
+                // conversation would be identical), or a host filter skips
+                // the session; either way the conversation is done and no
+                // fallback source may be consulted.
+                if !hooks.should_scan(candidate) {
+                    break;
+                }
+                let Some(mut conversation) = parse_conversation_from_transcript(
+                    &candidate.source_path,
+                    &conversation_dir,
+                    &root,
+                    &descriptors,
+                    index_complete,
+                ) else {
+                    // Empty/torn read: admit the next candidate so its
+                    // `should_scan` runs immediately before its read —
+                    // the completed primary always lands on the file the
+                    // parser actually read.
+                    continue;
+                };
+                ctx.tick();
                 root.apply_workspace_rewrite(&mut conversation);
-                let source_path = conversation.source_path.clone();
                 on_conversation(conversation).with_context(|| {
                     format!(
                         "emit antigravity conversation {}",
                         conversation_dir.display()
                     )
                 })?;
-                // The completion ledger belongs to the transcript the parser
-                // actually read; every other candidate rides as an optional
-                // sidecar so a change to any usable transcript invalidates it.
-                let mut primary = None;
-                let mut sidecars = Vec::new();
-                for candidate in discovered_candidates {
-                    if candidate.source_path == source_path {
-                        primary = Some(candidate);
-                    } else {
-                        sidecars.push(DiscoveredSourceFile {
-                            required_for_reconstruction: false,
-                            ..candidate
-                        });
-                    }
-                }
-                if let Some(source) = primary
-                    && !source.fs_metadata_changed()
+                // The completion ledger keys on the transcript actually
+                // read; every other candidate rides as an optional sidecar
+                // so a change to any usable transcript invalidates it.
+                let sidecars: Vec<DiscoveredSourceFile> = discovered_candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, d)| DiscoveredSourceFile {
+                        required_for_reconstruction: false,
+                        ..d.clone()
+                    })
+                    .collect();
+                if !candidate.fs_metadata_changed()
                     && sidecars.iter().all(|d| !d.fs_metadata_changed())
                 {
                     hooks.complete(&SourceCompletion {
-                        source,
+                        source: candidate.clone(),
                         required_sidecars: sidecars,
                         conversations_emitted: 1,
                     })?;
                 }
+                break;
             }
         }
     }
@@ -3198,6 +3222,187 @@ mod tests {
         });
         assert_eq!(convs.len(), 1, "a changed fallback source must rescan");
         assert_eq!(convs[0].messages[0].content, "updated short content");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ledger_state_machine_stays_aligned_with_the_parsed_source() {
+        // `SourceScanHooks::should_scan` is STATEFUL per source path (CASS
+        // `watch_source_ledger`): admitting a source records it as the
+        // expected primary, and `on_source_complete` requires the completed
+        // primary to be the last admitted one. The scan may therefore only
+        // consult `should_scan` on a candidate it is about to read — asking
+        // about a fallback it never parses corrupts the ledger.
+        #[derive(Default)]
+        struct SimLedger {
+            // Keyed ONLY by the primary source path, like watch_source_ledger.
+            entries: HashMap<PathBuf, Vec<(PathBuf, u64)>>,
+            last_admitted: Option<PathBuf>,
+            should_calls: Vec<PathBuf>,
+            completions: Vec<PathBuf>,
+        }
+        impl SimLedger {
+            fn should_scan(&mut self, d: &DiscoveredSourceFile) -> bool {
+                self.should_calls.push(d.source_path.clone());
+                if let Some(fps) = self.entries.get(&d.source_path)
+                    && fps
+                        .iter()
+                        .all(|(p, size)| fs::metadata(p).is_ok_and(|m| m.len() == *size))
+                {
+                    return false;
+                }
+                self.last_admitted = Some(d.source_path.clone());
+                true
+            }
+            fn complete(&mut self, c: &SourceCompletion) {
+                assert_eq!(
+                    self.last_admitted.as_deref(),
+                    Some(c.source.source_path.as_path()),
+                    "completed primary must be the last admitted source"
+                );
+                self.completions.push(c.source.source_path.clone());
+                let fps = std::iter::once(&c.source)
+                    .chain(c.required_sidecars.iter())
+                    .map(|d| (d.source_path.clone(), d.size_bytes.unwrap_or(0)))
+                    .collect();
+                self.entries.insert(c.source.source_path.clone(), fps);
+            }
+        }
+        let scan = |ctx: &ScanContext, ledger: &std::rc::Rc<std::cell::RefCell<SimLedger>>| {
+            let l1 = ledger.clone();
+            let mut should = move |d: &DiscoveredSourceFile| l1.borrow_mut().should_scan(d);
+            let l2 = ledger.clone();
+            let mut on_complete = move |c: &SourceCompletion| {
+                l2.borrow_mut().complete(c);
+                Ok(())
+            };
+            let mut convs = Vec::new();
+            scan_antigravity_with_exclusions(
+                ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut should),
+                    on_source_complete: Some(&mut on_complete),
+                },
+                &[],
+                &mut |conv| {
+                    convs.push(conv);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            convs
+        };
+
+        // Healthy pair: transcript_full is the parsed source.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let conv_dir = write_named_transcript(
+            base,
+            "90909090-9090-4909-8909-909090909090",
+            "transcript.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nshort content\n</USER_REQUEST>")
+            ),
+        );
+        write_named_transcript(
+            base,
+            "90909090-9090-4909-8909-909090909090",
+            "transcript_full.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nfull content\n</USER_REQUEST>")
+            ),
+        );
+        let logs = conv_dir.join(".system_generated").join("logs");
+        set_file_mtime(&logs.join("transcript.jsonl"), 1_000);
+        set_file_mtime(&logs.join("transcript_full.jsonl"), 2_000);
+        let short = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            None,
+        );
+
+        let l = std::rc::Rc::new(std::cell::RefCell::new(SimLedger::default()));
+        let convs = scan(&ctx, &l);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].source_path, full);
+        {
+            let b = l.borrow();
+            assert_eq!(
+                b.should_calls,
+                vec![full.clone()],
+                "only the top candidate is consulted on a fresh scan"
+            );
+            assert_eq!(b.completions, vec![full.clone()]);
+            assert!(
+                b.entries[&full].iter().any(|(p, _)| p == &short),
+                "the unparsed fallback is recorded as full's sidecar"
+            );
+        }
+        // Scan 2 unchanged: should_scan(full) hits the ledger → skip; the
+        // fallback candidate is never consulted.
+        let convs = scan(&ctx, &l);
+        assert!(convs.is_empty());
+        assert_eq!(
+            l.borrow().should_calls,
+            vec![full.clone(), full.clone()],
+            "a ledger hit must end the pass before should_scan(short)"
+        );
+
+        // Blank transcript_full + valid short: parse falls back, the ledger
+        // keys on `short`; rescan skips through short's entry.
+        let dir2 = TempDir::new().unwrap();
+        let base2 = dir2.path();
+        let conv_dir2 = write_named_transcript(
+            base2,
+            "a1a1a1a1-a1a1-41a1-81a1-a1a1a1a1a1a1",
+            "transcript.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nshort serves after blank full\n</USER_REQUEST>")
+            ),
+        );
+        write_named_transcript(
+            base2,
+            "a1a1a1a1-a1a1-41a1-81a1-a1a1a1a1a1a1",
+            "transcript_full.jsonl",
+            "\n\n",
+        );
+        let logs2 = conv_dir2.join(".system_generated").join("logs");
+        set_file_mtime(&logs2.join("transcript.jsonl"), 1_000);
+        set_file_mtime(&logs2.join("transcript_full.jsonl"), 2_000);
+        let short2 = logs2.join("transcript.jsonl");
+        let full2 = logs2.join("transcript_full.jsonl");
+        let ctx2 = ScanContext::with_roots(
+            base2.to_path_buf(),
+            vec![ScanRoot::local(base2.to_path_buf())],
+            None,
+        );
+
+        let l2 = std::rc::Rc::new(std::cell::RefCell::new(SimLedger::default()));
+        let convs = scan(&ctx2, &l2);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].source_path, short2);
+        {
+            let b = l2.borrow();
+            assert_eq!(b.should_calls, vec![full2.clone(), short2.clone()]);
+            assert_eq!(
+                b.completions,
+                vec![short2.clone()],
+                "the completed primary is the fallback actually read"
+            );
+        }
+        // Scan 2 unchanged: blank full is re-admitted but never completes;
+        // short's ledger hit ends the pass.
+        let convs = scan(&ctx2, &l2);
+        assert!(convs.is_empty());
+        assert_eq!(
+            l2.borrow().should_calls,
+            vec![full2.clone(), short2.clone(), full2.clone(), short2.clone()]
+        );
     }
 
     // -----------------------------------------------------------------

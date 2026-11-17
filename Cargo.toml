@@ -133,6 +133,8 @@ pi-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:fs4"]
 # access to its WAL-mode session.sqlite stores. JSONL commit-log stores need no
 # SQLite and are read with the base `connectors` feature (#28).
 pi-durable = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:fs4"]
+# Qoder: read-only access to Electron main.sqlite native session titles
+qoder-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:fs4"]
 # All connectors enabled
 all-connectors = [
     "connectors",
@@ -151,6 +153,7 @@ all-connectors = [
     "copilot-vscdb",
     "pi-durable",
     "pi-sqlite",
+    "qoder-sqlite",
 ]
 
 [dev-dependencies]

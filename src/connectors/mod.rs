@@ -74,7 +74,8 @@ pub(crate) mod checked_scan;
     feature = "openclaw-sqlite",
     feature = "copilot-vscdb",
     feature = "pi-sqlite",
-    feature = "pi-durable"
+    feature = "pi-durable",
+    feature = "qoder-sqlite"
 ))]
 pub mod sqlite_sync;
 pub mod token_extraction;

@@ -1,23 +1,30 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Seek};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use walkdir::WalkDir;
 
 use super::claude_code::{ClaudeFlavor, ParsedClaudeFile, parse_claude_records};
+use super::jsonl::JsonlLines;
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
 use super::utils::{
-    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
 };
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage, reindex_messages};
 
-/// Qoder CLI/IDE session ingestion (`~/.qoder/projects/<workspace-slug>/<uuid>.jsonl`).
+const QODER_TITLE_DB_NAME: &str = "main.sqlite";
+const QODER_TITLE_LAYOUTS: [(&str, &str); 2] = [
+    (".qoder", "com.qoder.app.stable"),
+    (".qoder-cn", "com.qodercn.app.stable"),
+];
+
+/// Qoder CLI/IDE session ingestion (`~/.qoder/projects`, `~/.qoderwork/projects`,
+/// `~/.qoder-cn/projects`, and `SharedClientCache/cli/projects`).
 pub struct QoderConnector;
 
 impl Default for QoderConnector {
@@ -32,13 +39,7 @@ impl QoderConnector {
         Self
     }
 
-    pub(crate) fn projects_root() -> PathBuf {
-        Self::projects_root_resolved(
-            env_path_nonempty("QODER_HOME").as_deref(),
-            dirs::home_dir().as_deref(),
-        )
-    }
-
+    #[cfg(test)]
     pub(crate) fn projects_root_resolved(
         qoder_home: Option<&Path>,
         home_dir: Option<&Path>,
@@ -52,38 +53,88 @@ impl QoderConnector {
         )
     }
 
-    fn path_has_subagents_component(path: &Path) -> bool {
-        path.components()
-            .any(|c| c.as_os_str().to_str() == Some("subagents"))
+    pub(crate) fn projects_roots() -> Vec<PathBuf> {
+        Self::projects_roots_resolved(
+            env_path_nonempty("QODER_PROJECTS_DIR").as_deref(),
+            env_path_nonempty("QODER_HOME").as_deref(),
+            dirs::home_dir().as_deref(),
+            dirs::config_dir().as_deref(),
+            env_path_nonempty("APPDATA").as_deref(),
+            env_path_nonempty("XDG_CONFIG_HOME").as_deref(),
+        )
     }
 
-    fn main_session_files(scan_target: &Path) -> Vec<PathBuf> {
-        if scan_target.is_file() {
-            let is_jsonl = scan_target.extension().and_then(|s| s.to_str()) == Some("jsonl");
-            if is_jsonl && !Self::path_has_subagents_component(scan_target) {
-                return vec![scan_target.to_path_buf()];
-            }
-            return Vec::new();
+    pub(crate) fn projects_roots_resolved(
+        qoder_projects_dir: Option<&Path>,
+        qoder_home: Option<&Path>,
+        home_dir: Option<&Path>,
+        config_dir: Option<&Path>,
+        appdata_dir: Option<&Path>,
+        xdg_config_home: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        if let Some(explicit_projects) = qoder_projects_dir {
+            return vec![explicit_projects.to_path_buf()];
         }
-        let mut files = Vec::new();
-        for entry in WalkDir::new(scan_target).into_iter().flatten() {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if Self::path_has_subagents_component(path) {
-                continue;
-            }
-            let is_hidden = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|n| n.starts_with('.'));
-            if !is_hidden && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                files.push(path.to_path_buf());
-            }
+        if let Some(explicit_home) = qoder_home {
+            return vec![explicit_home.join("projects")];
         }
-        files.sort();
-        files
+
+        let mut roots = Vec::new();
+        let mut push_unique = |path: PathBuf| {
+            if !roots.contains(&path) {
+                roots.push(path);
+            }
+        };
+
+        if let Some(home) = home_dir {
+            push_unique(home.join(".qoder/projects"));
+            push_unique(home.join(".qoderwork/projects"));
+            push_unique(home.join(".qoder-cn/projects"));
+            push_unique(
+                home.join("Library/Application Support/Qoder/SharedClientCache/cli/projects"),
+            );
+            push_unique(home.join(".config/Qoder/SharedClientCache/cli/projects"));
+            push_unique(home.join("AppData/Roaming/Qoder/SharedClientCache/cli/projects"));
+        }
+        if let Some(xdg) = xdg_config_home {
+            push_unique(xdg.join("Qoder/SharedClientCache/cli/projects"));
+        }
+        if let Some(appdata) = appdata_dir {
+            push_unique(appdata.join("Qoder/SharedClientCache/cli/projects"));
+        }
+        if let Some(cfg) = config_dir {
+            push_unique(cfg.join("Qoder/SharedClientCache/cli/projects"));
+        }
+
+        if roots.is_empty() {
+            roots.push(PathBuf::from(".qoder/projects"));
+        }
+        roots
+    }
+
+    fn is_valid_session_id(id: &str) -> bool {
+        !id.is_empty()
+            && !id.starts_with('.')
+            && id != ".."
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    }
+
+    fn jsonl_stem(path: &Path) -> Option<&str> {
+        let name = path.file_name()?.to_str()?;
+        if name.starts_with('.') {
+            return None;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            return None;
+        }
+        path.file_stem()?.to_str()
+    }
+
+    fn is_main_session_file_name(path: &Path) -> bool {
+        Self::jsonl_stem(path)
+            .is_some_and(|stem| !stem.starts_with("agent-") && Self::is_valid_session_id(stem))
     }
 
     fn is_subagent_transcript_path(path: &Path) -> bool {
@@ -92,12 +143,52 @@ impl QoderConnector {
             .and_then(Path::file_name)
             .and_then(|s| s.to_str())
             == Some("subagents");
-        let name_ok = path
-            .file_name()
+        let parent_ok = path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
             .and_then(|s| s.to_str())
-            .is_some_and(|n| !n.starts_with('.') && n.starts_with("agent-"));
-        let ext_ok = path.extension().and_then(|s| s.to_str()) == Some("jsonl");
-        in_subagents_dir && name_ok && ext_ok
+            .is_some_and(Self::is_valid_session_id);
+        let name_ok = Self::jsonl_stem(path)
+            .is_some_and(|stem| stem.starts_with("agent-") && Self::is_valid_session_id(stem));
+        in_subagents_dir && parent_ok && name_ok
+    }
+
+    fn main_session_files(scan_target: &Path) -> Vec<PathBuf> {
+        if scan_target.is_file() {
+            if Self::is_main_session_file_name(scan_target)
+                && !Self::is_subagent_transcript_path(scan_target)
+            {
+                return vec![scan_target.to_path_buf()];
+            }
+            return Vec::new();
+        }
+
+        let Ok(top_entries) = fs::read_dir(scan_target) else {
+            return Vec::new();
+        };
+
+        let mut files = Vec::new();
+        for entry in top_entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                if Self::is_main_session_file_name(&path) {
+                    files.push(path);
+                }
+                continue;
+            }
+            let Ok(project_entries) = fs::read_dir(&path) else {
+                continue;
+            };
+            for proj_entry in project_entries.flatten() {
+                let child = proj_entry.path();
+                if !child.is_dir() && Self::is_main_session_file_name(&child) {
+                    files.push(child);
+                }
+            }
+        }
+        files.sort();
+        files
     }
 
     fn subagent_session_files(scan_target: &Path) -> Vec<PathBuf> {
@@ -107,14 +198,41 @@ impl QoderConnector {
             }
             return Vec::new();
         }
+
+        let Ok(top_entries) = fs::read_dir(scan_target) else {
+            return Vec::new();
+        };
+
         let mut files = Vec::new();
-        for entry in WalkDir::new(scan_target).into_iter().flatten() {
-            if !entry.file_type().is_file() {
+        for entry in top_entries.flatten() {
+            let project_dir = entry.path();
+            if !project_dir.is_dir() {
                 continue;
             }
-            let path = entry.path();
-            if Self::is_subagent_transcript_path(path) {
-                files.push(path.to_path_buf());
+            let Ok(project_entries) = fs::read_dir(&project_dir) else {
+                continue;
+            };
+            for session_entry in project_entries.flatten() {
+                let session_dir = session_entry.path();
+                if !session_dir.is_dir() {
+                    continue;
+                }
+                let Some(session_name) = session_dir.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if !Self::is_valid_session_id(session_name) {
+                    continue;
+                }
+                let subagents_dir = session_dir.join("subagents");
+                let Ok(subagent_entries) = fs::read_dir(&subagents_dir) else {
+                    continue;
+                };
+                for sub_entry in subagent_entries.flatten() {
+                    let sub_path = sub_entry.path();
+                    if !sub_path.is_dir() && Self::is_subagent_transcript_path(&sub_path) {
+                        files.push(sub_path);
+                    }
+                }
             }
         }
         files.sort();
@@ -127,6 +245,21 @@ impl QoderConnector {
         files
     }
 
+    fn resolve_mirrored_qoder_store(scan_root: &ScanRoot) -> Option<PathBuf> {
+        scan_root
+            .mirrored_store(&[".qoder", "projects"])
+            .or_else(|| {
+                let src = scan_root.mirrored_source_path.as_deref()?;
+                if src.contains(".qoder-cn") {
+                    scan_root.mirrored_store(&[".qoder-cn", "projects"])
+                } else if src.contains(".qoderwork") {
+                    scan_root.mirrored_store(&[".qoderwork", "projects"])
+                } else {
+                    None
+                }
+            })
+    }
+
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let looks_like_root = |path: &Path| path.join("projects").is_dir();
 
@@ -134,7 +267,10 @@ impl QoderConnector {
             if looks_like_root(&ctx.data_dir) {
                 vec![ScanRoot::local(ctx.data_dir.join("projects"))]
             } else if ctx.allow_local_default_stores {
-                vec![ScanRoot::local(Self::projects_root())]
+                Self::projects_roots()
+                    .into_iter()
+                    .map(ScanRoot::local)
+                    .collect()
             } else {
                 Vec::new()
             }
@@ -142,20 +278,18 @@ impl QoderConnector {
             ctx.scan_roots
                 .iter()
                 .map(|scan_root| {
-                    scan_root
-                        .mirrored_store(&[".qoder", "projects"])
-                        .map_or_else(
-                            || {
-                                if scan_root.path.is_file() {
-                                    scan_root.clone()
-                                } else if scan_root.path.join("projects").is_dir() {
-                                    scan_root.with_path(scan_root.path.join("projects"))
-                                } else {
-                                    scan_root.clone()
-                                }
-                            },
-                            |mirrored| scan_root.with_path(mirrored),
-                        )
+                    Self::resolve_mirrored_qoder_store(scan_root).map_or_else(
+                        || {
+                            if scan_root.path.is_file() {
+                                scan_root.clone()
+                            } else if scan_root.path.join("projects").is_dir() {
+                                scan_root.with_path(scan_root.path.join("projects"))
+                            } else {
+                                scan_root.clone()
+                            }
+                        },
+                        |mirrored| scan_root.with_path(mirrored),
+                    )
                 })
                 .collect()
         };
@@ -184,7 +318,11 @@ impl QoderConnector {
                 if !seen_files.insert(dedupe_path_key(&path)) {
                     continue;
                 }
-                if !file_modified_since(&path, ctx.since_ts) {
+                let is_subagent = Self::is_subagent_transcript_path(&path);
+                let sidecar = (!is_subagent)
+                    .then(|| session_sidecar_path(&path))
+                    .flatten();
+                if !source_modified_since(&path, sidecar.as_deref(), ctx.since_ts) {
                     continue;
                 }
                 out.push(
@@ -197,10 +335,249 @@ impl QoderConnector {
                     )
                     .with_fs_metadata(),
                 );
+                if let Some(sidecar_path) = sidecar
+                    && sidecar_path.is_file()
+                    && !path_is_excluded(&sidecar_path, &excluded_paths)
+                {
+                    out.push(
+                        DiscoveredSourceFile::new(
+                            "qoder",
+                            &root,
+                            sidecar_path,
+                            DiscoveredSourceRole::MetadataSidecar,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
             }
         }
         Ok(out)
     }
+}
+
+fn session_sidecar_path(transcript_path: &Path) -> Option<PathBuf> {
+    let stem = QoderConnector::jsonl_stem(transcript_path)?;
+    Some(transcript_path.with_file_name(format!("{stem}-session.json")))
+}
+
+fn source_modified_since(path: &Path, sidecar: Option<&Path>, since_ts: Option<i64>) -> bool {
+    file_modified_since(path, since_ts)
+        || sidecar.is_some_and(|s| s.is_file() && file_modified_since(s, since_ts))
+}
+
+fn non_blank_str(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct QoderSessionSidecarRaw {
+    title: Option<String>,
+    parent_session_id: Option<String>,
+    fork_from: Option<String>,
+    working_dir: Option<String>,
+}
+
+#[derive(Default)]
+struct QoderSessionSidecar {
+    title: Option<String>,
+    parent_session_id: Option<String>,
+    fork_from: Option<String>,
+    working_dir: Option<PathBuf>,
+}
+
+fn read_qoder_session_sidecar(sidecar_path: &Path) -> QoderSessionSidecar {
+    let Ok(Some(contents)) = read_capped(sidecar_path) else {
+        return QoderSessionSidecar::default();
+    };
+    let Ok(raw) = serde_json::from_str::<QoderSessionSidecarRaw>(&contents) else {
+        return QoderSessionSidecar::default();
+    };
+    QoderSessionSidecar {
+        title: non_blank_str(raw.title.as_deref()),
+        parent_session_id: non_blank_str(raw.parent_session_id.as_deref()),
+        fork_from: non_blank_str(raw.fork_from.as_deref()),
+        working_dir: non_blank_str(raw.working_dir.as_deref()).map(PathBuf::from),
+    }
+}
+
+fn qoder_title_database_candidates(
+    home_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+) -> Vec<(PathBuf, PathBuf)> {
+    let (Some(home), Some(config)) = (home_dir, config_dir) else {
+        return Vec::new();
+    };
+    if home.as_os_str().is_empty() || !home.is_absolute() {
+        return Vec::new();
+    }
+    let mut pairs = Vec::with_capacity(QODER_TITLE_LAYOUTS.len() * 2);
+    for (dot_dir, app_id) in QODER_TITLE_LAYOUTS {
+        let unresolved = home.join(dot_dir).join("projects");
+        let store = config.join(app_id).join(QODER_TITLE_DB_NAME);
+        if let Ok(resolved) = fs::canonicalize(&unresolved)
+            && resolved != unresolved
+        {
+            pairs.push((resolved, store.clone()));
+        }
+        pairs.push((unresolved, store));
+    }
+    pairs
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn qoder_title_database_for_root_resolved(
+    root: &Path,
+    home_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    qoder_title_database_candidates(home_dir, config_dir)
+        .into_iter()
+        .find(|(alias, _)| alias == root)
+        .map(|(_, store)| store)
+}
+
+pub(crate) fn qoder_title_database_for_path_resolved(
+    path: &Path,
+    home_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    qoder_title_database_candidates(home_dir, config_dir)
+        .into_iter()
+        .filter(|(alias, _)| path.starts_with(alias) && path != alias)
+        .max_by_key(|(alias, _)| alias.as_os_str().len())
+        .map(|(_, store)| store)
+}
+
+#[cfg_attr(
+    not(any(
+        feature = "cursor",
+        feature = "opencode",
+        feature = "goose",
+        feature = "hermes",
+        feature = "crush",
+        feature = "devin",
+        feature = "shelley",
+        feature = "openclaw-sqlite",
+        feature = "copilot-vscdb",
+        feature = "pi-sqlite",
+        feature = "pi-durable",
+        feature = "qoder-sqlite"
+    )),
+    allow(dead_code)
+)]
+fn qoder_title_database_for_path(path: &Path) -> Option<PathBuf> {
+    qoder_title_database_for_path_resolved(
+        path,
+        dirs::home_dir().as_deref(),
+        dirs::config_dir().as_deref(),
+    )
+}
+
+#[cfg(any(
+    feature = "cursor",
+    feature = "opencode",
+    feature = "goose",
+    feature = "hermes",
+    feature = "crush",
+    feature = "devin",
+    feature = "shelley",
+    feature = "openclaw-sqlite",
+    feature = "copilot-vscdb",
+    feature = "pi-sqlite",
+    feature = "pi-durable",
+    feature = "qoder-sqlite"
+))]
+pub(crate) fn load_qoder_title_map_from_db(db_path: &Path) -> HashMap<String, String> {
+    use super::sqlite_sync::{
+        ConnectionExt, open_read_only_with_snapshot_fallback, store_is_provably_empty,
+    };
+    use frankensqlite::compat::RowExt;
+
+    if !fs::symlink_metadata(db_path).is_ok_and(|meta| meta.file_type().is_file())
+        || store_is_provably_empty(db_path)
+    {
+        return HashMap::new();
+    }
+
+    let Ok(conn) = open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref()) else {
+        tracing::debug!(
+            db = %db_path.display(),
+            "qoder could not open Electron main.sqlite title store"
+        );
+        return HashMap::new();
+    };
+    for pragma in [
+        "PRAGMA busy_timeout = 2000;",
+        "PRAGMA query_only = ON;",
+        "PRAGMA trusted_schema = OFF;",
+    ] {
+        if let Err(err) = conn.execute(pragma) {
+            tracing::debug!(db = %db_path.display(), %err, "qoder title store pragma failed");
+        }
+    }
+
+    let is_table = conn
+        .query_row_map(
+            "SELECT type FROM sqlite_master WHERE name = 'chat_sessions'",
+            &[],
+            |row| row.get_typed::<Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|kind| kind == "table");
+    if !is_table {
+        return HashMap::new();
+    }
+
+    let Ok(rows) =
+        conn.query_map_collect("SELECT session_id, title FROM chat_sessions", &[], |row| {
+            Ok((
+                row.get_typed::<Option<String>>(0)?,
+                row.get_typed::<Option<String>>(1)?,
+            ))
+        })
+    else {
+        tracing::debug!(
+            db = %db_path.display(),
+            "qoder could not query chat_sessions from main.sqlite"
+        );
+        return HashMap::new();
+    };
+
+    let mut titles = HashMap::new();
+    for (session_id, title) in rows {
+        let Some(session_id) = non_blank_str(session_id.as_deref()) else {
+            continue;
+        };
+        let Some(title) = non_blank_str(title.as_deref()) else {
+            continue;
+        };
+        titles.insert(session_id, title);
+    }
+    titles
+}
+
+#[cfg(not(any(
+    feature = "cursor",
+    feature = "opencode",
+    feature = "goose",
+    feature = "hermes",
+    feature = "crush",
+    feature = "devin",
+    feature = "shelley",
+    feature = "openclaw-sqlite",
+    feature = "copilot-vscdb",
+    feature = "pi-sqlite",
+    feature = "pi-durable",
+    feature = "qoder-sqlite"
+)))]
+pub(crate) fn load_qoder_title_map_from_db(_db_path: &Path) -> HashMap<String, String> {
+    HashMap::new()
 }
 
 /// Resolve the active branch from `active-leaf` records, latest timestamp, or
@@ -316,31 +693,9 @@ fn filter_active_branch_messages(parsed: ParsedClaudeFile) -> Option<FilteredQod
         }
     }
 
-    let title = json_title.or_else(|| {
-        messages
-            .iter()
-            .find(|m| m.role == "user")
-            .map(|m| {
-                m.content
-                    .lines()
-                    .next()
-                    .unwrap_or(&m.content)
-                    .chars()
-                    .take(100)
-                    .collect::<String>()
-            })
-            .or_else(|| {
-                workspace
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .map(String::from)
-            })
-    });
-
     Some(FilteredQoderSession {
         messages,
-        title,
+        transcript_title: json_title,
         workspace,
         model,
         started_at,
@@ -348,9 +703,68 @@ fn filter_active_branch_messages(parsed: ParsedClaudeFile) -> Option<FilteredQod
     })
 }
 
+fn extract_latest_custom_title(mut file: &fs::File) -> io::Result<Option<String>> {
+    file.rewind()?;
+    let mut latest: Option<String> = None;
+    for line_res in JsonlLines::new(BufReader::new(file)) {
+        let line = line_res?;
+        if !line.contains("custom-title") {
+            continue;
+        }
+        let trimmed = line.trim_start_matches('\u{feff}');
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if val.get("type").and_then(serde_json::Value::as_str) != Some("custom-title") {
+            continue;
+        }
+        let candidate = ["customTitle", "title"].into_iter().find_map(|key| {
+            val.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+        });
+        if let Some(title) = candidate {
+            latest = (!title.is_empty()).then(|| title.to_string());
+        }
+    }
+    Ok(latest)
+}
+
+fn resolve_qoder_title(
+    db_title: Option<&str>,
+    sidecar_title: Option<&str>,
+    transcript_title: Option<&str>,
+    messages: &[NormalizedMessage],
+    workspace: Option<&Path>,
+) -> Option<String> {
+    non_blank_str(db_title)
+        .or_else(|| non_blank_str(sidecar_title))
+        .or_else(|| non_blank_str(transcript_title))
+        .or_else(|| {
+            messages
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| {
+                    m.content
+                        .lines()
+                        .next()
+                        .unwrap_or(&m.content)
+                        .chars()
+                        .take(100)
+                        .collect::<String>()
+                })
+                .or_else(|| {
+                    workspace
+                        .and_then(Path::file_name)
+                        .and_then(|n| n.to_str())
+                        .map(String::from)
+                })
+        })
+}
+
 struct FilteredQoderSession {
     messages: Vec<NormalizedMessage>,
-    title: Option<String>,
+    transcript_title: Option<String>,
     workspace: Option<PathBuf>,
     model: Option<String>,
     started_at: Option<i64>,
@@ -549,10 +963,28 @@ fn scan_qoder_with_callback(
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    scan_qoder_with_title_resolver(
+        ctx,
+        excluded_paths,
+        hooks,
+        &qoder_title_database_for_path,
+        on_conversation,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_qoder_with_title_resolver(
+    ctx: &ScanContext,
+    excluded_paths: &[PathBuf],
+    hooks: &mut SourceScanHooks<'_>,
+    resolve_title_db: &dyn Fn(&Path) -> Option<PathBuf>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
     let roots = QoderConnector::source_roots(ctx);
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut read_failures = SourceReadFailures::default();
     let mut task_cache: HashMap<PathBuf, TaskSidecarIndex> = HashMap::new();
+    let mut title_db_cache: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
 
     for root in roots {
         if !root.path.exists() {
@@ -569,7 +1001,11 @@ fn scan_qoder_with_callback(
             if !seen_files.insert(dedupe_path_key(&path)) {
                 continue;
             }
-            if !file_modified_since(&path, ctx.since_ts) {
+            let is_subagent = QoderConnector::is_subagent_transcript_path(&path);
+            let sidecar = (!is_subagent)
+                .then(|| session_sidecar_path(&path))
+                .flatten();
+            if !source_modified_since(&path, sidecar.as_deref(), ctx.since_ts) {
                 continue;
             }
 
@@ -581,6 +1017,19 @@ fn scan_qoder_with_callback(
                 true,
             )
             .with_fs_metadata();
+            let sidecar_discovered = sidecar
+                .as_ref()
+                .filter(|s| s.is_file() && !path_is_excluded(s, excluded_paths))
+                .map(|sidecar_path| {
+                    DiscoveredSourceFile::new(
+                        "qoder",
+                        &root,
+                        sidecar_path.clone(),
+                        DiscoveredSourceRole::MetadataSidecar,
+                        false,
+                    )
+                    .with_fs_metadata()
+                });
             if !hooks.should_scan(&discovered) {
                 tracing::debug!(
                     path = %path.display(),
@@ -598,7 +1047,7 @@ fn scan_qoder_with_callback(
                 }
             };
             let parsed =
-                match parse_claude_records(BufReader::new(file), &path, ClaudeFlavor::Qoder) {
+                match parse_claude_records(BufReader::new(&file), &path, ClaudeFlavor::Qoder) {
                     Ok(Some(parsed)) => parsed,
                     Ok(None) => continue,
                     Err(error) => {
@@ -607,30 +1056,88 @@ fn scan_qoder_with_callback(
                         continue;
                     }
                 };
-
-            let Some(filtered) = filter_active_branch_messages(parsed) else {
-                continue;
+            let custom_title = match extract_latest_custom_title(&file) {
+                Ok(custom) => custom,
+                Err(io_err) => {
+                    read_failures.record(&path, "read", io_err);
+                    continue;
+                }
             };
 
-            let (external_id, metadata) = if QoderConnector::is_subagent_transcript_path(&path) {
-                subagent_metadata_and_external_id(&path, filtered.model.as_deref(), &mut task_cache)
+            let Some(mut filtered) = filter_active_branch_messages(parsed) else {
+                continue;
+            };
+            let transcript_title = custom_title.or_else(|| filtered.transcript_title.take());
+
+            let (external_id, metadata, title) = if is_subagent {
+                let (ext_id, meta) = subagent_metadata_and_external_id(
+                    &path,
+                    filtered.model.as_deref(),
+                    &mut task_cache,
+                );
+                let title = resolve_qoder_title(
+                    None,
+                    None,
+                    transcript_title.as_deref(),
+                    &filtered.messages,
+                    filtered.workspace.as_deref(),
+                );
+                (ext_id, meta, title)
             } else {
-                let external_id = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(str::to_string);
-                let metadata = serde_json::json!({
+                let file_stem = QoderConnector::jsonl_stem(&path).map(str::to_string);
+                let sidecar_meta = sidecar
+                    .as_deref()
+                    .filter(|s| s.is_file())
+                    .map(read_qoder_session_sidecar)
+                    .unwrap_or_default();
+                if filtered.workspace.is_none() {
+                    filtered.workspace = sidecar_meta.working_dir;
+                }
+                let db_title = if ctx.allow_local_default_stores && !root.origin.is_remote() {
+                    file_stem.as_deref().and_then(|stem| {
+                        let db_path = resolve_title_db(&path)?;
+                        let map = title_db_cache
+                            .entry(db_path.clone())
+                            .or_insert_with(|| load_qoder_title_map_from_db(&db_path));
+                        map.get(stem).cloned()
+                    })
+                } else {
+                    None
+                };
+                let title = resolve_qoder_title(
+                    db_title.as_deref(),
+                    sidecar_meta.title.as_deref(),
+                    transcript_title.as_deref(),
+                    &filtered.messages,
+                    filtered.workspace.as_deref(),
+                );
+
+                let mut metadata = serde_json::json!({
                     "source": "qoder_jsonl",
                     "is_subagent": false,
                     "model": filtered.model,
                 });
-                (external_id, metadata)
+                if let Some(obj) = metadata.as_object_mut() {
+                    if let Some(fork_from) = sidecar_meta.fork_from {
+                        obj.insert(
+                            "fork_from".to_string(),
+                            serde_json::Value::String(fork_from),
+                        );
+                    }
+                    if let Some(parent_session_id) = sidecar_meta.parent_session_id {
+                        obj.insert(
+                            "parent_session_id".to_string(),
+                            serde_json::Value::String(parent_session_id),
+                        );
+                    }
+                }
+                (file_stem, metadata, title)
             };
 
             let mut conv = NormalizedConversation {
                 agent_slug: "qoder".into(),
                 external_id,
-                title: filtered.title,
+                title,
                 workspace: filtered.workspace,
                 source_path: path.clone(),
                 started_at: filtered.started_at,
@@ -641,7 +1148,11 @@ fn scan_qoder_with_callback(
             root.apply_workspace_rewrite(&mut conv);
             on_conversation(conv)?;
 
-            if discovered.fs_metadata_changed() {
+            let changed = discovered.fs_metadata_changed()
+                || sidecar_discovered
+                    .as_ref()
+                    .is_some_and(DiscoveredSourceFile::fs_metadata_changed);
+            if changed {
                 tracing::debug!(
                     path = %path.display(),
                     "qoder source changed during parse; completion withheld"
@@ -649,7 +1160,7 @@ fn scan_qoder_with_callback(
             } else {
                 hooks.complete(&SourceCompletion {
                     source: discovered,
-                    required_sidecars: Vec::new(),
+                    required_sidecars: sidecar_discovered.into_iter().collect(),
                     conversations_emitted: 1,
                 })?;
             }
@@ -716,6 +1227,7 @@ impl Connector for QoderConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
     #[test]
@@ -807,6 +1319,58 @@ mod tests {
             QoderConnector::projects_root_resolved(None, None),
             PathBuf::from(".qoder/projects")
         );
+    }
+
+    #[test]
+    fn projects_roots_resolved_covers_all_four_families_and_qoder_projects_dir() {
+        let explicit_projects = Path::new("/custom/qoder/projects");
+        let explicit_home = Path::new("/opt/qoder_home");
+        let home = Path::new("/home/jane");
+        let appdata = Path::new("/win/Users/jane/AppData/Roaming");
+        let xdg = Path::new("/home/jane/.xdg-config");
+
+        assert_eq!(
+            QoderConnector::projects_roots_resolved(
+                Some(explicit_projects),
+                Some(explicit_home),
+                Some(home),
+                None,
+                Some(appdata),
+                Some(xdg),
+            ),
+            vec![PathBuf::from("/custom/qoder/projects")]
+        );
+
+        assert_eq!(
+            QoderConnector::projects_roots_resolved(
+                None,
+                Some(explicit_home),
+                Some(home),
+                None,
+                Some(appdata),
+                Some(xdg),
+            ),
+            vec![PathBuf::from("/opt/qoder_home/projects")]
+        );
+
+        let roots = QoderConnector::projects_roots_resolved(
+            None,
+            None,
+            Some(home),
+            None,
+            Some(appdata),
+            Some(xdg),
+        );
+        assert!(roots.contains(&home.join(".qoder/projects")));
+        assert!(roots.contains(&home.join(".qoderwork/projects")));
+        assert!(roots.contains(&home.join(".qoder-cn/projects")));
+        assert!(roots.contains(
+            &home.join("Library/Application Support/Qoder/SharedClientCache/cli/projects")
+        ));
+        assert!(roots.contains(&home.join(".config/Qoder/SharedClientCache/cli/projects")));
+        assert!(roots.contains(&home.join("AppData/Roaming/Qoder/SharedClientCache/cli/projects")));
+        assert!(roots.contains(&appdata.join("Qoder/SharedClientCache/cli/projects")));
+        assert!(roots.contains(&xdg.join("Qoder/SharedClientCache/cli/projects")));
     }
 
     #[test]
@@ -929,16 +1493,18 @@ mod tests {
 
     #[test]
     fn main_session_files_never_returns_subagent_files_while_discover_includes_both() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qoder");
-        let main_files = QoderConnector::main_session_files(&root);
+        let projects_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qoder/projects");
+        let main_files = QoderConnector::main_session_files(&projects_root);
         assert_eq!(main_files.len(), 1);
         assert!(
             main_files
                 .iter()
-                .all(|p| !QoderConnector::path_has_subagents_component(p)),
+                .all(|p| !QoderConnector::is_subagent_transcript_path(p)),
             "main_session_files must exclude subagents: {main_files:?}"
         );
 
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qoder");
         let dir = TempDir::new().unwrap();
         let ctx =
             ScanContext::with_roots(dir.path().to_path_buf(), vec![ScanRoot::local(root)], None);
@@ -947,8 +1513,582 @@ mod tests {
         assert!(
             discovered
                 .iter()
-                .any(|d| QoderConnector::path_has_subagents_component(&d.source_path)),
+                .any(|d| QoderConnector::is_subagent_transcript_path(&d.source_path)),
             "discover_source_files should include subagent transcript"
         );
+    }
+
+    #[test]
+    fn project_named_subagents_is_discovered_and_scanned_as_main_session() {
+        let dir = TempDir::new().unwrap();
+        let projects = dir.path().join("projects");
+        let main_in_subagents_proj = projects
+            .join("subagents")
+            .join("11111111-1111-4111-8111-111111111111.jsonl");
+        let stray_agent_in_proj = projects.join("-tmp-demo").join("agent-123.jsonl");
+        let stray_nested = projects.join("-tmp-demo").join("notes").join("stray.jsonl");
+        fs::create_dir_all(main_in_subagents_proj.parent().unwrap()).unwrap();
+        fs::create_dir_all(stray_nested.parent().unwrap()).unwrap();
+        let line = r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/work/subagents","timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"Main session in subagents project"}}"#;
+        fs::write(&main_in_subagents_proj, line).unwrap();
+        fs::write(&stray_agent_in_proj, line).unwrap();
+        fs::write(&stray_nested, line).unwrap();
+
+        assert!(!QoderConnector::is_subagent_transcript_path(
+            &main_in_subagents_proj
+        ));
+        let main_files = QoderConnector::main_session_files(&projects);
+        assert_eq!(main_files, vec![main_in_subagents_proj.clone()]);
+
+        let ctx = ScanContext::with_roots(
+            dir.path().join("state"),
+            vec![ScanRoot::local(projects)],
+            None,
+        )
+        .without_local_default_stores();
+        let convs = QoderConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].external_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(convs[0].metadata["is_subagent"], false);
+        assert_eq!(convs[0].source_path, main_in_subagents_proj);
+    }
+
+    #[test]
+    fn flat_shared_client_cache_layout_with_dotted_stem_is_discovered_and_scanned() {
+        let dir = TempDir::new().unwrap();
+        let cli_projects = dir.path().join("Qoder/SharedClientCache/cli/projects");
+        fs::create_dir_all(&cli_projects).unwrap();
+        let stem = "task-10f849241e06451d9c9c.session.execution";
+        let flat_path = cli_projects.join(format!("{stem}.jsonl"));
+        let flat_agent = cli_projects.join("agent-stray.jsonl");
+        fs::write(
+            &flat_path,
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/work/cli","timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"SharedClientCache task"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &flat_agent,
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"Should skip"}}"#,
+        )
+        .unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().join("state"),
+            vec![ScanRoot::local(cli_projects)],
+            None,
+        )
+        .without_local_default_stores();
+        let discovered = QoderConnector::new().discover_source_files(&ctx).unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].source_path, flat_path);
+
+        let convs = QoderConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some(stem));
+        assert_eq!(convs[0].metadata["is_subagent"], false);
+        assert_eq!(convs[0].workspace, Some(PathBuf::from("/work/cli")));
+    }
+
+    #[test]
+    fn companion_session_json_sidecar_backfills_workspace_metadata_and_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let projects = dir.path().join("projects");
+        let proj_dir = projects.join("-tmp-proj");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let stem = "22222222-2222-4222-8222-222222222222";
+        let transcript = proj_dir.join(format!("{stem}.jsonl"));
+        let sidecar = proj_dir.join(format!("{stem}-session.json"));
+
+        // Transcript has NO cwd and includes an ai-title that sidecar title must outrank.
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"Generated title"}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"forked prompt"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &sidecar,
+            r#"{"title":"Forked work","parent_session_id":"00000000-0000-4000-8000-000000000000","fork_from":"11111111-1111-4111-8111-111111111111","working_dir":"/tmp/qoder-sidecar"}"#,
+        )
+        .unwrap();
+
+        // Set transcript mtime old, sidecar mtime recent -> since_ts filtering must include it!
+        let old_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let new_time = UNIX_EPOCH + Duration::from_secs(1_760_000_000);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_modified(new_time)
+            .unwrap();
+
+        let since_ts_ms = i64::try_from(new_time.duration_since(UNIX_EPOCH).unwrap().as_millis())
+            .unwrap()
+            - 5_000;
+
+        let ctx = ScanContext::with_roots(
+            dir.path().join("state"),
+            vec![ScanRoot::local(projects)],
+            Some(since_ts_ms),
+        )
+        .without_local_default_stores();
+
+        let discovered = QoderConnector::new().discover_source_files(&ctx).unwrap();
+        assert_eq!(discovered.len(), 2);
+        assert!(
+            discovered.iter().any(|d| d.source_path == transcript
+                && d.role == DiscoveredSourceRole::PrimarySessionLog)
+        );
+        assert!(
+            discovered.iter().any(
+                |d| d.source_path == sidecar && d.role == DiscoveredSourceRole::MetadataSidecar
+            )
+        );
+
+        let mut completions = Vec::new();
+        let mut convs = Vec::new();
+        {
+            let mut on_complete = |c: &SourceCompletion| {
+                completions.push(c.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            QoderConnector::new()
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conv| {
+                    convs.push(conv);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+        assert_eq!(conv.title.as_deref(), Some("Forked work"));
+        assert_eq!(conv.workspace, Some(PathBuf::from("/tmp/qoder-sidecar")));
+        assert_eq!(
+            conv.metadata["fork_from"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(
+            conv.metadata["parent_session_id"],
+            "00000000-0000-4000-8000-000000000000"
+        );
+
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].source.source_path, transcript);
+        assert_eq!(completions[0].required_sidecars.len(), 1);
+        assert_eq!(completions[0].required_sidecars[0].source_path, sidecar);
+
+        // If neither transcript nor sidecar was modified after since_ts, nothing is scanned.
+        let future_since_ms = i64::try_from(
+            (SystemTime::now() + Duration::from_secs(3600))
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let ctx_future = ScanContext::with_roots(
+            dir.path().join("state"),
+            vec![ScanRoot::local(dir.path().join("projects"))],
+            Some(future_since_ms),
+        )
+        .without_local_default_stores();
+        assert!(
+            QoderConnector::new()
+                .discover_source_files(&ctx_future)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(QoderConnector::new().scan(&ctx_future).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_session_json_rejects_symlink_and_falls_back_gracefully() {
+        let dir = TempDir::new().unwrap();
+        let projects = dir.path().join("projects/proj");
+        fs::create_dir_all(&projects).unwrap();
+        let outside = dir.path().join("secret-sidecar.json");
+        fs::write(&outside, r#"{"title":"Leaked","working_dir":"/secret"}"#).unwrap();
+
+        let stem = "33333333-3333-4333-8333-333333333333";
+        let transcript = projects.join(format!("{stem}.jsonl"));
+        let sidecar_link = projects.join(format!("{stem}-session.json"));
+        fs::write(
+            &transcript,
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"Prompt fallback"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, &sidecar_link).unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().join("state"),
+            vec![ScanRoot::local(dir.path().join("projects"))],
+            None,
+        )
+        .without_local_default_stores();
+        let convs = QoderConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Prompt fallback"));
+        assert!(convs[0].workspace.is_none());
+    }
+
+    #[test]
+    fn companion_session_json_does_not_overwrite_transcript_cwd_or_emit_blank_links() {
+        let dir = TempDir::new().unwrap();
+        let projects = dir.path().join("projects/proj");
+        fs::create_dir_all(&projects).unwrap();
+        let stem = "44444444-4444-4444-8444-444444444444";
+        let transcript = projects.join(format!("{stem}.jsonl"));
+        let sidecar = projects.join(format!("{stem}-session.json"));
+        fs::write(
+            &transcript,
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/transcript/cwd","timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"Keep transcript cwd"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &sidecar,
+            r#"{"title":"   ","parent_session_id":"  ","fork_from":"","working_dir":"/sidecar/cwd"}"#,
+        )
+        .unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().join("state"),
+            vec![ScanRoot::local(dir.path().join("projects"))],
+            None,
+        )
+        .without_local_default_stores();
+        let convs = QoderConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].workspace, Some(PathBuf::from("/transcript/cwd")));
+        assert_eq!(convs[0].title.as_deref(), Some("Keep transcript cwd"));
+        assert!(convs[0].metadata.get("fork_from").is_none());
+        assert!(convs[0].metadata.get("parent_session_id").is_none());
+    }
+
+    #[test]
+    fn title_database_resolution_strictly_binds_home_default_roots_only() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let app_data = dir.path().join("appdata");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&app_data).unwrap();
+
+        let intl_root = home.join(".qoder/projects");
+        let cn_root = home.join(".qoder-cn/projects");
+        assert_eq!(
+            qoder_title_database_for_root_resolved(&intl_root, Some(&home), Some(&app_data)),
+            Some(app_data.join("com.qoder.app.stable/main.sqlite"))
+        );
+        assert_eq!(
+            qoder_title_database_for_root_resolved(&cn_root, Some(&home), Some(&app_data)),
+            Some(app_data.join("com.qodercn.app.stable/main.sqlite"))
+        );
+
+        for non_bound in [
+            home.join(".qoderwork/projects"),
+            home.join("sessions/projects"),
+            home.join("Library/Application Support/Qoder/SharedClientCache/cli/projects"),
+            home.join(".qoder"),
+            home.join("mirror-0001/.qoder/projects"),
+            PathBuf::from(".qoder/projects"),
+        ] {
+            assert_eq!(
+                qoder_title_database_for_root_resolved(&non_bound, Some(&home), Some(&app_data)),
+                None,
+                "only home-anchored .qoder and .qoder-cn may bind main.sqlite: {}",
+                non_bound.display()
+            );
+        }
+
+        // Transcript path resolution including symlinked default root.
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("moved-cn-projects");
+            fs::create_dir_all(&target).unwrap();
+            fs::create_dir_all(cn_root.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&target, &cn_root).unwrap();
+            let resolved_cn = fs::canonicalize(&cn_root).unwrap();
+            assert_eq!(
+                qoder_title_database_for_path_resolved(
+                    &resolved_cn.join("proj/aaaa.jsonl"),
+                    Some(&home),
+                    Some(&app_data),
+                ),
+                Some(app_data.join("com.qodercn.app.stable/main.sqlite"))
+            );
+        }
+
+        assert_eq!(
+            qoder_title_database_for_path_resolved(
+                &intl_root.join("-Users-u-demo/aaaa.jsonl"),
+                Some(&home),
+                Some(&app_data),
+            ),
+            Some(app_data.join("com.qoder.app.stable/main.sqlite"))
+        );
+        assert_eq!(
+            qoder_title_database_for_path_resolved(
+                &home.join(".qoderwork/projects/aaaa.jsonl"),
+                Some(&home),
+                Some(&app_data),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn title_precedence_enforces_db_then_sidecar_then_transcript_then_prompt() {
+        assert_eq!(
+            resolve_qoder_title(
+                Some("From database"),
+                Some("From sidecar"),
+                Some("Renamed in chat"),
+                &[],
+                None,
+            )
+            .as_deref(),
+            Some("From database")
+        );
+        assert_eq!(
+            resolve_qoder_title(
+                Some("   "),
+                Some("From sidecar"),
+                Some("Renamed in chat"),
+                &[],
+                None,
+            )
+            .as_deref(),
+            Some("From sidecar")
+        );
+        assert_eq!(
+            resolve_qoder_title(
+                None,
+                Some("\u{0000}\u{0001}\u{0080}"),
+                Some("Renamed in chat"),
+                &[],
+                None,
+            )
+            .as_deref(),
+            Some("\u{0000}\u{0001}\u{0080}")
+        );
+        assert_eq!(
+            resolve_qoder_title(None, Some("   "), Some("Renamed in chat"), &[], None).as_deref(),
+            Some("Renamed in chat")
+        );
+    }
+
+    #[cfg(any(
+        feature = "cursor",
+        feature = "opencode",
+        feature = "goose",
+        feature = "hermes",
+        feature = "crush",
+        feature = "devin",
+        feature = "shelley",
+        feature = "openclaw-sqlite",
+        feature = "copilot-vscdb",
+        feature = "pi-sqlite",
+        feature = "pi-durable",
+        feature = "qoder-sqlite"
+    ))]
+    #[test]
+    fn main_sqlite_title_store_precedence_and_hermeticity() {
+        use crate::connectors::sqlite_sync::Connection;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("com.qoder.app.stable/main.sqlite");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        let sid_db_wins = "11111111-1111-4111-8111-111111111111";
+        let sid_blank_db = "22222222-2222-4222-8222-222222222222";
+        let sid_missing_db = "33333333-3333-4333-8333-333333333333";
+        let sid_ai_title = "44444444-4444-4444-8444-444444444444";
+        let sid_prompt = "55555555-5555-4555-8555-555555555555";
+
+        {
+            let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chat_sessions (session_id TEXT PRIMARY KEY, title TEXT);",
+            )
+            .unwrap();
+            conn.execute(&format!(
+                "INSERT INTO chat_sessions (session_id, title) VALUES \
+                 ('{sid_db_wins}', 'From database'), \
+                 ('{sid_blank_db}', '   '), \
+                 ('null-title', NULL);"
+            ))
+            .unwrap();
+        }
+
+        let loaded = load_qoder_title_map_from_db(&db_path);
+        assert_eq!(
+            loaded.get(sid_db_wins).map(String::as_str),
+            Some("From database")
+        );
+        assert!(!loaded.contains_key(sid_blank_db));
+        assert!(!loaded.contains_key("null-title"));
+
+        // Corrupt DB and DB missing chat_sessions table return empty map gracefully.
+        let corrupt_db = dir.path().join("corrupt.sqlite");
+        fs::write(&corrupt_db, "not sqlite").unwrap();
+        assert!(load_qoder_title_map_from_db(&corrupt_db).is_empty());
+
+        let empty_schema_db = dir.path().join("other-table.sqlite");
+        {
+            let conn = Connection::open(empty_schema_db.to_string_lossy().as_ref()).unwrap();
+            conn.execute_batch("CREATE TABLE unrelated (id TEXT);")
+                .unwrap();
+        }
+        assert!(load_qoder_title_map_from_db(&empty_schema_db).is_empty());
+
+        #[cfg(unix)]
+        {
+            let linked_db = dir.path().join("linked-main.sqlite");
+            std::os::unix::fs::symlink(&db_path, &linked_db).unwrap();
+            assert!(load_qoder_title_map_from_db(&linked_db).is_empty());
+        }
+
+        // End-to-end scan through title resolver enforcing exact precedence:
+        // main.sqlite > -session.json > custom-title > ai-title > first user prompt.
+        let projects = dir.path().join("projects/proj");
+        fs::create_dir_all(&projects).unwrap();
+
+        fs::write(
+            projects.join(format!("{sid_db_wins}.jsonl")),
+            concat!(
+                r#"{"type":"custom-title","customTitle":"Renamed in chat"}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"First prompt 1"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            projects.join(format!("{sid_db_wins}-session.json")),
+            r#"{"title":"From sidecar"}"#,
+        )
+        .unwrap();
+
+        fs::write(
+            projects.join(format!("{sid_blank_db}.jsonl")),
+            concat!(
+                r#"{"type":"custom-title","customTitle":"Renamed in chat"}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"First prompt 2"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            projects.join(format!("{sid_blank_db}-session.json")),
+            r#"{"title":"From sidecar"}"#,
+        )
+        .unwrap();
+
+        fs::write(
+            projects.join(format!("{sid_missing_db}.jsonl")),
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"Generated AI title"}"#,
+                "\n",
+                r#"{"type":"custom-title","customTitle":"Renamed in chat"}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"First prompt 3"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        fs::write(
+            projects.join(format!("{sid_ai_title}.jsonl")),
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"Generated AI title"}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"First prompt 4"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        fs::write(
+            projects.join(format!("{sid_prompt}.jsonl")),
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-11-15T10:00:00Z","message":{"role":"user","content":"First prompt 5"}}"#,
+        )
+        .unwrap();
+
+        // With allow_local_default_stores = true and explicit resolver pointing at our temp main.sqlite:
+        let ctx = ScanContext::with_roots(
+            dir.path().join("state"),
+            vec![ScanRoot::local(dir.path().join("projects"))],
+            None,
+        );
+        let mut convs = Vec::new();
+        let db_for_closure = db_path.clone();
+        scan_qoder_with_title_resolver(
+            &ctx,
+            &[],
+            &mut SourceScanHooks::default(),
+            &move |_| Some(db_for_closure.clone()),
+            &mut |c| {
+                convs.push(c);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let title_for = |id: &str| {
+            convs
+                .iter()
+                .find(|c| c.external_id.as_deref() == Some(id))
+                .and_then(|c| c.title.as_deref())
+                .map(str::to_string)
+        };
+        assert_eq!(title_for(sid_db_wins).as_deref(), Some("From database"));
+        assert_eq!(title_for(sid_blank_db).as_deref(), Some("From sidecar"));
+        assert_eq!(
+            title_for(sid_missing_db).as_deref(),
+            Some("Renamed in chat")
+        );
+        assert_eq!(
+            title_for(sid_ai_title).as_deref(),
+            Some("Generated AI title")
+        );
+        assert_eq!(title_for(sid_prompt).as_deref(), Some("First prompt 5"));
+
+        // With allow_local_default_stores = false (hermetic): DB MUST NOT be consulted!
+        let hermetic_ctx = ctx.without_local_default_stores();
+        let mut hermetic_convs = Vec::new();
+        let db_for_hermetic = db_path;
+        scan_qoder_with_title_resolver(
+            &hermetic_ctx,
+            &[],
+            &mut SourceScanHooks::default(),
+            &move |_| Some(db_for_hermetic.clone()),
+            &mut |c| {
+                hermetic_convs.push(c);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let hermetic_db_wins = hermetic_convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some(sid_db_wins))
+            .unwrap();
+        assert_eq!(hermetic_db_wins.title.as_deref(), Some("From sidecar"));
     }
 }

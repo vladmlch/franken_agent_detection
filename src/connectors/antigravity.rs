@@ -262,11 +262,11 @@ impl AntigravityConnector {
     /// Transcript candidates for a `brain/<uuid>` conversation directory, in
     /// the native `get_best_log_file` selection order (`claude_viewer`
     /// `providers/antigravity/discovery.py`): `transcript_full.jsonl`
-    /// (priority 3) and `transcript.jsonl` (priority 2), filtered to existing
-    /// non-empty files under the 100 MiB scan cap and ordered by
+    /// (priority 3) and `transcript.jsonl` (priority 2), filtered to existing,
+    /// non-excluded, non-empty files under the 100 MiB scan cap and ordered by
     /// `(mtime desc, priority desc)` — so the fuller transcript wins on ties
     /// while a fresher short transcript beats a stale full one.
-    fn transcript_candidates(conversation_dir: &Path) -> Vec<PathBuf> {
+    fn transcript_candidates(conversation_dir: &Path, excluded_paths: &[PathBuf]) -> Vec<PathBuf> {
         /// The connector's transcript scan cap (mirrors `read_transcript_records`).
         const MAX_TRANSCRIPT_BYTES: u64 = 100 * 1024 * 1024;
         let mut candidates = [
@@ -275,6 +275,9 @@ impl AntigravityConnector {
         ]
         .into_iter()
         .filter_map(|(priority, path)| {
+            if path_is_excluded(&path, excluded_paths) {
+                return None;
+            }
             let meta = fs::metadata(&path).ok()?;
             if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_TRANSCRIPT_BYTES {
                 return None;
@@ -1076,23 +1079,29 @@ fn subagent_verdict(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_conversation(
     conversation_dir: &Path,
     _scan_root: &ScanRoot,
     descriptors: &HashMap<String, SubagentDescriptor>,
     index_complete: bool,
+    excluded_paths: &[PathBuf],
 ) -> Option<NormalizedConversation> {
-    // Native `get_best_log_file` order: try each transcript candidate until
-    // one yields records — a torn read or empty fuller transcript falls back
-    // to the next file rather than losing the conversation. Records are read
-    // from exactly one file; lines are never stitched across the pair.
-    let (transcript, records) = AntigravityConnector::transcript_candidates(conversation_dir)
-        .into_iter()
-        .map(|path| {
-            let records = AntigravityConnector::read_transcript_records(&path);
-            (path, records)
-        })
-        .find(|(_, records)| !records.is_empty())?;
+    // Native `get_best_log_file` order: try each non-excluded transcript
+    // candidate until one yields records — a torn read or empty fuller
+    // transcript falls back to the next file rather than losing the
+    // conversation. Records are read from exactly one file; lines are never
+    // stitched across the pair.
+    let (transcript, records) =
+        AntigravityConnector::transcript_candidates(conversation_dir, excluded_paths)
+            .into_iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    AntigravityConnector::read_transcript_records(&path),
+                )
+            })
+            .find(|(_, records)| !records.is_empty())?;
 
     // Sort by step_index (gaps are expected; ties keep input order via stable sort).
     let mut ordered: Vec<&Value> = records.iter().collect();
@@ -1241,17 +1250,7 @@ fn scan_antigravity_with_exclusions(
         // descriptor still classifies a fresh child on an incremental scan.
         let (descriptors, index_complete) = subagent_descriptor_index(&root.path, excluded_paths);
         for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
-            // The boundary hooks track the file the parser tries first in
-            // native selection order; when no transcript is parseable yet,
-            // fall back to the canonical short path so exclusion handling
-            // stays stable.
-            let transcript = AntigravityConnector::transcript_candidates(&conversation_dir)
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| AntigravityConnector::transcript_path(&conversation_dir));
-            if path_is_excluded(&conversation_dir, excluded_paths)
-                || path_is_excluded(&transcript, excluded_paths)
-            {
+            if path_is_excluded(&conversation_dir, excluded_paths) {
                 continue;
             }
             if !seen.insert(dedupe_path_key(&conversation_dir)) {
@@ -1260,32 +1259,70 @@ fn scan_antigravity_with_exclusions(
             if !AntigravityConnector::conversation_modified_since(&conversation_dir, ctx.since_ts) {
                 continue;
             }
-            let discovered = DiscoveredSourceFile::new(
-                AGENT_SLUG,
-                &root,
-                transcript,
-                DiscoveredSourceRole::PrimarySessionLog,
-                true,
-            )
-            .with_fs_metadata();
-            if !hooks.should_scan(&discovered) {
+            // Snapshot every usable transcript before parsing: the boundary
+            // hooks must watch whichever candidate the parser may read, not
+            // just the preferred one — a mid-parse change to any of them
+            // invalidates the completion, and the actual fallback pick owns
+            // the ledger.
+            let discovered_candidates: Vec<DiscoveredSourceFile> =
+                AntigravityConnector::transcript_candidates(&conversation_dir, excluded_paths)
+                    .into_iter()
+                    .map(|transcript| {
+                        DiscoveredSourceFile::new(
+                            AGENT_SLUG,
+                            &root,
+                            transcript,
+                            DiscoveredSourceRole::PrimarySessionLog,
+                            true,
+                        )
+                        .with_fs_metadata()
+                    })
+                    .collect();
+            if discovered_candidates.is_empty()
+                || !discovered_candidates
+                    .iter()
+                    .any(|source| hooks.should_scan(source))
+            {
                 continue;
             }
             ctx.tick();
-            if let Some(mut conversation) =
-                parse_conversation(&conversation_dir, &root, &descriptors, index_complete)
-            {
+            if let Some(mut conversation) = parse_conversation(
+                &conversation_dir,
+                &root,
+                &descriptors,
+                index_complete,
+                excluded_paths,
+            ) {
                 root.apply_workspace_rewrite(&mut conversation);
+                let source_path = conversation.source_path.clone();
                 on_conversation(conversation).with_context(|| {
                     format!(
                         "emit antigravity conversation {}",
                         conversation_dir.display()
                     )
                 })?;
-                if !discovered.fs_metadata_changed() {
+                // The completion ledger belongs to the transcript the parser
+                // actually read; every other candidate rides as an optional
+                // sidecar so a change to any usable transcript invalidates it.
+                let mut primary = None;
+                let mut sidecars = Vec::new();
+                for candidate in discovered_candidates {
+                    if candidate.source_path == source_path {
+                        primary = Some(candidate);
+                    } else {
+                        sidecars.push(DiscoveredSourceFile {
+                            required_for_reconstruction: false,
+                            ..candidate
+                        });
+                    }
+                }
+                if let Some(source) = primary
+                    && !source.fs_metadata_changed()
+                    && sidecars.iter().all(|d| !d.fs_metadata_changed())
+                {
                     hooks.complete(&SourceCompletion {
-                        source: discovered,
-                        required_sidecars: Vec::new(),
+                        source,
+                        required_sidecars: sidecars,
                         conversations_emitted: 1,
                     })?;
                 }
@@ -1314,15 +1351,16 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
                 continue;
             }
 
-            // The transcripts the parser can use, in native selection order.
+            // The transcripts the parser can use, in native selection order
+            // (exclusions already applied inside `transcript_candidates`).
             // The first discovered candidate is the file the parser reads —
             // required for reconstruction; the other is a fallback worth
             // mirroring (optional).
             let mut primary_taken = false;
-            for transcript in AntigravityConnector::transcript_candidates(&conversation_dir) {
-                if path_is_excluded(&transcript, &excluded_paths)
-                    || !seen.insert(dedupe_path_key(&transcript))
-                {
+            for transcript in
+                AntigravityConnector::transcript_candidates(&conversation_dir, &excluded_paths)
+            {
+                if !seen.insert(dedupe_path_key(&transcript)) {
                     continue;
                 }
                 let required = !primary_taken;
@@ -2981,6 +3019,185 @@ mod tests {
             }),
             "a full-only transcript is the required primary source"
         );
+    }
+
+    #[test]
+    fn excluded_transcript_variant_is_never_read() {
+        // `CASS_EXCLUDE_PATHS`-style exclusion must apply inside candidate
+        // selection in both directions:
+        // 1. transcript_full excluded → the short transcript still serves the
+        //    conversation (it must not be skipped wholesale).
+        // 2. transcript.jsonl excluded + a blank transcript_full → the
+        //    excluded short file must never be read as the fallback.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid_a = "60606060-6060-4606-8606-606060606060";
+        let conv_a = write_named_transcript(
+            base,
+            uuid_a,
+            "transcript.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nshort wins when full is excluded\n</USER_REQUEST>")
+            ),
+        );
+        write_named_transcript(
+            base,
+            uuid_a,
+            "transcript_full.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nexcluded full marker\n</USER_REQUEST>")
+            ),
+        );
+        let excluded_full = conv_a.join(".system_generated/logs/transcript_full.jsonl");
+
+        let uuid_b = "70707070-7070-4707-8707-707070707070";
+        let conv_b = write_named_transcript(
+            base,
+            uuid_b,
+            "transcript.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nexcluded short marker\n</USER_REQUEST>")
+            ),
+        );
+        write_named_transcript(base, uuid_b, "transcript_full.jsonl", "\n\n");
+        let excluded_short = conv_b.join(".system_generated/logs/transcript.jsonl");
+
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            None,
+        );
+        let mut convs = Vec::new();
+        scan_antigravity_with_exclusions(
+            &ctx,
+            &mut SourceScanHooks::default(),
+            &[excluded_full, excluded_short],
+            &mut |conv| {
+                convs.push(conv);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some(uuid_a));
+        assert_eq!(
+            convs[0].source_path,
+            conv_a.join(".system_generated/logs/transcript.jsonl")
+        );
+        assert_eq!(
+            convs[0].messages[0].content,
+            "short wins when full is excluded"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn transcript_fallback_records_the_actual_source_in_the_completion() {
+        // transcript_full yields no records → the parser falls back to
+        // transcript.jsonl; the SourceCompletion must name the file actually
+        // read so a later change to it rescans.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "80808080-8080-4808-8808-808080808080";
+        let conv_dir = write_named_transcript(
+            base,
+            uuid,
+            "transcript.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nshort serves the ledger\n</USER_REQUEST>")
+            ),
+        );
+        write_named_transcript(base, uuid, "transcript_full.jsonl", "\n\n");
+        let logs = conv_dir.join(".system_generated").join("logs");
+        // transcript_full strictly newer: tried first, yields nothing.
+        set_file_mtime(&logs.join("transcript.jsonl"), 1_000);
+        set_file_mtime(&logs.join("transcript_full.jsonl"), 2_000);
+        let short = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            None,
+        );
+        let scan = |hooks: &mut SourceScanHooks<'_>| {
+            let mut convs = Vec::new();
+            scan_antigravity_with_exclusions(&ctx, hooks, &[], &mut |conv| {
+                convs.push(conv);
+                Ok(())
+            })
+            .unwrap();
+            convs
+        };
+
+        let mut completions = Vec::new();
+        let mut on_complete = |c: &SourceCompletion| {
+            completions.push(c.clone());
+            Ok(())
+        };
+        let convs = scan(&mut SourceScanHooks {
+            should_scan_source: None,
+            on_source_complete: Some(&mut on_complete),
+        });
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].source_path, short);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(
+            completions[0].source.source_path, short,
+            "the ledger must belong to the transcript actually read"
+        );
+        assert!(
+            completions[0]
+                .required_sidecars
+                .iter()
+                .any(|d| d.source_path == full),
+            "the passed-over candidate rides as a sidecar so its changes \
+             invalidate the ledger"
+        );
+
+        // Host-ledger simulation: a candidate needs rescan when its
+        // fingerprint is not one of the recorded snapshots.
+        let ledger_fingerprints: Vec<(PathBuf, Option<u64>, Option<i64>)> =
+            std::iter::once(&completions[0].source)
+                .chain(completions[0].required_sidecars.iter())
+                .map(|d| (d.source_path.clone(), d.size_bytes, d.modified_at_ms))
+                .collect();
+        let mut should = |d: &DiscoveredSourceFile| {
+            !ledger_fingerprints.iter().any(|(p, s, m)| {
+                *p == d.source_path && *s == d.size_bytes && *m == d.modified_at_ms
+            })
+        };
+
+        // Unchanged: every candidate matches the ledger → skip.
+        assert!(
+            scan(&mut SourceScanHooks {
+                should_scan_source: Some(&mut should),
+                on_source_complete: None,
+            })
+            .is_empty(),
+            "unchanged candidates must be skipped"
+        );
+
+        // transcript.jsonl changes while transcript_full stays blank and
+        // unchanged — the ledger must NOT suppress the rescan.
+        fs::write(
+            &short,
+            format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nupdated short content\n</USER_REQUEST>")
+            ),
+        )
+        .unwrap();
+        set_file_mtime(&short, 3_000);
+        let convs = scan(&mut SourceScanHooks {
+            should_scan_source: Some(&mut should),
+            on_source_complete: None,
+        });
+        assert_eq!(convs.len(), 1, "a changed fallback source must rescan");
+        assert_eq!(convs[0].messages[0].content, "updated short content");
     }
 
     // -----------------------------------------------------------------

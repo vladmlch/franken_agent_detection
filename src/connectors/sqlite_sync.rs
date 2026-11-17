@@ -1988,12 +1988,12 @@ mod tests {
 
         let max_interval = SQLITE_CONTAINER_REVERIFY_INTERVAL;
         assert!(!needs_periodic_reverify(
-            max_interval - Duration::from_nanos(1),
+            max_interval.checked_sub(Duration::from_nanos(1)).unwrap(),
             max_interval
         ));
         assert!(needs_periodic_reverify(max_interval, max_interval));
         assert!(needs_periodic_reverify(
-            max_interval + Duration::from_secs(1),
+            max_interval.checked_add(Duration::from_secs(1)).unwrap(),
             max_interval
         ));
     }

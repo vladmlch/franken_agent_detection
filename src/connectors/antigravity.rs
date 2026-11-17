@@ -21,9 +21,10 @@
 //!   path, a simple, stable line-per-step JSON shape, no protobuf required.
 //!   When both `transcript_full.jsonl` (the fuller variant) and
 //!   `transcript.jsonl` exist, the parse source is picked with the native
-//!   `get_best_log_file` rule — `(mtime desc, priority desc)` — so the
-//!   fuller transcript wins on ties and a fresher short transcript beats a
-//!   stale full one; the first candidate that yields records wins, with no
+//!   `get_best_log_file` rule — an unconditional intra-directory priority
+//!   (the fuller transcript always wins inside one logs/ directory; the
+//!   native `(mtime, prio)` sort only ranks candidates across different
+//!   `brain_dirs`); the first candidate that yields records wins, with no
 //!   stitching across the pair.
 //!
 //! The `<uuid>` keying `conversations/<uuid>.db` and `brain/<uuid>/` is the same
@@ -261,33 +262,38 @@ impl AntigravityConnector {
 
     /// Transcript candidates for a `brain/<uuid>` conversation directory, in
     /// the native `get_best_log_file` selection order (`claude_viewer`
-    /// `providers/antigravity/discovery.py`): `transcript_full.jsonl`
-    /// (priority 3) and `transcript.jsonl` (priority 2), filtered to existing,
-    /// non-excluded, non-empty files under the 100 MiB scan cap and ordered by
-    /// `(mtime desc, priority desc)` — so the fuller transcript wins on ties
-    /// while a fresher short transcript beats a stale full one.
+    /// `providers/antigravity/discovery.py`): within a single
+    /// `.system_generated/logs/` directory the choice is an UNCONDITIONAL
+    /// priority — `transcript_full.jsonl` (priority 3) whenever it exists
+    /// and is non-empty, else `transcript.jsonl` (priority 2). The native
+    /// `(mtime desc, priority desc)` sort only ranks candidates ACROSS
+    /// different `brain_dirs`, never inside one logs/ directory, and must
+    /// not be applied here: agy flushes `transcript.jsonl` microseconds
+    /// after `transcript_full.jsonl` on every turn, so the short file
+    /// routinely carries the newer nanosecond mtime while being the
+    /// truncated variant. Returned paths are filtered to non-excluded
+    /// regular files with `0 < len <= 100 MiB`, in strict priority order
+    /// (`transcript_full.jsonl` first); the caller's
+    /// first-candidate-that-yields-records rule supplies the fallback the
+    /// native `elif` encodes.
+    ///
+    /// `overview.txt` (plain text, priority 1 in `claude_viewer`) is
+    /// intentionally out of scope for FAD's JSONL transcript connector.
     fn transcript_candidates(conversation_dir: &Path, excluded_paths: &[PathBuf]) -> Vec<PathBuf> {
         /// The connector's transcript scan cap (mirrors `read_transcript_records`).
         const MAX_TRANSCRIPT_BYTES: u64 = 100 * 1024 * 1024;
-        let mut candidates = [
-            (3_u8, Self::transcript_full_path(conversation_dir)),
-            (2_u8, Self::transcript_path(conversation_dir)),
+        [
+            Self::transcript_full_path(conversation_dir),
+            Self::transcript_path(conversation_dir),
         ]
         .into_iter()
-        .filter_map(|(priority, path)| {
-            if path_is_excluded(&path, excluded_paths) {
-                return None;
-            }
-            let meta = fs::metadata(&path).ok()?;
-            if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_TRANSCRIPT_BYTES {
-                return None;
-            }
-            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            Some((mtime, priority, path))
+        .filter(|path| {
+            !path_is_excluded(path, excluded_paths)
+                && fs::metadata(path).is_ok_and(|meta| {
+                    meta.is_file() && meta.len() > 0 && meta.len() <= MAX_TRANSCRIPT_BYTES
+                })
         })
-        .collect::<Vec<_>>();
-        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-        candidates.into_iter().map(|entry| entry.2).collect()
+        .collect()
     }
 
     /// A conversation directory is recognized by the presence of EITHER
@@ -403,13 +409,24 @@ impl AntigravityConnector {
         out
     }
 
-    /// True when the conversation's transcript is newer than `since_ts`.
-    fn conversation_modified_since(conversation_dir: &Path, since_ts: Option<i64>) -> bool {
+    /// True when one of the conversation's non-excluded transcript variants
+    /// is newer than `since_ts`. Excluded paths are filtered out so an
+    /// excluded `transcript_full.jsonl`'s mtime cannot force rescan churn
+    /// when only `transcript.jsonl` is admitted.
+    fn conversation_modified_since(
+        conversation_dir: &Path,
+        since_ts: Option<i64>,
+        excluded_paths: &[PathBuf],
+    ) -> bool {
         if since_ts.is_none() {
             return true;
         }
-        file_modified_since(&Self::transcript_path(conversation_dir), since_ts)
-            || file_modified_since(&Self::transcript_full_path(conversation_dir), since_ts)
+        [
+            Self::transcript_path(conversation_dir),
+            Self::transcript_full_path(conversation_dir),
+        ]
+        .iter()
+        .any(|path| !path_is_excluded(path, excluded_paths) && file_modified_since(path, since_ts))
     }
 
     /// Read a transcript file into per-step JSON records, tolerating blank lines
@@ -1209,34 +1226,6 @@ fn parse_conversation_from_transcript(
     })
 }
 
-/// Parse a conversation using the native `get_best_log_file` order over the
-/// non-excluded candidates — a torn read or empty fuller transcript falls
-/// back to the next file rather than losing the conversation. Records are
-/// read from exactly one file; lines are never stitched across the pair.
-/// Kept for non-hook callers and tests; the hook-driven scan loop calls
-/// `parse_conversation_from_transcript` per admitted candidate so the
-/// completion ledger always keys on the file actually read.
-#[allow(dead_code)]
-fn parse_conversation(
-    conversation_dir: &Path,
-    scan_root: &ScanRoot,
-    descriptors: &HashMap<String, SubagentDescriptor>,
-    index_complete: bool,
-    excluded_paths: &[PathBuf],
-) -> Option<NormalizedConversation> {
-    AntigravityConnector::transcript_candidates(conversation_dir, excluded_paths)
-        .into_iter()
-        .find_map(|transcript| {
-            parse_conversation_from_transcript(
-                &transcript,
-                conversation_dir,
-                scan_root,
-                descriptors,
-                index_complete,
-            )
-        })
-}
-
 fn scan_antigravity_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
@@ -1276,7 +1265,11 @@ fn scan_antigravity_with_exclusions(
             if !seen.insert(dedupe_path_key(&conversation_dir)) {
                 continue;
             }
-            if !AntigravityConnector::conversation_modified_since(&conversation_dir, ctx.since_ts) {
+            if !AntigravityConnector::conversation_modified_since(
+                &conversation_dir,
+                ctx.since_ts,
+                excluded_paths,
+            ) {
                 continue;
             }
             // Snapshot every usable transcript before parsing. The boundary
@@ -1331,6 +1324,14 @@ fn scan_antigravity_with_exclusions(
                 // The completion ledger keys on the transcript actually
                 // read; every other candidate rides as an optional sidecar
                 // so a change to any usable transcript invalidates it.
+                // Declaring the un-parsed variant in `required_sidecars` is
+                // backed by CASS's
+                // `SourceDependencyPolicy::ObserveParentDirectory`: it
+                // pre-captures BOTH candidates via `discover_source_files`
+                // into `dependencies.files` before `should_scan` runs, so
+                // the sidecar fingerprint exists at admission time.
+                // Switching Antigravity to `SelfContained` in CASS would
+                // instead require offering the sidecars before parsing.
                 let sidecars: Vec<DiscoveredSourceFile> = discovered_candidates
                     .iter()
                     .enumerate()
@@ -1371,15 +1372,22 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
             if path_is_excluded(&conversation_dir, &excluded_paths) {
                 continue;
             }
-            if !AntigravityConnector::conversation_modified_since(&conversation_dir, ctx.since_ts) {
+            if !AntigravityConnector::conversation_modified_since(
+                &conversation_dir,
+                ctx.since_ts,
+                &excluded_paths,
+            ) {
                 continue;
             }
 
             // The transcripts the parser can use, in native selection order
             // (exclusions already applied inside `transcript_candidates`).
-            // The first discovered candidate is the file the parser reads —
-            // required for reconstruction; the other is a fallback worth
-            // mirroring (optional).
+            // `required = !primary_taken` marks the PREFERRED candidate —
+            // the first in the static priority order — as required for
+            // reconstruction; a torn preferred candidate is not a
+            // discovery-time concern because the parser falls back to the
+            // next candidate at read time. The other candidate is an
+            // optional fallback worth mirroring.
             let mut primary_taken = false;
             for transcript in
                 AntigravityConnector::transcript_candidates(&conversation_dir, &excluded_paths)
@@ -2384,9 +2392,10 @@ mod tests {
         let discovered = connector.discover_source_files(&fixture_ctx()).unwrap();
 
         assert!(discovered.iter().all(|d| d.provider_slug == "antigravity"));
-        // The fixture's transcript_full.jsonl is the freshest transcript, so
-        // it is the required primary source; transcript.jsonl stays
-        // discovered as the optional fallback.
+        // The fixture's transcript_full.jsonl is the preferred transcript
+        // (unconditional intra-directory priority), so it is the required
+        // primary source; transcript.jsonl stays discovered as the optional
+        // fallback.
         assert!(
             discovered
                 .iter()
@@ -2811,9 +2820,13 @@ mod tests {
 
     // -----------------------------------------------------------------
     // transcript_full.jsonl selection (native `get_best_log_file` parity,
-    // claude_viewer providers/antigravity/discovery.py): the fuller
-    // transcript is the higher-priority candidate and wins whenever it is
-    // not stale; the short transcript takes over when it is fresher or the
+    // claude_viewer providers/antigravity/discovery.py): within a single
+    // logs/ directory the fuller transcript wins UNCONDITIONALLY — the
+    // native (mtime, prio) sort only ranks candidates across different
+    // brain_dirs, never inside one directory (agy flushes transcript.jsonl
+    // microseconds after transcript_full.jsonl on every turn, so the short
+    // file routinely carries the newer nanosecond mtime while being the
+    // truncated variant). The short transcript takes over only when the
     // full file cannot produce records.
     // -----------------------------------------------------------------
 
@@ -2908,9 +2921,12 @@ mod tests {
     }
 
     #[test]
-    fn stale_transcript_full_loses_to_fresher_short() {
-        // mtime dominates priority: a newer short transcript wins over a
-        // stale full one (native sort key order).
+    fn transcript_full_wins_over_fresher_short_within_same_dir() {
+        // Native parity: inside one logs/ directory selection is an
+        // unconditional priority, NOT an mtime race — the (mtime, prio)
+        // sort only ranks candidates across different brain_dirs. A
+        // transcript.jsonl flushed microseconds after transcript_full.jsonl
+        // has the strictly newer mtime yet must still lose.
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let uuid = "30303030-3030-4303-8303-303030303030";
@@ -2929,16 +2945,21 @@ mod tests {
             "transcript_full.jsonl",
             &format!(
                 "{}\n",
-                ag_user_step("<USER_REQUEST>\nstale full marker\n</USER_REQUEST>")
+                ag_user_step("<USER_REQUEST>\nolder full marker\n</USER_REQUEST>")
             ),
         );
         let logs = conv_dir.join(".system_generated").join("logs");
+        // The short transcript is strictly fresher than the full one.
         set_file_mtime(&logs.join("transcript_full.jsonl"), 1_000);
         set_file_mtime(&logs.join("transcript.jsonl"), 2_000);
         let convs = ag_scan(base);
         assert_eq!(convs.len(), 1);
-        assert_eq!(convs[0].source_path, logs.join("transcript.jsonl"));
-        assert_eq!(convs[0].messages[0].content, "fresh short marker");
+        assert_eq!(
+            convs[0].source_path,
+            logs.join("transcript_full.jsonl"),
+            "transcript_full wins unconditionally inside one logs/ directory"
+        );
+        assert_eq!(convs[0].messages[0].content, "older full marker");
     }
 
     #[test]
@@ -2969,7 +2990,8 @@ mod tests {
             } else {
                 fs::write(&full, "this is not json\n{\"step_index\":0,\"unclosed\":").unwrap();
             }
-            // Newer mtime: the full file is tried first and must fail over.
+            // The full file holds static priority and is tried first; it
+            // must fail over to the short transcript.
             set_file_mtime(&full, 2_000);
             set_file_mtime(&logs.join("transcript.jsonl"), 1_000);
             let convs = ag_scan(base);
@@ -3118,6 +3140,72 @@ mod tests {
     }
 
     #[test]
+    fn excluded_transcript_variant_mtime_does_not_force_rescan() {
+        // An excluded transcript_full.jsonl with a recent mtime must not
+        // mark the conversation modified when the only admitted source
+        // (transcript.jsonl) is older than since_ts — otherwise every
+        // incremental scan re-reads a conversation whose usable source
+        // never changed.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = "b2b2b2b2-b2b2-4b2b-8b2b-b2b2b2b2b2b2";
+        let conv_dir = write_named_transcript(
+            base,
+            uuid,
+            "transcript.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nold short marker\n</USER_REQUEST>")
+            ),
+        );
+        write_named_transcript(
+            base,
+            uuid,
+            "transcript_full.jsonl",
+            &format!(
+                "{}\n",
+                ag_user_step("<USER_REQUEST>\nnew full marker\n</USER_REQUEST>")
+            ),
+        );
+        let logs = conv_dir.join(".system_generated").join("logs");
+        let short = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        set_file_mtime(&short, 1_000);
+        set_file_mtime(&full, 9_999_999);
+        // since_ts (epoch ms) between the two mtimes: only the excluded
+        // full file would look "modified".
+        let ctx = ScanContext::with_roots(
+            base.to_path_buf(),
+            vec![ScanRoot::local(base.to_path_buf())],
+            Some(5_000_000),
+        );
+        let scan = |excluded: &[PathBuf]| {
+            let mut convs = Vec::new();
+            scan_antigravity_with_exclusions(
+                &ctx,
+                &mut SourceScanHooks::default(),
+                excluded,
+                &mut |conv| {
+                    convs.push(conv);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            convs
+        };
+
+        assert!(
+            scan(&[full.clone()]).is_empty(),
+            "an excluded transcript's mtime must not mark the conversation modified"
+        );
+        // Sanity: without the exclusion the fresh full file legitimately
+        // marks the conversation modified and the scan emits it.
+        let convs = scan(&[]);
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].source_path, logs.join("transcript_full.jsonl"));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn transcript_fallback_records_the_actual_source_in_the_completion() {
         // transcript_full yields no records → the parser falls back to
@@ -3137,7 +3225,8 @@ mod tests {
         );
         write_named_transcript(base, uuid, "transcript_full.jsonl", "\n\n");
         let logs = conv_dir.join(".system_generated").join("logs");
-        // transcript_full strictly newer: tried first, yields nothing.
+        // transcript_full holds static priority: tried first, yields
+        // nothing.
         set_file_mtime(&logs.join("transcript.jsonl"), 1_000);
         set_file_mtime(&logs.join("transcript_full.jsonl"), 2_000);
         let short = logs.join("transcript.jsonl");
@@ -3182,20 +3271,37 @@ mod tests {
              invalidate the ledger"
         );
 
-        // Host-ledger simulation: a candidate needs rescan when its
-        // fingerprint is not one of the recorded snapshots.
-        let ledger_fingerprints: Vec<(PathBuf, Option<u64>, Option<i64>)> =
+        // Host-ledger simulation, keyed by the PRIMARY source path like
+        // CASS `watch_source_ledger` (`source_ledger_key` → saved receipt):
+        // `should_scan` may skip only the candidate whose OWN completed
+        // entry has every recorded file (primary + sidecars) still
+        // unchanged — a sidecar fingerprint under another primary never
+        // skips it.
+        let primary_key = completions[0].source.source_path.clone();
+        let ledger_entry: Vec<(PathBuf, Option<u64>, Option<i64>)> =
             std::iter::once(&completions[0].source)
                 .chain(completions[0].required_sidecars.iter())
                 .map(|d| (d.source_path.clone(), d.size_bytes, d.modified_at_ms))
                 .collect();
+        let unchanged = |path: &Path, size: Option<u64>, mtime_ms: Option<i64>| {
+            let Ok(meta) = fs::metadata(path) else {
+                return false;
+            };
+            let now_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|d| i64::try_from(d.as_millis()).ok());
+            Some(meta.len()) == size && now_ms == mtime_ms
+        };
         let mut should = |d: &DiscoveredSourceFile| {
-            !ledger_fingerprints.iter().any(|(p, s, m)| {
-                *p == d.source_path && *s == d.size_bytes && *m == d.modified_at_ms
-            })
+            d.source_path != primary_key
+                || !ledger_entry.iter().all(|(p, s, m)| unchanged(p, *s, *m))
         };
 
-        // Unchanged: every candidate matches the ledger → skip.
+        // Unchanged: the torn full candidate is re-admitted but yields no
+        // records, and the completed primary's files all match → no
+        // conversation.
         assert!(
             scan(&mut SourceScanHooks {
                 should_scan_source: Some(&mut should),

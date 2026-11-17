@@ -1,12 +1,17 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
+use super::json_stream::{
+    JsonContainerKind, drive_seq_stream, peek_json_container, stream_json_array_after_peek,
+};
 use super::jsonl::JsonlLines;
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
@@ -546,9 +551,9 @@ impl GeminiConnector {
         Ok(Value::Object(session))
     }
 
-    fn parse_session_file(file: &Path) -> Option<Value> {
-        // Legacy whole-file sessions load into a full JSON DOM (~4-10x the
-        // file size in RAM); enforce the project's 100MB scan cap.
+    fn parse_session_file(file: &Path) -> Option<ParsedGeminiSession> {
+        // Legacy whole-file sessions can still carry large message bodies;
+        // enforce the project's 100MB scan cap.
         if let Ok(metadata) = fs::metadata(file)
             && metadata.len() > MAX_SCAN_FILE_BYTES
         {
@@ -573,7 +578,7 @@ impl GeminiConnector {
 
         if is_jsonl {
             return match Self::replay_jsonl_session(reader, file) {
-                Ok(value) => Some(value),
+                Ok(value) => parsed_session_from_value(value),
                 Err(error) => {
                     tracing::warn!(path = %file.display(), %error, "failed to read Gemini session");
                     None
@@ -581,8 +586,8 @@ impl GeminiConnector {
             };
         }
 
-        match serde_json::from_reader(reader) {
-            Ok(value) => Some(value),
+        match parse_json_session_reader(reader) {
+            Ok(session) => session,
             Err(error) => {
                 tracing::warn!(path = %file.display(), %error, "failed to parse Gemini session");
                 None
@@ -744,6 +749,329 @@ fn normalize_gemini_message_content(
     (content, invocations)
 }
 
+struct ParsedGeminiSession {
+    session_id: Option<String>,
+    project_hash: Option<String>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    messages: Vec<NormalizedMessage>,
+}
+
+fn merge_min_ts(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
+    match (current, candidate) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (None, Some(b)) => Some(b),
+        (a, None) => a,
+    }
+}
+
+fn merge_max_ts(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
+    match (current, candidate) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (None, Some(b)) => Some(b),
+        (a, None) => a,
+    }
+}
+
+fn normalize_gemini_message(
+    item: Value,
+    started_at: &mut Option<i64>,
+    ended_at: &mut Option<i64>,
+) -> Option<NormalizedMessage> {
+    // Legacy Gemini used `model`; current Gemini CLI uses `gemini`.
+    let msg_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("model");
+    let role = GeminiConnector::normalize_message_role(msg_type);
+
+    // Parse timestamp using shared utility
+    let created = item.get("timestamp").and_then(parse_timestamp);
+
+    // NOTE: Do NOT filter individual messages by timestamp here!
+    // The file-level check in file_modified_since() is sufficient.
+    // Filtering messages would cause older messages to be lost when
+    // the file is re-indexed after new messages are added.
+    *started_at = merge_min_ts(*started_at, created);
+    *ended_at = merge_max_ts(*ended_at, created);
+
+    let (content_str, invocations) = normalize_gemini_message_content(&item, role);
+
+    // Empty text with no readable thoughts or named tools is not a message.
+    if content_str.trim().is_empty() {
+        return None;
+    }
+
+    Some(NormalizedMessage {
+        idx: 0, // will be re-assigned after filtering
+        role: role.to_string(),
+        author: None,
+        created_at: created,
+        content: content_str,
+        extra: item,
+        invocations,
+        snippets: Vec::new(),
+    })
+}
+
+fn parsed_session_from_value(mut val: Value) -> Option<ParsedGeminiSession> {
+    let session_id = val
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let project_hash = val
+        .get("projectHash")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let start_time = val.get("startTime").and_then(parse_timestamp);
+    let last_updated = val.get("lastUpdated").and_then(parse_timestamp);
+
+    let Value::Array(messages_arr) = val
+        .as_object_mut()
+        .and_then(|object| object.remove("messages"))?
+    else {
+        return None;
+    };
+
+    let mut messages = Vec::new();
+    let mut started_at = start_time;
+    let mut ended_at = last_updated;
+    for item in messages_arr {
+        if let Some(msg) = normalize_gemini_message(item, &mut started_at, &mut ended_at) {
+            messages.push(msg);
+        }
+    }
+
+    Some(ParsedGeminiSession {
+        session_id,
+        project_hash,
+        started_at,
+        ended_at,
+        messages,
+    })
+}
+
+#[derive(Default)]
+struct GeminiStreamState {
+    session_id: Option<String>,
+    project_hash: Option<String>,
+    start_time: Option<i64>,
+    last_updated: Option<i64>,
+    msg_started_at: Option<i64>,
+    msg_ended_at: Option<i64>,
+    messages: Vec<NormalizedMessage>,
+    has_messages_array: bool,
+}
+
+struct GeminiMessagesFieldSeed<'a> {
+    state: &'a mut GeminiStreamState,
+    callback_error: &'a mut Option<anyhow::Error>,
+}
+
+impl<'de> DeserializeSeed<'de> for GeminiMessagesFieldSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct MessagesVisitor<'a> {
+            state: &'a mut GeminiStreamState,
+            callback_error: &'a mut Option<anyhow::Error>,
+        }
+
+        impl<'de> Visitor<'de> for MessagesVisitor<'_> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("Gemini messages field")
+            }
+
+            fn visit_seq<A>(self, seq: A) -> std::result::Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                self.state.has_messages_array = true;
+                self.state.messages.clear();
+                self.state.msg_started_at = None;
+                self.state.msg_ended_at = None;
+                let state = self.state;
+                let mut push_item = |item: Value| -> Result<()> {
+                    if let Some(msg) = normalize_gemini_message(
+                        item,
+                        &mut state.msg_started_at,
+                        &mut state.msg_ended_at,
+                    ) {
+                        state.messages.push(msg);
+                    }
+                    Ok(())
+                };
+                drive_seq_stream(seq, &mut push_item, self.callback_error)
+            }
+
+            fn visit_bool<E>(self, _: bool) -> std::result::Result<(), E> {
+                self.state.has_messages_array = false;
+                Ok(())
+            }
+
+            fn visit_i64<E>(self, _: i64) -> std::result::Result<(), E> {
+                self.state.has_messages_array = false;
+                Ok(())
+            }
+
+            fn visit_u64<E>(self, _: u64) -> std::result::Result<(), E> {
+                self.state.has_messages_array = false;
+                Ok(())
+            }
+
+            fn visit_f64<E>(self, _: f64) -> std::result::Result<(), E> {
+                self.state.has_messages_array = false;
+                Ok(())
+            }
+
+            fn visit_str<E>(self, _: &str) -> std::result::Result<(), E> {
+                self.state.has_messages_array = false;
+                Ok(())
+            }
+
+            fn visit_bytes<E>(self, _: &[u8]) -> std::result::Result<(), E> {
+                self.state.has_messages_array = false;
+                Ok(())
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<(), E> {
+                self.state.has_messages_array = false;
+                Ok(())
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<(), E> {
+                self.state.has_messages_array = false;
+                Ok(())
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                self.state.has_messages_array = false;
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_any(MessagesVisitor {
+            state: self.state,
+            callback_error: self.callback_error,
+        })
+    }
+}
+
+struct GeminiObjectSeed<'a> {
+    state: &'a mut GeminiStreamState,
+    callback_error: &'a mut Option<anyhow::Error>,
+}
+
+impl<'de> DeserializeSeed<'de> for GeminiObjectSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ObjectVisitor<'a> {
+            state: &'a mut GeminiStreamState,
+            callback_error: &'a mut Option<anyhow::Error>,
+        }
+
+        impl<'de> Visitor<'de> for ObjectVisitor<'_> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Gemini JSON session object")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> std::result::Result<(), M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "sessionId" => {
+                            let val = map.next_value::<Value>()?;
+                            self.state.session_id = val.as_str().map(str::to_owned);
+                        }
+                        "projectHash" => {
+                            let val = map.next_value::<Value>()?;
+                            self.state.project_hash = val.as_str().map(str::to_owned);
+                        }
+                        "startTime" => {
+                            let val = map.next_value::<Value>()?;
+                            self.state.start_time = parse_timestamp(&val);
+                        }
+                        "lastUpdated" => {
+                            let val = map.next_value::<Value>()?;
+                            self.state.last_updated = parse_timestamp(&val);
+                        }
+                        "messages" => {
+                            map.next_value_seed(GeminiMessagesFieldSeed {
+                                state: self.state,
+                                callback_error: self.callback_error,
+                            })?;
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_map(ObjectVisitor {
+            state: self.state,
+            callback_error: self.callback_error,
+        })
+    }
+}
+
+fn parse_json_session_reader(reader: impl BufRead) -> Result<Option<ParsedGeminiSession>> {
+    let (kind, stream_reader) = peek_json_container(reader)?;
+    match kind {
+        JsonContainerKind::Array => {
+            stream_json_array_after_peek::<_, IgnoredAny, _>(stream_reader, &mut |_| Ok(()))?;
+            Ok(None)
+        }
+        JsonContainerKind::Object => {
+            let mut deserializer = serde_json::Deserializer::from_reader(stream_reader);
+            let mut state = GeminiStreamState::default();
+            let mut callback_error = None;
+            let result = GeminiObjectSeed {
+                state: &mut state,
+                callback_error: &mut callback_error,
+            }
+            .deserialize(&mut deserializer);
+            if let Some(err) = callback_error {
+                return Err(err);
+            }
+            result?;
+            deserializer.end()?;
+
+            if !state.has_messages_array {
+                return Ok(None);
+            }
+            let started_at = merge_min_ts(state.start_time, state.msg_started_at);
+            let ended_at = merge_max_ts(state.last_updated, state.msg_ended_at);
+            Ok(Some(ParsedGeminiSession {
+                session_id: state.session_id,
+                project_hash: state.project_hash,
+                started_at,
+                ended_at,
+                messages: state.messages,
+            }))
+        }
+        JsonContainerKind::Empty | JsonContainerKind::Other(_) => {
+            bail!("expected Gemini JSON session object or array")
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn scan_gemini_with_callback(
     ctx: &ScanContext,
@@ -788,82 +1116,16 @@ fn scan_gemini_with_hooks(
             }
             ctx.tick();
 
-            let Some(mut val) = GeminiConnector::parse_session_file(&file) else {
+            let Some(parsed) = GeminiConnector::parse_session_file(&file) else {
                 continue;
             };
-
-            // Extract session metadata
-            let session_id = val
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let project_hash = val
-                .get("projectHash")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-
-            // Parse session-level timestamps
-            let start_time = val.get("startTime").and_then(parse_timestamp);
-            let last_updated = val.get("lastUpdated").and_then(parse_timestamp);
-
-            // Parse messages array
-            let Some(messages_value) = val
-                .as_object_mut()
-                .and_then(|object| object.remove("messages"))
-            else {
-                continue;
-            };
-            let Value::Array(messages_arr) = messages_value else {
-                continue;
-            };
-
-            let mut messages = Vec::new();
-            let mut started_at = start_time;
-            let mut ended_at = last_updated;
-
-            for item in messages_arr {
-                // Legacy Gemini used `model`; current Gemini CLI uses `gemini`.
-                let msg_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("model");
-                let role = GeminiConnector::normalize_message_role(msg_type);
-
-                // Parse timestamp using shared utility
-                let created = item.get("timestamp").and_then(parse_timestamp);
-
-                // NOTE: Do NOT filter individual messages by timestamp here!
-                // The file-level check in file_modified_since() is sufficient.
-                // Filtering messages would cause older messages to be lost when
-                // the file is re-indexed after new messages are added.
-
-                started_at = match (started_at, created) {
-                    (Some(curr), Some(ts)) => Some(curr.min(ts)),
-                    (None, Some(ts)) => Some(ts),
-                    (other, None) => other,
-                };
-                ended_at = match (ended_at, created) {
-                    (Some(current), Some(ts)) => Some(current.max(ts)),
-                    (None, Some(ts)) => Some(ts),
-                    (Some(current), None) => Some(current),
-                    (None, None) => None,
-                };
-
-                let (content_str, invocations) = normalize_gemini_message_content(&item, role);
-
-                // Empty text with no readable thoughts or named tools is not a message.
-                if content_str.trim().is_empty() {
-                    continue;
-                }
-
-                messages.push(NormalizedMessage {
-                    idx: 0, // will be re-assigned after filtering
-                    role: role.to_string(),
-                    author: None,
-                    created_at: created,
-                    content: content_str,
-                    extra: item,
-                    invocations,
-                    snippets: Vec::new(),
-                });
-            }
+            let ParsedGeminiSession {
+                session_id,
+                project_hash,
+                started_at,
+                ended_at,
+                mut messages,
+            } = parsed;
 
             // Re-assign sequential indices after filtering
             crate::types::reindex_messages(&mut messages);
@@ -2439,5 +2701,90 @@ mod tests {
         // Session-level timestamps should be set
         assert!(convs[0].started_at.is_some());
         assert!(convs[0].ended_at.is_some());
+    }
+
+    #[test]
+    fn json_stream_handles_bom_whitespace_array_dispatch_and_truncated_mid_array() {
+        use std::io::Cursor;
+
+        // 1. Leading UTF-8 BOM + whitespace around a top-level `{...}` session object.
+        let mut bom_session = Vec::from(b"\xEF\xBB\xBF \t\r\n".as_slice());
+        bom_session.extend_from_slice(
+            br#"{"sessionId":"bom-s1","projectHash":"ph","startTime":"2025-01-15T10:00:00Z","lastUpdated":"2025-01-15T10:05:00Z","messages":[{"type":"user","content":"BOM streamed"},{"type":"model","content":"   "},{"type":"gemini","content":"Reply"}]}"#,
+        );
+        let parsed = parse_json_session_reader(Cursor::new(&bom_session))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.session_id.as_deref(), Some("bom-s1"));
+        assert_eq!(parsed.project_hash.as_deref(), Some("ph"));
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages[0].content, "BOM streamed");
+        assert_eq!(parsed.messages[1].role, "assistant");
+        assert_eq!(parsed.messages[1].content, "Reply");
+
+        // 2. Empty messages array inside `{...}` parses cleanly with 0 messages.
+        let empty_msgs =
+            parse_json_session_reader(Cursor::new(br#"{"sessionId":"empty","messages":[]}"#))
+                .unwrap()
+                .unwrap();
+        assert!(empty_msgs.messages.is_empty());
+
+        // 3. Top-level `[]` and valid `[...]` dispatch returns None without error.
+        assert!(
+            parse_json_session_reader(Cursor::new(b"[]"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_json_session_reader(Cursor::new(br#"[{"type":"user","content":"x"}]"#))
+                .unwrap()
+                .is_none()
+        );
+
+        // 4. Truncated mid-array JSON returns Err (never silently truncating).
+        assert!(
+            parse_json_session_reader(Cursor::new(
+                br#"{"sessionId":"trunc","messages":[{"type":"user","content":"ok"},{"type":"model","content":"cut"#,
+            ))
+            .is_err()
+        );
+        assert!(parse_json_session_reader(Cursor::new(br#"[{"type":"user""#)).is_err());
+
+        // 5. Connector scan with BOM succeeds and truncated mid-array never marks source complete.
+        let dir = TempDir::new().unwrap();
+        let chats_dir = dir.path().join("gemini_hash").join("chats");
+        fs::create_dir_all(&chats_dir).unwrap();
+        fs::write(chats_dir.join("session-bom.json"), &bom_session).unwrap();
+        fs::write(
+            chats_dir.join("session-trunc-mid-array.json"),
+            br#"{"sessionId":"trunc","messages":[{"type":"user","content":"partial"},{"type":"model""#,
+        )
+        .unwrap();
+
+        let connector = GeminiConnector::new();
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+        let mut completed = Vec::new();
+        let mut on_complete = |c: &SourceCompletion| {
+            completed.push(c.source.source_path.clone());
+            Ok(())
+        };
+        let mut emitted = Vec::new();
+        connector
+            .scan_with_source_boundaries(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: None,
+                    on_source_complete: Some(&mut on_complete),
+                },
+                &mut |conv| {
+                    emitted.push(conv);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].external_id.as_deref(), Some("bom-s1"));
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0].ends_with("session-bom.json"));
     }
 }

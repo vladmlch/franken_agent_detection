@@ -418,6 +418,296 @@ pub fn store_is_provably_empty(db_path: &Path) -> bool {
         .is_ok_and(|tables| tables.is_empty())
 }
 
+/// Length of the standard SQLite database file header in bytes.
+const SQLITE_HEADER_PROBE_SIZE: usize = 100;
+
+/// Length of the standard SQLite WAL header in bytes.
+///
+/// A `-wal` file at or below this length holds no transaction frames
+/// (read-only clients commonly create a 0-byte or 32-byte frameless `-wal`).
+const SQLITE_WAL_HEADER_SIZE: usize = 32;
+
+/// Documented SQLite WAL header magic values (little-endian / big-endian
+/// checksum byte order) and format version `3007000`.
+const SQLITE_WAL_MAGIC_LE: u32 = 0x377f_0682;
+const SQLITE_WAL_MAGIC_BE: u32 = 0x377f_0683;
+const SQLITE_WAL_FORMAT_VERSION: u32 = 3_007_000;
+
+/// Default maximum re-verification interval (5 minutes).
+///
+/// Guards against same-second write-checkpoint-truncate cycles that preserve
+/// header markers in [`SqliteContainerHeaderState`].
+pub const SQLITE_CONTAINER_REVERIFY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// Zero-open SQLite + WAL header state for bounded freshness and change
+/// detection without opening a SQLite connection or touching `-shm`.
+///
+/// Captures:
+/// - Main DB file metadata (`db_size`, whole-second `db_mtime_sec`, Unix
+///   `db_ino` without `st_dev` for device-id-free portability) and, when
+///   `db_size >= 100`, the verified 100-byte SQLite header fields
+///   (`change_counter` at bytes `24..28`, `page_count` at `28..32`, and
+///   `schema_cookie` at `40..44`).
+/// - Sibling `-wal` metadata and 32-byte WAL header fields (`wal_size`,
+///   `wal_mtime_sec`, `wal_ckpt_seq` at `12..16`, `wal_salt_1` at `16..20`,
+///   `wal_salt_2` at `20..24`) when `-wal` exists and `wal_size > 32`.
+///   Absent, 0-byte, and 32-byte frameless `-wal` files set `wal_present =
+///   false` and ignore `-wal` mtime.
+/// - Sibling `-shm` is never stated or opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SqliteContainerHeaderState {
+    pub db_size: u64,
+    pub db_mtime_sec: i64,
+    /// Unix inode (`st_ino`), or `0` on non-Unix platforms. Intentionally
+    /// excludes `st_dev` to preserve device-id-free portability across mounts.
+    pub db_ino: u64,
+    /// Whether `db_size >= 100` and the `"SQLite format 3\0"` header magic
+    /// was verified.
+    pub db_header_valid: bool,
+    pub change_counter: u32,
+    pub page_count: u32,
+    pub schema_cookie: u32,
+    /// `true` only when sibling `<db_path>-wal` exists and `wal_size > 32`.
+    pub wal_present: bool,
+    pub wal_size: u64,
+    pub wal_mtime_sec: i64,
+    pub wal_ckpt_seq: u32,
+    pub wal_salt_1: u32,
+    pub wal_salt_2: u32,
+}
+
+impl SqliteContainerHeaderState {
+    /// Returns `true` if any material container marker changed relative to
+    /// `prev`.
+    ///
+    /// When `wal_present == false` in both states (absent, 0-byte, or 32-byte
+    /// frameless `-wal`), all WAL fields are ignored.
+    #[must_use]
+    pub const fn has_material_change_since(&self, prev: &Self) -> bool {
+        if self.db_size != prev.db_size
+            || self.db_mtime_sec != prev.db_mtime_sec
+            || self.db_ino != prev.db_ino
+            || self.db_header_valid != prev.db_header_valid
+            || self.change_counter != prev.change_counter
+            || self.page_count != prev.page_count
+            || self.schema_cookie != prev.schema_cookie
+            || self.wal_present != prev.wal_present
+        {
+            return true;
+        }
+        if self.wal_present {
+            self.wal_size != prev.wal_size
+                || self.wal_mtime_sec != prev.wal_mtime_sec
+                || self.wal_ckpt_seq != prev.wal_ckpt_seq
+                || self.wal_salt_1 != prev.wal_salt_1
+                || self.wal_salt_2 != prev.wal_salt_2
+        } else {
+            false
+        }
+    }
+}
+
+/// Returns `true` when `elapsed` since the last full verification has reached
+/// or exceeded `max_interval` (same-second checkpoint/truncate edge cases).
+#[must_use]
+pub const fn needs_periodic_reverify(
+    elapsed: std::time::Duration,
+    max_interval: std::time::Duration,
+) -> bool {
+    elapsed.as_nanos() >= max_interval.as_nanos()
+}
+
+const fn read_be_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
+}
+
+fn system_time_to_unix_sec(time: SystemTime) -> i64 {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        Err(error) => i64::try_from(error.duration().as_secs())
+            .unwrap_or(i64::MAX)
+            .saturating_neg(),
+    }
+}
+
+#[cfg(unix)]
+fn file_inode(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.ino()
+}
+
+#[cfg(not(unix))]
+const fn file_inode(_meta: &std::fs::Metadata) -> u64 {
+    0
+}
+
+#[derive(Clone, Copy)]
+struct WalHeaderProbe {
+    size: u64,
+    mtime_sec: i64,
+    ckpt_seq: u32,
+    salt_1: u32,
+    salt_2: u32,
+}
+
+fn probe_wal_header(wal_path: &Path) -> std::io::Result<Option<WalHeaderProbe>> {
+    use std::io::Read as _;
+
+    let meta = match std::fs::metadata(wal_path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "SQLite WAL sidecar is not a regular file: {}",
+                wal_path.display()
+            ),
+        ));
+    }
+    if meta.len() <= SQLITE_WAL_HEADER_SIZE as u64 {
+        // Absent, 0-byte, or 32-byte frameless WAL header (created by read-only
+        // clients without any committed frames): treat as absent and ignore mtime.
+        return Ok(None);
+    }
+
+    let mut wal_file = match std::fs::File::open(wal_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let opened_meta = wal_file.metadata()?;
+    if !opened_meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "SQLite WAL sidecar is not a regular file: {}",
+                wal_path.display()
+            ),
+        ));
+    }
+    let wal_size = opened_meta.len();
+    if wal_size <= SQLITE_WAL_HEADER_SIZE as u64 {
+        return Ok(None);
+    }
+    let wal_mtime_sec = system_time_to_unix_sec(opened_meta.modified()?);
+
+    let mut header = [0_u8; SQLITE_WAL_HEADER_SIZE];
+    wal_file.read_exact(&mut header)?;
+    let magic = read_be_u32(&header, 0);
+    if magic != SQLITE_WAL_MAGIC_LE && magic != SQLITE_WAL_MAGIC_BE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid SQLite WAL header magic: {}", wal_path.display()),
+        ));
+    }
+    let version = read_be_u32(&header, 4);
+    // Accept the documented SQLite WAL format version (3007000) as well as 0
+    // for minimal synthetic test headers, while failing closed on unknown
+    // format versions (e.g. 3008000).
+    if version != 0 && version != SQLITE_WAL_FORMAT_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "unsupported SQLite WAL format version {version}: {}",
+                wal_path.display()
+            ),
+        ));
+    }
+
+    Ok(Some(WalHeaderProbe {
+        size: wal_size,
+        mtime_sec: wal_mtime_sec,
+        ckpt_seq: read_be_u32(&header, 12),
+        salt_1: read_be_u32(&header, 16),
+        salt_2: read_be_u32(&header, 20),
+    }))
+}
+
+/// Probe a SQLite container's file metadata and raw DB + WAL headers without
+/// opening a SQLite connection or stating/touching `-shm`.
+///
+/// - Returns `Ok(None)` if `db_path` does not exist (`NotFound`).
+/// - Returns `Ok(Some(state))` for 0-byte/sub-header databases
+///   (`db_header_valid = false`) and valid SQLite databases (`db_size >= 100`
+///   with `"SQLite format 3\0"` magic).
+/// - Ignores sibling `<db_path>-wal` when absent or `wal_size <= 32` (32-byte
+///   frameless WAL header created by read-only clients) and ignores `-wal`
+///   mtime in that case.
+/// - Never stats or opens `<db_path>-shm`.
+pub fn stat_sqlite_container_header(
+    db_path: &Path,
+) -> std::io::Result<Option<SqliteContainerHeaderState>> {
+    use std::io::Read as _;
+
+    let mut file = match std::fs::File::open(db_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("SQLite path is not a regular file: {}", db_path.display()),
+        ));
+    }
+
+    let db_size = meta.len();
+    let db_mtime_sec = system_time_to_unix_sec(meta.modified()?);
+    let db_ino = file_inode(&meta);
+
+    let (db_header_valid, change_counter, page_count, schema_cookie) =
+        if db_size >= SQLITE_HEADER_PROBE_SIZE as u64 {
+            let mut header = [0_u8; SQLITE_HEADER_PROBE_SIZE];
+            file.read_exact(&mut header)?;
+            if header[..16] != SQLITE_HEADER_MAGIC {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "file does not carry SQLite header magic: {}",
+                        db_path.display()
+                    ),
+                ));
+            }
+            (
+                true,
+                read_be_u32(&header, 24),
+                read_be_u32(&header, 28),
+                read_be_u32(&header, 40),
+            )
+        } else {
+            (false, 0, 0, 0)
+        };
+
+    let wal_path = sidecar_path(db_path, "-wal");
+    let wal_probe = probe_wal_header(&wal_path)?;
+
+    Ok(Some(SqliteContainerHeaderState {
+        db_size,
+        db_mtime_sec,
+        db_ino,
+        db_header_valid,
+        change_counter,
+        page_count,
+        schema_cookie,
+        wal_present: wal_probe.is_some(),
+        wal_size: wal_probe.map_or(0, |wal| wal.size),
+        wal_mtime_sec: wal_probe.map_or(0, |wal| wal.mtime_sec),
+        wal_ckpt_seq: wal_probe.map_or(0, |wal| wal.ckpt_seq),
+        wal_salt_1: wal_probe.map_or(0, |wal| wal.salt_1),
+        wal_salt_2: wal_probe.map_or(0, |wal| wal.salt_2),
+    }))
+}
+
 /// Synchronous wrapper over [`frankensqlite::Connection`].
 ///
 /// Exposes the subset of the engine surface the connectors use, with the
@@ -1425,5 +1715,286 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("absent.db");
         assert!(!store_is_provably_empty(&db));
+    }
+
+    // Zero-open SQLite + WAL header state probe tests.
+
+    fn set_whole_sec_mtime(path: &std::path::Path, unix_sec: u64, subsec_nanos: u32) {
+        let time = SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(unix_sec)
+            + std::time::Duration::from_nanos(u64::from(subsec_nanos));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open file to set mtime");
+        file.set_modified(time).expect("set file mtime");
+    }
+
+    fn make_wal_bytes(
+        magic: u32,
+        version: u32,
+        ckpt_seq: u32,
+        salt_1: u32,
+        salt_2: u32,
+        total_len: usize,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0_u8; total_len];
+        bytes[0..4].copy_from_slice(&magic.to_be_bytes());
+        bytes[4..8].copy_from_slice(&version.to_be_bytes());
+        bytes[8..12].copy_from_slice(&4096_u32.to_be_bytes());
+        bytes[12..16].copy_from_slice(&ckpt_seq.to_be_bytes());
+        bytes[16..20].copy_from_slice(&salt_1.to_be_bytes());
+        bytes[20..24].copy_from_slice(&salt_2.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn container_header_probe_returns_none_for_missing_and_state_for_zero_byte_db() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("missing.db");
+        assert_eq!(stat_sqlite_container_header(&missing).unwrap(), None);
+
+        let empty = dir.path().join("empty.db");
+        std::fs::write(&empty, []).unwrap();
+        let first = stat_sqlite_container_header(&empty)
+            .unwrap()
+            .expect("0-byte db should return Some(state)");
+        assert_eq!(first.db_size, 0);
+        assert!(!first.db_header_valid);
+        assert_eq!(first.change_counter, 0);
+        assert_eq!(first.page_count, 0);
+        assert_eq!(first.schema_cookie, 0);
+        assert!(!first.wal_present);
+
+        let second = stat_sqlite_container_header(&empty).unwrap().unwrap();
+        assert!(!second.has_material_change_since(&first));
+    }
+
+    #[test]
+    fn container_header_probe_rejects_non_sqlite_file_at_header_size() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bogus = dir.path().join("bogus.db");
+        std::fs::write(&bogus, vec![b'X'; 128]).unwrap();
+        let err = stat_sqlite_container_header(&bogus).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn container_header_probe_extracts_real_sqlite_header_fields_and_ignores_subsecond_mtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("sessions.db");
+        let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=delete; CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT); INSERT INTO t VALUES (1, 'hi');",
+        )
+        .unwrap();
+        drop(conn);
+
+        set_whole_sec_mtime(&db, 1_700_000_000, 100_000_000);
+        let first = stat_sqlite_container_header(&db)
+            .unwrap()
+            .expect("real sqlite db should probe");
+        assert!(first.db_header_valid);
+        assert!(first.db_size >= 100);
+        assert_eq!(first.db_mtime_sec, 1_700_000_000);
+        #[cfg(unix)]
+        assert_ne!(first.db_ino, 0);
+        assert!(first.change_counter >= 1);
+        assert!(first.page_count >= 1);
+        assert!(first.schema_cookie >= 1);
+        assert!(!first.wal_present);
+
+        // Sub-second mtime drift within the same whole second is ignored.
+        set_whole_sec_mtime(&db, 1_700_000_000, 900_000_000);
+        let same_sec = stat_sqlite_container_header(&db).unwrap().unwrap();
+        assert!(!same_sec.has_material_change_since(&first));
+
+        // Crossing a whole-second boundary registers.
+        set_whole_sec_mtime(&db, 1_700_000_001, 0);
+        let next_sec = stat_sqlite_container_header(&db).unwrap().unwrap();
+        assert!(next_sec.has_material_change_since(&first));
+    }
+
+    #[test]
+    fn container_header_probe_ignores_zero_and_32_byte_frameless_wal_and_all_shm_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=delete; CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let base = stat_sqlite_container_header(&db).unwrap().unwrap();
+        assert!(!base.wal_present);
+
+        // Read-only / checkpointed clients can create a 0-byte `-wal` and `-shm`.
+        let wal = sidecar(&db, "-wal");
+        let shm = sidecar(&db, "-shm");
+        std::fs::write(&wal, []).unwrap();
+        std::fs::write(&shm, vec![0xAA_u8; 32_768]).unwrap();
+        set_whole_sec_mtime(&wal, 1_700_000_100, 0);
+        let with_zero_wal = stat_sqlite_container_header(&db).unwrap().unwrap();
+        assert!(!with_zero_wal.wal_present);
+        assert!(!with_zero_wal.has_material_change_since(&base));
+
+        // A 32-byte frameless `-wal` header + touched mtime + modified `-shm`
+        // must STILL keep wal_present == false and report no material change.
+        let frameless = make_wal_bytes(SQLITE_WAL_MAGIC_LE, SQLITE_WAL_FORMAT_VERSION, 1, 2, 3, 32);
+        std::fs::write(&wal, frameless).unwrap();
+        set_whole_sec_mtime(&wal, 1_700_000_200, 0);
+        std::fs::write(&shm, vec![0xBB_u8; 32_768]).unwrap();
+        let with_frameless_wal = stat_sqlite_container_header(&db).unwrap().unwrap();
+        assert!(!with_frameless_wal.wal_present);
+        assert_eq!(with_frameless_wal.wal_mtime_sec, 0);
+        assert!(!with_frameless_wal.has_material_change_since(&base));
+        assert!(!with_frameless_wal.has_material_change_since(&with_zero_wal));
+    }
+
+    #[test]
+    fn container_header_probe_detects_framed_wal_salt_and_ckpt_seq_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(conn);
+
+        let wal = sidecar(&db, "-wal");
+        let wal_one = make_wal_bytes(
+            SQLITE_WAL_MAGIC_LE,
+            SQLITE_WAL_FORMAT_VERSION,
+            4,
+            100,
+            200,
+            128,
+        );
+        std::fs::write(&wal, wal_one).unwrap();
+        set_whole_sec_mtime(&wal, 1_700_000_300, 0);
+
+        let first = stat_sqlite_container_header(&db).unwrap().unwrap();
+        assert!(first.wal_present);
+        assert_eq!(first.wal_size, 128);
+        assert_eq!(first.wal_mtime_sec, 1_700_000_300);
+        assert_eq!(first.wal_ckpt_seq, 4);
+        assert_eq!(first.wal_salt_1, 100);
+        assert_eq!(first.wal_salt_2, 200);
+
+        // Same size and exact same mtime_sec, but ckpt_seq changed -> detected.
+        let wal_ckpt = make_wal_bytes(
+            SQLITE_WAL_MAGIC_BE,
+            SQLITE_WAL_FORMAT_VERSION,
+            5,
+            100,
+            200,
+            128,
+        );
+        std::fs::write(&wal, wal_ckpt).unwrap();
+        set_whole_sec_mtime(&wal, 1_700_000_300, 0);
+        let second = stat_sqlite_container_header(&db).unwrap().unwrap();
+        assert!(second.has_material_change_since(&first));
+
+        // Same size and exact same mtime_sec, ckpt_seq same as second, salt changed -> detected.
+        let wal_salt = make_wal_bytes(
+            SQLITE_WAL_MAGIC_BE,
+            SQLITE_WAL_FORMAT_VERSION,
+            5,
+            101,
+            200,
+            128,
+        );
+        std::fs::write(&wal, wal_salt).unwrap();
+        set_whole_sec_mtime(&wal, 1_700_000_300, 0);
+        let third = stat_sqlite_container_header(&db).unwrap().unwrap();
+        assert!(third.has_material_change_since(&second));
+
+        // Invalid WAL magic fails closed.
+        let bad_magic = make_wal_bytes(0xdead_beef, SQLITE_WAL_FORMAT_VERSION, 5, 101, 200, 128);
+        std::fs::write(&wal, bad_magic).unwrap();
+        assert_eq!(
+            stat_sqlite_container_header(&db).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        // Unknown WAL version fails closed.
+        let bad_version = make_wal_bytes(SQLITE_WAL_MAGIC_LE, 3_008_000, 5, 101, 200, 128);
+        std::fs::write(&wal, bad_version).unwrap();
+        assert_eq!(
+            stat_sqlite_container_header(&db).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn container_header_probe_detects_change_counter_increment_with_identical_size_and_mtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=delete; CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        set_whole_sec_mtime(&db, 1_700_000_400, 0);
+        let before = stat_sqlite_container_header(&db).unwrap().unwrap();
+
+        // Update a row in-place (page count and file size stay equal) and force
+        // the exact same mtime_sec; change_counter still detects the write.
+        let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute("PRAGMA journal_mode=delete;").unwrap();
+        conn.execute("UPDATE t SET v = 2;").unwrap();
+        drop(conn);
+        set_whole_sec_mtime(&db, 1_700_000_400, 0);
+
+        let after = stat_sqlite_container_header(&db).unwrap().unwrap();
+        assert_eq!(after.db_size, before.db_size);
+        assert_eq!(after.db_mtime_sec, before.db_mtime_sec);
+        assert_ne!(after.change_counter, before.change_counter);
+        assert!(after.has_material_change_since(&before));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_header_probe_detects_inode_replacement_with_identical_bytes_and_mtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(conn);
+
+        set_whole_sec_mtime(&db, 1_700_000_500, 0);
+        let before = stat_sqlite_container_header(&db).unwrap().unwrap();
+
+        let bytes = std::fs::read(&db).unwrap();
+        let replacement = dir.path().join("store.db.tmp");
+        std::fs::write(&replacement, bytes).unwrap();
+        std::fs::rename(&replacement, &db).unwrap();
+        set_whole_sec_mtime(&db, 1_700_000_500, 0);
+
+        let after = stat_sqlite_container_header(&db).unwrap().unwrap();
+        assert_ne!(after.db_ino, before.db_ino);
+        assert_eq!(after.db_size, before.db_size);
+        assert_eq!(after.db_mtime_sec, before.db_mtime_sec);
+        assert_eq!(after.change_counter, before.change_counter);
+        assert!(after.has_material_change_since(&before));
+    }
+
+    #[test]
+    fn periodic_reverify_respects_interval_boundary() {
+        use std::time::Duration;
+
+        let max_interval = SQLITE_CONTAINER_REVERIFY_INTERVAL;
+        assert!(!needs_periodic_reverify(
+            max_interval.checked_sub(Duration::from_nanos(1)).unwrap(),
+            max_interval
+        ));
+        assert!(needs_periodic_reverify(max_interval, max_interval));
+        assert!(needs_periodic_reverify(
+            max_interval.checked_add(Duration::from_secs(1)).unwrap(),
+            max_interval
+        ));
     }
 }

@@ -83,6 +83,101 @@ impl ScanFailures {
             ))
         }
     }
+
+    /// Verify that a symlink at `path` resolves to an accessible target via
+    /// `std::fs::metadata`.
+    ///
+    /// Returns `true` when `metadata(path)` succeeds. Returns `false` and
+    /// records a failure in `self` when resolving the target fails (e.g.,
+    /// `NotFound` for a dangling symlink or `PermissionDenied` for an
+    /// unreadable target).
+    #[allow(dead_code)]
+    pub fn verify_symlink_target(&mut self, path: &Path) -> bool {
+        match std::fs::metadata(path) {
+            Ok(_) => true,
+            Err(error) => {
+                let reason = match error.kind() {
+                    std::io::ErrorKind::NotFound => "dangling symlink",
+                    std::io::ErrorKind::PermissionDenied => "unreadable symlink target",
+                    _ => "broken symlink target",
+                };
+                self.record(path, &anyhow!("{reason}: {error}"));
+                false
+            }
+        }
+    }
+
+    /// Inspect a single [`walkdir::WalkDir`] iterator item, returning
+    /// `Some(entry)` when healthy or recording a scan failure and returning
+    /// `None` when the walk hit an I/O error or encountered a broken/dangling
+    /// or unreadable symlink.
+    ///
+    /// Replaces `WalkDir::into_iter().flatten()`, which silently drops walk
+    /// errors and leaves unfollowed broken symlink subtrees unreported as zero
+    /// sessions.
+    #[allow(dead_code)]
+    pub fn walk_dir_entry_or_record_failure(
+        &mut self,
+        item: std::result::Result<walkdir::DirEntry, walkdir::Error>,
+        fallback_path: &Path,
+    ) -> Option<walkdir::DirEntry> {
+        match item {
+            Ok(entry) => {
+                if entry.path_is_symlink() && !self.verify_symlink_target(entry.path()) {
+                    return None;
+                }
+                Some(entry)
+            }
+            Err(error) => {
+                let path = error
+                    .path()
+                    .map_or_else(|| fallback_path.to_path_buf(), Path::to_path_buf);
+                self.record(&path, &anyhow::Error::new(error));
+                None
+            }
+        }
+    }
+
+    /// Check whether a direct candidate path is a regular file, recording a
+    /// scan failure when `path` is a dangling symlink (`metadata` fails with
+    /// `NotFound` while `symlink_metadata` succeeds) or fails to stat for any
+    /// reason other than plain absence.
+    #[allow(dead_code)]
+    pub fn check_candidate_file_or_record_failure(&mut self, path: &Path) -> bool {
+        match std::fs::metadata(path) {
+            Ok(meta) => meta.is_file(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(path) {
+                    Ok(_) => {
+                        self.record(path, &anyhow!("dangling symlink: {error}"));
+                    }
+                    Err(lstat_error) if lstat_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(lstat_error) => {
+                        self.record(
+                            path,
+                            &anyhow!("failed to inspect symlink metadata: {lstat_error}"),
+                        );
+                    }
+                }
+                false
+            }
+            Err(error) => {
+                self.record(path, &anyhow!("failed to stat candidate path: {error}"));
+                false
+            }
+        }
+    }
+}
+
+/// Free-function helper delegating to
+/// [`ScanFailures::walk_dir_entry_or_record_failure`].
+#[allow(dead_code)]
+pub fn walk_dir_entry_or_record_failure(
+    failures: &mut ScanFailures,
+    item: std::result::Result<walkdir::DirEntry, walkdir::Error>,
+    fallback_path: &Path,
+) -> Option<walkdir::DirEntry> {
+    failures.walk_dir_entry_or_record_failure(item, fallback_path)
 }
 
 /// Read every candidate database, keep the healthy results, and return
@@ -270,5 +365,132 @@ mod tests {
         })
         .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_during_walk_is_recorded_as_scan_failure() {
+        use std::os::unix::fs::symlink;
+        use walkdir::WalkDir;
+
+        let dir = TempDir::new().unwrap();
+        let healthy = dir.path().join("healthy.jsonl");
+        std::fs::write(&healthy, b"{}\n").unwrap();
+
+        let broken_dir = dir.path().join("broken_subtree");
+        symlink(dir.path().join("does_not_exist"), &broken_dir).unwrap();
+
+        // Both follow_links(false) and follow_links(true) must record the
+        // broken subtree rather than silently swallowing it.
+        for follow in [false, true] {
+            let mut failures = ScanFailures::new("TestConnector");
+            let mut visited = Vec::new();
+            for item in WalkDir::new(dir.path()).follow_links(follow) {
+                if let Some(entry) =
+                    walk_dir_entry_or_record_failure(&mut failures, item, dir.path())
+                    && entry.file_type().is_file()
+                {
+                    visited.push(entry.path().to_path_buf());
+                }
+            }
+            assert_eq!(visited, vec![healthy.clone()]);
+            let err = failures.finish().unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("broken_subtree"),
+                "follow={follow}: expected broken_subtree in failure: {rendered}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_and_symlink_target_are_recorded_as_scan_failures() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use walkdir::WalkDir;
+
+        struct RestorePermissions<'a>(&'a std::path::Path);
+        impl Drop for RestorePermissions<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let healthy = dir.path().join("ok.jsonl");
+        std::fs::write(&healthy, b"{}\n").unwrap();
+
+        let locked = dir.path().join("locked_dir");
+        std::fs::create_dir(&locked).unwrap();
+        let inner_target = locked.join("secret");
+        std::fs::create_dir(&inner_target).unwrap();
+        let link_into_locked = dir.path().join("link_into_locked");
+        symlink(&inner_target, &link_into_locked).unwrap();
+
+        // Also include a healthy symlink that must not trigger a failure.
+        let healthy_dir = dir.path().join("real_dir");
+        std::fs::create_dir(&healthy_dir).unwrap();
+        let healthy_link = dir.path().join("healthy_link");
+        symlink(&healthy_dir, &healthy_link).unwrap();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = RestorePermissions(&locked);
+
+        // Only run permission assertions if the current user cannot bypass 0o000.
+        if std::fs::read_dir(&locked).is_err() {
+            let mut failures = ScanFailures::new("TestConnector");
+            let mut visited = Vec::new();
+            for item in WalkDir::new(dir.path()) {
+                if let Some(entry) = failures.walk_dir_entry_or_record_failure(item, dir.path())
+                    && entry.file_type().is_file()
+                {
+                    visited.push(entry.path().to_path_buf());
+                }
+            }
+            assert_eq!(visited, vec![healthy]);
+            let err = failures.finish().unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("locked_dir"),
+                "expected locked_dir in failure: {rendered}"
+            );
+            assert!(
+                rendered.contains("link_into_locked"),
+                "expected link_into_locked in failure: {rendered}"
+            );
+            assert!(
+                !rendered.contains("healthy_link"),
+                "healthy_link must not be reported as failed: {rendered}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_candidate_file_distinguishes_absent_from_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("absent.db");
+        let regular = dir.path().join("present.db");
+        std::fs::write(&regular, b"x").unwrap();
+        let dangling = dir.path().join("dangling.db");
+        symlink(dir.path().join("missing_target.db"), &dangling).unwrap();
+
+        let mut failures = ScanFailures::new("OpenCode");
+        assert!(!failures.check_candidate_file_or_record_failure(&missing));
+        assert!(failures.check_candidate_file_or_record_failure(&regular));
+        assert!(
+            ScanFailures::new("OpenCode").finish().is_ok(),
+            "sanity check"
+        );
+        // Before probing dangling, failures must still be empty.
+        assert!(!failures.check_candidate_file_or_record_failure(&dangling));
+        let err = failures.finish().unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("dangling.db"),
+            "dangling symlink candidate must be recorded: {rendered}"
+        );
     }
 }

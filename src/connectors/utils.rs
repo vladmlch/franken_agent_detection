@@ -179,12 +179,122 @@ pub(crate) fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
     capped::read_capped(path)
 }
 
+/// Verify that an already-opened [`std::fs::File`] descriptor refers to a
+/// regular file, rejecting directories, FIFOs, sockets, and device nodes.
+pub(crate) fn ensure_regular_file_fd(file: &std::fs::File) -> std::io::Result<()> {
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+const fn unix_o_nofollow() -> Option<i32> {
+    if cfg!(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    )) {
+        Some(0x0100)
+    } else if cfg!(all(
+        target_os = "linux",
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "s390x",
+        )
+    )) {
+        Some(0o40_0000)
+    } else if cfg!(all(
+        target_os = "linux",
+        any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "m68k",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+        )
+    )) {
+        Some(0o10_0000)
+    } else {
+        None
+    }
+}
+
+/// Open `path` for reading without following a symlink at the final path
+/// component, and verify the opened descriptor is a regular file.
+///
+/// Rejects symlinks (via `O_NOFOLLOW` on supported Unix targets, closing the
+/// open-time TOCTOU window) as well as directories, FIFOs, sockets, and device
+/// nodes. Pre-checking `symlink_metadata` avoids blocking on a FIFO or
+/// triggering device-open side effects before the kernel opens the path.
+pub(crate) fn open_regular_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let link_meta = std::fs::symlink_metadata(path)?;
+    let link_type = link_meta.file_type();
+    #[cfg(unix)]
+    let has_o_nofollow = unix_o_nofollow().is_some();
+    #[cfg(not(unix))]
+    let has_o_nofollow = false;
+
+    if link_type.is_symlink() {
+        if !has_o_nofollow {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing symlink",
+            ));
+        }
+    } else if !link_type.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        if let Some(o_nofollow) = unix_o_nofollow() {
+            opts.custom_flags(o_nofollow);
+        }
+        opts.open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+
+    ensure_regular_file_fd(&file)?;
+    #[cfg(unix)]
+    if !has_o_nofollow {
+        use std::os::unix::fs::MetadataExt;
+        let fd_meta = file.metadata()?;
+        if fd_meta.dev() != link_meta.dev() || fd_meta.ino() != link_meta.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path changed during open",
+            ));
+        }
+    }
+    Ok(file)
+}
+
 /// Open a session-store file for line-oriented streaming if its size is within
 /// [`MAX_SCAN_FILE_BYTES`]. Returns `Ok(None)` when the file exceeds the cap.
 pub(crate) fn open_capped_reader(
     path: &Path,
 ) -> std::io::Result<Option<std::io::BufReader<std::fs::File>>> {
-    let file = std::fs::File::open(path)?;
+    let file = open_regular_no_follow(path)?;
     if file
         .metadata()
         .is_ok_and(|metadata| metadata.len() > MAX_SCAN_FILE_BYTES)
@@ -196,18 +306,27 @@ pub(crate) fn open_capped_reader(
 
 /// True when a user message is harness-injected context rather than a
 /// human-authored prompt (`# AGENTS.md instructions …`,
-/// `<environment_context>`, `<session_context>`, `<user_instructions>`).
+/// `<environment_context>`, `<session_context>`, `<user_instructions>`,
+/// `<recommended_plugins>`, `<INSTRUCTIONS>`, `<skill>`, `<turn_aborted>`,
+/// `<subagent_notification>`, `<goal_context>`, `<codex_internal_context`).
 ///
 /// Used for TITLE selection only: the records stay in the timeline, but
 /// letting them seed a conversation title yields boilerplate for a large
 /// share of real sessions (3/12 recently-modified codex sessions sampled).
 #[must_use]
 pub(crate) fn is_injected_context_message(content: &str) -> bool {
-    const PREFIXES: [&str; 4] = [
+    const PREFIXES: [&str; 11] = [
         "# AGENTS.md instructions",
         "<environment_context>",
         "<session_context>",
         "<user_instructions>",
+        "<recommended_plugins>",
+        "<INSTRUCTIONS>",
+        "<skill>",
+        "<turn_aborted>",
+        "<subagent_notification>",
+        "<goal_context>",
+        "<codex_internal_context",
     ];
     let trimmed = content.trim_start();
     PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix))
@@ -720,15 +839,152 @@ mod tests {
         ));
         assert!(is_injected_context_message("<session_context>\n…"));
         assert!(is_injected_context_message("  <user_instructions>…"));
+        assert!(is_injected_context_message(
+            "<recommended_plugins>\nfoo\n</recommended_plugins>"
+        ));
+        assert!(is_injected_context_message(
+            "\n  <INSTRUCTIONS>\nFollow rules\n</INSTRUCTIONS>"
+        ));
+        assert!(is_injected_context_message(
+            "  <skill><name>demo</name></skill>"
+        ));
+        assert!(is_injected_context_message(
+            "<turn_aborted>User interrupted</turn_aborted>"
+        ));
+        assert!(is_injected_context_message(
+            "\t<subagent_notification>done</subagent_notification>"
+        ));
+        assert!(is_injected_context_message(
+            "<goal_context>Keep working</goal_context>"
+        ));
+        assert!(is_injected_context_message(
+            "<codex_internal_context source=\"goal\">Continue</codex_internal_context>"
+        ));
+        assert!(is_injected_context_message(
+            "<codex_internal_context>Continue</codex_internal_context>"
+        ));
     }
 
     #[test]
     fn is_injected_context_message_allows_real_prompts() {
         assert!(!is_injected_context_message("Fix the flaky test in it.rs"));
+        assert!(!is_injected_context_message(""));
+        assert!(!is_injected_context_message("   \n\t  "));
         // Wrapper text appearing mid-message is not an injection header.
+        for snippet in [
+            "<session_context>",
+            "<recommended_plugins>",
+            "<INSTRUCTIONS>",
+            "<skill>",
+            "<turn_aborted>",
+            "<subagent_notification>",
+            "<goal_context>",
+            "<codex_internal_context source=\"goal\">",
+        ] {
+            let prompt = format!("please inspect the {snippet} block");
+            assert!(
+                !is_injected_context_message(&prompt),
+                "mid-sentence {snippet} must not be flagged"
+            );
+        }
+        // Case-exact matching per agentsview: lowercase/mismatched-case tags are user text.
         assert!(!is_injected_context_message(
-            "please read the <session_context> block"
+            "<instructions>hello</instructions>"
         ));
+        assert!(!is_injected_context_message("<Skill>hello</Skill>"));
+        assert!(!is_injected_context_message("<RECOMMENDED_PLUGINS>"));
+    }
+
+    #[test]
+    fn open_regular_no_follow_accepts_regular_file_and_rejects_non_regular() {
+        use std::io::Read;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("session.jsonl");
+        std::fs::write(&file_path, "{\"ok\":true}\n").unwrap();
+
+        let mut file = open_regular_no_follow(&file_path).unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "{\"ok\":true}\n");
+
+        let dir_err = open_regular_no_follow(dir.path()).unwrap_err();
+        assert_eq!(dir_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let missing_err = open_regular_no_follow(&dir.path().join("missing.jsonl")).unwrap_err();
+        assert_eq!(missing_err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_no_follow_rejects_symlinks_but_allows_symlinked_ancestors() {
+        use std::io::Read;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let target = real_dir.join("session.jsonl");
+        std::fs::write(&target, "payload").unwrap();
+
+        let leaf_link = dir.path().join("leaf-link.jsonl");
+        symlink(&target, &leaf_link).unwrap();
+        assert!(open_regular_no_follow(&leaf_link).is_err());
+
+        let dangling = dir.path().join("dangling.jsonl");
+        symlink(dir.path().join("does-not-exist"), &dangling).unwrap();
+        assert!(open_regular_no_follow(&dangling).is_err());
+
+        let ancestor_link = dir.path().join("dir-link");
+        symlink(&real_dir, &ancestor_link).unwrap();
+        let mut via_ancestor =
+            open_regular_no_follow(&ancestor_link.join("session.jsonl")).unwrap();
+        let mut text = String::new();
+        via_ancestor.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "payload");
+    }
+
+    #[test]
+    fn ensure_regular_file_fd_accepts_file_and_rejects_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("regular.txt");
+        std::fs::write(&file_path, "data").unwrap();
+        let file = std::fs::File::open(&file_path).unwrap();
+        ensure_regular_file_fd(&file).unwrap();
+
+        if let Ok(dir_fd) = std::fs::File::open(dir.path()) {
+            let err = ensure_regular_file_fd(&dir_fd).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn open_capped_reader_reads_regular_file_and_enforces_cap_and_guard() {
+        use std::io::BufRead;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let small = dir.path().join("small.jsonl");
+        std::fs::write(&small, "line1\nline2\n").unwrap();
+        let mut reader = open_capped_reader(&small).unwrap().unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        assert_eq!(first, "line1\n");
+
+        let big = dir.path().join("big.jsonl");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(MAX_SCAN_FILE_BYTES + 1).unwrap();
+        drop(file);
+        assert!(open_capped_reader(&big).unwrap().is_none());
+
+        let dir_err = open_capped_reader(dir.path()).unwrap_err();
+        assert_eq!(dir_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.jsonl");
+            std::os::unix::fs::symlink(&small, &link).unwrap();
+            assert!(open_capped_reader(&link).is_err());
+        }
     }
 
     #[test]

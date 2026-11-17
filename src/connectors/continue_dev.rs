@@ -12,9 +12,11 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::de::{SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
+
+use super::json_stream::{JsonContainerKind, SeqStreamSeed, peek_json_container};
 
 use super::token_extraction::{ExtractedTokenUsage, TokenDataSource, normalize_model};
 use super::utils::{
@@ -241,15 +243,48 @@ impl Connector for ContinueConnector {
 // prompt/completion logs, tool definitions, parsedArgs and binary attachments
 // directly in the reader. None of those become a second retained transcript.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SavedSession {
+#[serde(field_identifier, rename_all = "camelCase")]
+enum SavedSessionField {
+    SessionId,
+    Title,
+    WorkspaceDirectory,
+    History,
+    Mode,
+    ChatModelTitle,
+    Usage,
+    Version,
+    #[serde(other)]
+    Ignore,
+}
+
+struct ReadUsageSeed;
+
+impl<'de> DeserializeSeed<'de> for ReadUsageSeed {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        read_usage(deserializer)
+    }
+}
+
+struct StreamedHistoryEntry {
+    primary: Option<NormalizedMessage>,
+    primary_requires_tool_results: bool,
+    tool_results: Vec<(Option<String>, Option<String>, String)>,
+    history_index: usize,
+}
+
+struct StreamedSession {
     session_id: String,
     title: String,
     workspace_directory: String,
-    history: Vec<HistoryItem>,
+    entries: Vec<StreamedHistoryEntry>,
+    native_results: HashSet<String>,
     mode: Option<String>,
     chat_model_title: Option<String>,
-    #[serde(default, deserialize_with = "read_usage")]
     usage: Value,
     version: Option<Value>,
 }
@@ -544,9 +579,289 @@ fn add_invocation(
 }
 
 #[allow(clippy::too_many_lines)]
+fn convert_history_item(
+    history_index: usize,
+    item: HistoryItem,
+    native_results: &mut HashSet<String>,
+) -> Result<Option<StreamedHistoryEntry>> {
+    let message = item.message;
+    // IDE stores explicit tool rows as well as toolCallStates.output. CLI
+    // stores only the latter. Prefer each actual tool row when both exist.
+    if message.role == "tool"
+        && let Some(id) = message.tool_call_id.as_ref().filter(|id| !id.is_empty())
+    {
+        native_results.insert(id.clone());
+    }
+    let role = match message.role.as_str() {
+        "assistant" | "thinking" => "assistant",
+        "user" => "user",
+        "system" => "system",
+        "tool" => "tool",
+        _ => return Ok(None),
+    };
+    let mut content = String::new();
+    if let Some(reasoning) = item.reasoning.filter(|_| role == "assistant")
+        && !reasoning.text.trim().is_empty()
+    {
+        append_text(&mut content, &format!("[Thinking] {}", reasoning.text));
+    }
+    if message.role == "thinking" && !message.content.0.trim().is_empty() {
+        append_text(&mut content, &format!("[Thinking] {}", message.content.0));
+    } else {
+        append_text(&mut content, &message.content.0);
+    }
+    let mut invocations = Vec::new();
+    let mut seen_calls = HashSet::new();
+    let has_native_calls = !message.tool_calls.is_empty();
+    if role == "assistant" {
+        for call in message.tool_calls {
+            add_invocation(call, &mut seen_calls, &mut content, &mut invocations);
+        }
+    }
+    let mut tool_results = Vec::new();
+    let mut statuses = Vec::new();
+    if role == "assistant" {
+        for mut state in item.tool_call_states {
+            let id = state
+                .tool_call_id
+                .take()
+                .filter(|id| !id.is_empty())
+                .or_else(|| state.tool_call.id.clone().filter(|id| !id.is_empty()));
+            state.tool_call.id.clone_from(&id);
+            if id.is_some() || !has_native_calls {
+                add_invocation(
+                    state.tool_call,
+                    &mut seen_calls,
+                    &mut content,
+                    &mut invocations,
+                );
+            }
+            if let Some(status) = &state.status {
+                statuses.push(json!({"id": id, "status": status}));
+            }
+            let mut output = String::new();
+            for part in state.output {
+                append_text(&mut output, &part.content);
+            }
+            if !output.trim().is_empty() {
+                tool_results.push((id, state.status, output));
+            }
+        }
+    }
+    unwrap_skill_invocations(&mut invocations);
+    let mut models = Vec::new();
+    for model in item.prompt_logs {
+        if !models.contains(&model) {
+            models.push(model);
+        }
+    }
+    let mut cass = json!({"source_format": "continue_session", "history_index": history_index});
+    if !invocations.is_empty() {
+        cass["tool_call_count"] = json!(invocations.len());
+    }
+    if !statuses.is_empty() {
+        cass["tool_states"] = json!(statuses);
+    }
+    if !models.is_empty() {
+        cass["prompt_models"] = json!(models);
+    }
+    let mut saved_message = json!({"role": message.role});
+    if let Some(id) = message.id {
+        saved_message["id"] = json!(id);
+    }
+    if let Some(id) = message.tool_call_id {
+        saved_message["toolCallId"] = json!(id);
+    }
+    if !message.usage.is_null() {
+        saved_message["usage"] = message.usage;
+    }
+    if message.metadata.responses_output_item_id.is_some()
+        || !message.metadata.responses_output_item_ids.is_empty()
+    {
+        saved_message["metadata"] = serde_json::to_value(message.metadata)?;
+    }
+    let has_primary_body = !content.trim().is_empty() || saved_message.get("usage").is_some();
+    if !has_primary_body && tool_results.is_empty() {
+        return Ok(None);
+    }
+    let primary = NormalizedMessage {
+        idx: 0,
+        role: role.into(),
+        author: None,
+        // The native snapshot does not persist per-message timestamps. The
+        // shared sessions.json index is not a message-time source or a log.
+        created_at: None,
+        content,
+        extra: json!({"message": saved_message, "cass": cass}),
+        snippets: Vec::new(),
+        invocations,
+    };
+    Ok(Some(StreamedHistoryEntry {
+        primary: Some(primary),
+        primary_requires_tool_results: !has_primary_body,
+        tool_results,
+        history_index,
+    }))
+}
+
+struct SavedSessionSeed<'a> {
+    callback_error: &'a mut Option<anyhow::Error>,
+}
+
+impl<'de> DeserializeSeed<'de> for SavedSessionSeed<'_> {
+    type Value = StreamedSession;
+
+    #[allow(clippy::too_many_lines)]
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SessionVisitor<'a> {
+            callback_error: &'a mut Option<anyhow::Error>,
+        }
+
+        impl<'de> Visitor<'de> for SessionVisitor<'_> {
+            type Value = StreamedSession;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("struct SavedSession")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut session_id: Option<String> = None;
+                let mut title: Option<String> = None;
+                let mut workspace_directory: Option<String> = None;
+                let mut saw_history = false;
+                let mut mode: Option<Option<String>> = None;
+                let mut chat_model_title: Option<Option<String>> = None;
+                let mut usage: Option<Value> = None;
+                let mut version: Option<Option<Value>> = None;
+                let mut entries = Vec::new();
+                let mut native_results = HashSet::new();
+
+                while let Some(key) = map.next_key::<SavedSessionField>()? {
+                    match key {
+                        SavedSessionField::SessionId => {
+                            if session_id.is_some() {
+                                return Err(serde::de::Error::duplicate_field("sessionId"));
+                            }
+                            session_id = Some(map.next_value()?);
+                        }
+                        SavedSessionField::Title => {
+                            if title.is_some() {
+                                return Err(serde::de::Error::duplicate_field("title"));
+                            }
+                            title = Some(map.next_value()?);
+                        }
+                        SavedSessionField::WorkspaceDirectory => {
+                            if workspace_directory.is_some() {
+                                return Err(serde::de::Error::duplicate_field(
+                                    "workspaceDirectory",
+                                ));
+                            }
+                            workspace_directory = Some(map.next_value()?);
+                        }
+                        SavedSessionField::History => {
+                            if saw_history {
+                                return Err(serde::de::Error::duplicate_field("history"));
+                            }
+                            saw_history = true;
+                            let mut history_index = 0usize;
+                            let mut on_item = |item: HistoryItem| -> Result<()> {
+                                let idx = history_index;
+                                history_index += 1;
+                                if let Some(entry) =
+                                    convert_history_item(idx, item, &mut native_results)?
+                                {
+                                    entries.push(entry);
+                                }
+                                Ok(())
+                            };
+                            map.next_value_seed(SeqStreamSeed::<HistoryItem, _>::new(
+                                &mut on_item,
+                                self.callback_error,
+                            ))?;
+                        }
+                        SavedSessionField::Mode => {
+                            if mode.is_some() {
+                                return Err(serde::de::Error::duplicate_field("mode"));
+                            }
+                            mode = Some(map.next_value()?);
+                        }
+                        SavedSessionField::ChatModelTitle => {
+                            if chat_model_title.is_some() {
+                                return Err(serde::de::Error::duplicate_field("chatModelTitle"));
+                            }
+                            chat_model_title = Some(map.next_value()?);
+                        }
+                        SavedSessionField::Usage => {
+                            if usage.is_some() {
+                                return Err(serde::de::Error::duplicate_field("usage"));
+                            }
+                            usage = Some(map.next_value_seed(ReadUsageSeed)?);
+                        }
+                        SavedSessionField::Version => {
+                            if version.is_some() {
+                                return Err(serde::de::Error::duplicate_field("version"));
+                            }
+                            version = Some(map.next_value()?);
+                        }
+                        SavedSessionField::Ignore => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                let session_id =
+                    session_id.ok_or_else(|| serde::de::Error::missing_field("sessionId"))?;
+                let title = title.ok_or_else(|| serde::de::Error::missing_field("title"))?;
+                let workspace_directory = workspace_directory
+                    .ok_or_else(|| serde::de::Error::missing_field("workspaceDirectory"))?;
+                if !saw_history {
+                    return Err(serde::de::Error::missing_field("history"));
+                }
+
+                Ok(StreamedSession {
+                    session_id,
+                    title,
+                    workspace_directory,
+                    entries,
+                    native_results,
+                    mode: mode.flatten(),
+                    chat_model_title: chat_model_title.flatten(),
+                    usage: usage.unwrap_or(Value::Null),
+                    version: version.flatten(),
+                })
+            }
+        }
+
+        deserializer.deserialize_map(SessionVisitor {
+            callback_error: self.callback_error,
+        })
+    }
+}
+
 fn parse_session_reader(path: &Path, reader: impl Read) -> Result<Option<NormalizedConversation>> {
-    let session: SavedSession =
-        serde_json::from_reader(reader).context("read Continue snapshot")?;
+    let (kind, stream_reader) =
+        peek_json_container(BufReader::new(reader)).context("read Continue snapshot")?;
+    if kind != JsonContainerKind::Object {
+        bail!("read Continue snapshot: expected JSON object");
+    }
+    let mut deserializer = serde_json::Deserializer::from_reader(stream_reader);
+    let mut callback_error = None;
+    let session_result = SavedSessionSeed {
+        callback_error: &mut callback_error,
+    }
+    .deserialize(&mut deserializer);
+    if let Some(err) = callback_error {
+        return Err(err);
+    }
+    let session = session_result.context("read Continue snapshot")?;
+    deserializer.end().context("read Continue snapshot")?;
+
     if session.version.is_some() {
         bail!("unsupported versioned Continue snapshot");
     }
@@ -555,131 +870,36 @@ fn parse_session_reader(path: &Path, reader: impl Read) -> Result<Option<Normali
     {
         bail!("Continue session identity does not match its file");
     }
-    // IDE stores explicit tool rows as well as toolCallStates.output. CLI
-    // stores only the latter. Prefer each actual tool row when both exist.
-    let native_results: HashSet<_> = session
-        .history
-        .iter()
-        .filter(|item| item.message.role == "tool")
-        .filter_map(|item| item.message.tool_call_id.as_ref())
-        .filter(|id| !id.is_empty())
-        .cloned()
-        .collect();
+
     let mut messages = Vec::new();
-    for (history_index, item) in session.history.into_iter().enumerate() {
-        let message = item.message;
-        let role = match message.role.as_str() {
-            "assistant" | "thinking" => "assistant",
-            "user" => "user",
-            "system" => "system",
-            "tool" => "tool",
-            _ => continue,
-        };
-        let mut content = String::new();
-        if let Some(reasoning) = item.reasoning.filter(|_| role == "assistant") {
-            if !reasoning.text.trim().is_empty() {
-                append_text(&mut content, &format!("[Thinking] {}", reasoning.text));
-            }
-        }
-        if message.role == "thinking" && !message.content.0.trim().is_empty() {
-            append_text(&mut content, &format!("[Thinking] {}", message.content.0));
-        } else {
-            append_text(&mut content, &message.content.0);
-        }
-        let mut invocations = Vec::new();
-        let mut seen_calls = HashSet::new();
-        let has_native_calls = !message.tool_calls.is_empty();
-        if role == "assistant" {
-            for call in message.tool_calls {
-                add_invocation(call, &mut seen_calls, &mut content, &mut invocations);
-            }
-        }
-        let mut tool_results = Vec::new();
-        let mut statuses = Vec::new();
-        if role == "assistant" {
-            for mut state in item.tool_call_states {
-                let id = state
-                    .tool_call_id
-                    .take()
-                    .filter(|id| !id.is_empty())
-                    .or_else(|| state.tool_call.id.clone().filter(|id| !id.is_empty()));
-                state.tool_call.id.clone_from(&id);
-                if id.is_some() || !has_native_calls {
-                    add_invocation(
-                        state.tool_call,
-                        &mut seen_calls,
-                        &mut content,
-                        &mut invocations,
-                    );
-                }
-                if let Some(status) = &state.status {
-                    statuses.push(json!({"id": id, "status": status}));
-                }
-                if id.as_ref().is_some_and(|id| native_results.contains(id)) {
-                    continue;
-                }
-                let mut output = String::new();
-                for part in state.output {
-                    append_text(&mut output, &part.content);
-                }
-                if !output.trim().is_empty() {
-                    tool_results.push((id, state.status, output));
-                }
-            }
-        }
-        unwrap_skill_invocations(&mut invocations);
-        let mut models = Vec::new();
-        for model in item.prompt_logs {
-            if !models.contains(&model) {
-                models.push(model);
-            }
-        }
-        let mut cass = json!({"source_format": "continue_session", "history_index": history_index});
-        if !invocations.is_empty() {
-            cass["tool_call_count"] = json!(invocations.len());
-        }
-        if !statuses.is_empty() {
-            cass["tool_states"] = json!(statuses);
-        }
-        if !models.is_empty() {
-            cass["prompt_models"] = json!(models);
-        }
-        let mut saved_message = json!({"role": message.role});
-        if let Some(id) = message.id {
-            saved_message["id"] = json!(id);
-        }
-        if let Some(id) = message.tool_call_id {
-            saved_message["toolCallId"] = json!(id);
-        }
-        if !message.usage.is_null() {
-            saved_message["usage"] = message.usage;
-        }
-        if message.metadata.responses_output_item_id.is_some()
-            || !message.metadata.responses_output_item_ids.is_empty()
+    for entry in session.entries {
+        let surviving_results: Vec<_> = entry
+            .tool_results
+            .into_iter()
+            .filter(|(id, _, _)| {
+                !id.as_ref()
+                    .is_some_and(|id| session.native_results.contains(id))
+            })
+            .collect();
+        if let Some(mut primary) = entry.primary
+            && (!entry.primary_requires_tool_results || !surviving_results.is_empty())
         {
-            saved_message["metadata"] = serde_json::to_value(message.metadata)?;
+            primary.idx = i64::try_from(messages.len()).unwrap_or(i64::MAX);
+            messages.push(primary);
         }
-        if !content.trim().is_empty()
-            || saved_message.get("usage").is_some()
-            || !tool_results.is_empty()
-        {
-            push_message(
-                &mut messages,
-                role,
-                content,
-                json!({"message": saved_message, "cass": cass}),
-                invocations,
-            );
-        }
-        for (id, status, output) in tool_results {
+        for (id, status, output) in surviving_results {
             push_message(
                 &mut messages,
                 "tool",
                 output,
                 json!({
                     "message": {"role": "tool", "toolCallId": id},
-                    "cass": {"source_format": "continue_session", "history_index": history_index,
-                        "from_tool_state": true, "tool_status": status}
+                    "cass": {
+                        "source_format": "continue_session",
+                        "history_index": entry.history_index,
+                        "from_tool_state": true,
+                        "tool_status": status
+                    }
                 }),
                 Vec::new(),
             );
@@ -810,5 +1030,76 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(format!("{:#}", result.unwrap_err()).contains("fixture read failure"));
+    }
+
+    #[test]
+    fn json_stream_handles_bom_empty_multi_and_truncated_history() {
+        // 1. Empty history returns Ok(None).
+        let empty = parse_session_reader(
+            Path::new("empty.json"),
+            io::Cursor::new(
+                br#"{"sessionId":"empty","title":"Empty","workspaceDirectory":"/work","history":[]}"#,
+            ),
+        )
+        .unwrap();
+        assert!(empty.is_none());
+
+        // 2. Leading UTF-8 BOM + whitespace + forward-referenced native tool row
+        //    suppressing synthetic tool_call_states output (and omitting an
+        //    otherwise-empty assistant item whose only output was suppressed).
+        let mut bom_multi = Vec::from(b"\xEF\xBB\xBF \r\n\t".as_slice());
+        bom_multi.extend_from_slice(
+            br#"{
+                "sessionId": "bom-id",
+                "title": "BOM Continue",
+                "workspaceDirectory": "/work/proj",
+                "history": [
+                    {"message": {"role": "user", "content": "Run tool"}},
+                    {
+                        "message": {"role": "assistant", "content": ""},
+                        "toolCallStates": [{
+                            "toolCallId": "call-1",
+                            "toolCall": {"id": "call-1", "type": "function", "function": {"name": "read", "arguments": "{}"}},
+                            "status": "done",
+                            "output": [{"content": "stale"}]
+                        }]
+                    },
+                    {"message": {"role": "tool", "toolCallId": "call-1", "content": "native tool output"}}
+                ]
+            }"#,
+        );
+        let conv = parse_session_reader(Path::new("bom-id.json"), io::Cursor::new(&bom_multi))
+            .unwrap()
+            .unwrap();
+        assert_eq!(conv.external_id.as_deref(), Some("bom-id"));
+        assert_eq!(conv.messages.len(), 3);
+        assert_eq!(conv.messages[0].idx, 0);
+        assert_eq!(conv.messages[0].content, "Run tool");
+        assert_eq!(conv.messages[1].idx, 1);
+        assert_eq!(conv.messages[1].role, "assistant");
+        assert_eq!(conv.messages[1].content, "[Tool: read]");
+        assert_eq!(conv.messages[2].idx, 2);
+        assert_eq!(conv.messages[2].role, "tool");
+        assert_eq!(conv.messages[2].content, "native tool output");
+
+        // 3. Top-level array dispatch returns Err cleanly.
+        assert!(
+            parse_session_reader(
+                Path::new("arr.json"),
+                io::Cursor::new(br#"[{"message":{"role":"user","content":"x"}}]"#),
+            )
+            .is_err()
+        );
+
+        // 4. Truncated mid-array history returns Err (never silently truncating).
+        assert!(
+            parse_session_reader(
+                Path::new("trunc.json"),
+                io::Cursor::new(
+                    br#"{"sessionId":"trunc","title":"T","workspaceDirectory":"/w","history":[{"message":{"role":"user","content":"ok"}},{"message":{"role":"user""#,
+                ),
+            )
+            .is_err()
+        );
     }
 }

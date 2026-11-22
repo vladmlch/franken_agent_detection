@@ -2243,8 +2243,7 @@ mod tests {
     #[cfg(feature = "pi-sqlite")]
     mod sqlite_sessions {
         use super::*;
-        use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
-        use frankensqlite::compat::ParamValue;
+        use crate::connectors::sqlite_sync::{Connection, ConnectionExt, ParamValue};
 
         /// `pi_agent_rust`'s `session_sqlite.rs` schema, with the same wire
         /// records a JSONL session would hold.

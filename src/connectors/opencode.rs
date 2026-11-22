@@ -41,10 +41,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ParamValue, RowExt};
-use frankensqlite::{Row, SqliteValue, params};
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
+use super::sqlite_sync::{
+    Connection, ConnectionExt, FrankenError, ParamValue, Row, RowExt, SqliteValue,
+    open_read_only_with_snapshot_fallback, params,
+};
 use super::utils::read_capped;
 
 /// Max ids bound into a single `... IN (?, ?, …)` chunk. Kept well under
@@ -732,7 +733,7 @@ impl OpenCodeConnector {
         progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<HashMap<String, Vec<NormalizedMessage>>> {
         const SELECT: &str = "SELECT session_id, id, type, seq, data, time_created FROM session_message WHERE data IS NOT NULL AND session_id IS NOT NULL AND id IS NOT NULL AND type IS NOT NULL";
-        let map_row = |row: &Row| -> Result<SqliteV2MessageRow, frankensqlite::FrankenError> {
+        let map_row = |row: &Row<'_>| -> Result<SqliteV2MessageRow, FrankenError> {
             Ok(SqliteV2MessageRow {
                 session_id: row.get_typed(0)?,
                 id: row.get_typed(1)?,
@@ -1982,14 +1983,10 @@ fn error_text_of(error: Option<&serde_json::Value>) -> Option<&str> {
     }
 }
 
-fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
-    row.get(index).and_then(|value| {
-        if matches!(value, SqliteValue::Null) {
-            None
-        } else {
-            Some(value.clone())
-        }
-    })
+fn optional_sqlite_value(row: &Row<'_>, index: usize) -> Option<SqliteValue> {
+    row.get_value(index)
+        .ok()
+        .filter(|value| !matches!(value, SqliteValue::Null))
 }
 
 /// Normalize a raw SQLite value to epoch milliseconds.
@@ -2002,7 +1999,7 @@ fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
 fn normalize_sqlite_ts_value(val: &SqliteValue) -> Option<i64> {
     match val {
         SqliteValue::Integer(i) => normalize_opencode_timestamp(Some(*i)),
-        SqliteValue::Float(f) => normalize_opencode_timestamp(Some(*f as i64)),
+        SqliteValue::Real(f) => normalize_opencode_timestamp(Some(*f as i64)),
         SqliteValue::Text(s) => {
             // Try common SQLite/Drizzle datetime formats (space separator)
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
@@ -4580,7 +4577,7 @@ mod tests {
 
     #[test]
     fn normalize_sqlite_ts_value_real() {
-        let val = SqliteValue::Float(1_700_000_000.5);
+        let val = SqliteValue::Real(1_700_000_000.5);
         assert_eq!(normalize_sqlite_ts_value(&val), Some(1_700_000_000_000));
     }
 
@@ -6189,11 +6186,14 @@ mod tests {
         .unwrap();
 
         // The incident shape: every frame checkpointed into the db, so the
-        // `-wal` remains on disk at 0 bytes after the writer exits.
+        // `-wal` remains on disk at 0 bytes after the writer exits. Closing
+        // the last connection would checkpoint and unlink the sidecars, so
+        // the writer disables the close-time checkpoint to leave them.
         conn.query_row_map::<(i64, i64, i64), _>("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
             Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
         })
         .unwrap();
+        conn.set_no_ckpt_on_close(true).unwrap();
         drop(conn);
 
         assert!(
@@ -6249,7 +6249,7 @@ mod tests {
     /// modifying the user's files. The db and `-wal` are never written by any
     /// read-only open; the `-shm` is never written whenever the snapshot
     /// fallback engages, and `garbage`/`torn` wal-indexes refuse the strict
-    /// open on every frankensqlite build, so the fallback always engages for
+    /// open on every build, so the fallback always engages for
     /// them.
     #[serial]
     #[test]

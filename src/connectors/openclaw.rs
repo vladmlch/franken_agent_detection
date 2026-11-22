@@ -888,13 +888,12 @@ mod sqlite_store {
     use std::path::Path;
 
     use anyhow::{Context, Result, bail};
-    use frankensqlite::compat::{ParamValue, RowExt};
-    use frankensqlite::{Row, SqliteValue};
     use serde_json::Value;
 
     use super::super::parse_timestamp;
     use super::super::sqlite_sync::{
-        Connection, ConnectionExt, open_read_only_with_snapshot_fallback,
+        Connection, ConnectionExt, ParamValue, Row, RowExt, SqliteValue,
+        open_read_only_with_snapshot_fallback,
     };
     use super::{OpenClawConnector, SessionEventAccumulator};
     use crate::types::NormalizedConversation;
@@ -971,8 +970,9 @@ mod sqlite_store {
         })
     }
 
-    fn non_null(row: &Row, index: usize) -> Option<&SqliteValue> {
-        row.get(index)
+    fn non_null(row: &Row, index: usize) -> Option<SqliteValue> {
+        row.get::<usize, SqliteValue>(index)
+            .ok()
             .filter(|value| !matches!(value, SqliteValue::Null))
     }
 
@@ -1009,12 +1009,11 @@ mod sqlite_store {
         event_utf8_bytes: Option<&SqliteValue>,
     ) -> std::result::Result<String, PayloadError> {
         match event_json {
-            Some(SqliteValue::Text(text)) => return Ok(text.to_string()),
+            Some(SqliteValue::Text(text)) => return Ok(text.clone()),
             // SQLite's column affinity is advisory; a writer binding bytes
             // leaves a blob in a TEXT column. Accept it only as UTF-8.
             Some(SqliteValue::Blob(bytes)) => {
-                return String::from_utf8(bytes.to_vec())
-                    .map_err(|_| PayloadError::IdentityNotText);
+                return String::from_utf8(bytes.clone()).map_err(|_| PayloadError::IdentityNotText);
             }
             Some(_) => return Err(PayloadError::IdentityNotText),
             None => {}
@@ -1064,7 +1063,11 @@ mod sqlite_store {
                 Ok((
                     row.get_typed::<i64>(0)?,
                     row.get_typed::<Option<i64>>(2).ok().flatten(),
-                    event_json_text(non_null(row, 1), non_null(row, 3), non_null(row, 4)),
+                    event_json_text(
+                        non_null(row, 1).as_ref(),
+                        non_null(row, 3).as_ref(),
+                        non_null(row, 4).as_ref(),
+                    ),
                 ))
             })?;
 
@@ -1915,8 +1918,7 @@ mod tests {
     #[cfg(feature = "openclaw-sqlite")]
     mod sqlite_variant {
         use super::*;
-        use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
-        use frankensqlite::params;
+        use crate::connectors::sqlite_sync::{Connection, ConnectionExt, params};
 
         fn create_agent_db(agent_dir: &Path) -> PathBuf {
             let db_dir = agent_dir.join("agent");
@@ -2273,7 +2275,7 @@ mod tests {
             use super::super::sqlite_store::{
                 MAX_COMPRESSED_EVENT_BYTES, PayloadError, event_json_text,
             };
-            use frankensqlite::SqliteValue;
+            use crate::connectors::sqlite_sync::SqliteValue;
 
             #[allow(clippy::needless_pass_by_value)] // keeps the call sites terse
             fn dec(
@@ -2284,7 +2286,7 @@ mod tests {
                 event_json_text(json.as_ref(), zstd.as_ref(), bytes.as_ref())
             }
 
-            let blob = |b: &[u8]| Some(SqliteValue::Blob(b.to_vec().into()));
+            let blob = |b: &[u8]| Some(SqliteValue::Blob(b.to_vec()));
             let int = |n: i64| Some(SqliteValue::Integer(n));
             let json = user_event("bounded");
             let (frame, len) = compress(&json);

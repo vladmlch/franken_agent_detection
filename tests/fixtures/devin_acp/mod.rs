@@ -5,9 +5,7 @@
 
 use std::path::Path;
 
-use franken_agent_detection::connectors::sqlite_sync::{Connection, ConnectionExt};
-use frankensqlite::compat::RowExt;
-use frankensqlite::params;
+use franken_agent_detection::connectors::sqlite_sync::{Connection, ConnectionExt, RowExt, params};
 use serde_json::{Value, json};
 
 fn open_rw(path: &Path) -> Connection {

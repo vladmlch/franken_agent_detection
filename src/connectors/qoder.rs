@@ -494,9 +494,8 @@ fn qoder_title_database_for_path(path: &Path) -> Option<PathBuf> {
 ))]
 pub(crate) fn load_qoder_title_map_from_db(db_path: &Path) -> HashMap<String, String> {
     use super::sqlite_sync::{
-        ConnectionExt, open_read_only_with_snapshot_fallback, store_is_provably_empty,
+        ConnectionExt, RowExt, open_read_only_with_snapshot_fallback, store_is_provably_empty,
     };
-    use frankensqlite::compat::RowExt;
 
     if !fs::symlink_metadata(db_path).is_ok_and(|meta| meta.file_type().is_file())
         || store_is_provably_empty(db_path)
@@ -1593,6 +1592,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn companion_session_json_sidecar_backfills_workspace_metadata_and_boundaries() {
         let dir = TempDir::new().unwrap();
         let projects = dir.path().join("projects");
@@ -1908,6 +1908,7 @@ mod tests {
         feature = "qoder-sqlite"
     ))]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn main_sqlite_title_store_precedence_and_hermeticity() {
         use crate::connectors::sqlite_sync::Connection;
 

@@ -3,6 +3,6 @@
 rustflags = ["-Z", "threads=4"]
 
 [env]
-# fsqlite's async engine builds very large debug-mode futures; some SQLite
-# connector tests overflow the default 2 MiB test-thread stack.
+# SQLite connector tests overflow the default 2 MiB test-thread stack in
+# debug builds; keep the raised limit.
 RUST_MIN_STACK = "16777216"

@@ -34,17 +34,20 @@
 //!     participant emails, image/base64 payloads, signatures, or encrypted
 //!     continuation data.
 //!
-//! **NOTE:** This connector uses `frankensqlite`. See AGENTS.md RULE 2.
+//! **NOTE:** This connector reads SQLite through the bundled `rusqlite`
+//! facade in `sqlite_sync`. See AGENTS.md RULE 2.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use frankensqlite::compat::{ParamValue, RowExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
+use super::sqlite_sync::{
+    Connection, ConnectionExt, ParamValue, Row, RowExt, SqliteError,
+    open_read_only_with_snapshot_fallback,
+};
 use super::utils::{
     env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, unwrap_skill_invocations,
 };
@@ -644,32 +647,23 @@ struct ConvRow {
     tags: Option<String>,
 }
 
-fn opt_flag(
-    row: &frankensqlite::Row,
-    idx: Option<usize>,
-) -> Result<bool, frankensqlite::FrankenError> {
+fn opt_flag(row: &Row, idx: Option<usize>) -> Result<bool, SqliteError> {
     idx.map_or(Ok(false), |i| {
         Ok(row.get_typed::<Option<i64>>(i)?.unwrap_or(0) != 0)
     })
 }
 
-fn opt_text(
-    row: &frankensqlite::Row,
-    idx: Option<usize>,
-) -> Result<Option<String>, frankensqlite::FrankenError> {
+fn opt_text(row: &Row, idx: Option<usize>) -> Result<Option<String>, SqliteError> {
     idx.map_or(Ok(None), |i| row.get_typed::<Option<String>>(i))
 }
 
-fn opt_int(
-    row: &frankensqlite::Row,
-    idx: Option<usize>,
-) -> Result<Option<i64>, frankensqlite::FrankenError> {
+fn opt_int(row: &Row, idx: Option<usize>) -> Result<Option<i64>, SqliteError> {
     idx.map_or(Ok(None), |i| row.get_typed::<Option<i64>>(i))
 }
 
 /// Read a Shelley DATETIME column leniently: TEXT timestamps from Go drivers
 /// in several layouts, or numeric epoch seconds/milliseconds.
-fn read_ts(row: &frankensqlite::Row, idx: usize) -> Option<i64> {
+fn read_ts(row: &Row, idx: usize) -> Option<i64> {
     if let Ok(Some(text)) = row.get_typed::<Option<String>>(idx) {
         if let Some(ms) = parse_shelley_timestamp(&text) {
             return Some(ms);
@@ -1901,7 +1895,7 @@ fn enforce_extra_budget(extra: &mut serde_json::Map<String, Value>) {
 #[allow(clippy::similar_names)] // conn/conv/convs fixture bindings are idiomatic here
 mod tests {
     use super::*;
-    use frankensqlite::params;
+    use crate::connectors::sqlite_sync::params;
 
     fn fixture_schema(conn: &Connection, with_migrations: bool) {
         conn.execute_batch(

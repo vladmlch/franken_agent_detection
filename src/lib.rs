@@ -2569,6 +2569,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn default_probe_paths_tilde_covers_expected_roots() {
         let mut by_slug: std::collections::HashMap<&'static str, Vec<String>> =
             std::collections::HashMap::new();

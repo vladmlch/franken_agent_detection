@@ -10,11 +10,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::RowExt;
-use frankensqlite::params;
 use serde_json::{Map, Value, json};
 
-use super::super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
+use super::super::sqlite_sync::{
+    Connection, ConnectionExt, RowExt, open_read_only_with_snapshot_fallback, params,
+};
 use super::super::utils::{file_modified_since, parse_timestamp, unwrap_skill_invocations};
 use super::{assign_message_indices, bound_tool_arguments, first_user_line_title, sidecar_path};
 use crate::types::{NormalizedConversation, NormalizedInvocation, NormalizedMessage};

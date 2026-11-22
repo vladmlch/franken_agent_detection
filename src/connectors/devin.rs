@@ -46,10 +46,6 @@ use std::path::Path;
 
 #[cfg(feature = "devin")]
 use anyhow::{Context, Result};
-#[cfg(feature = "devin")]
-use frankensqlite::compat::RowExt;
-#[cfg(feature = "devin")]
-use frankensqlite::params;
 
 #[cfg(feature = "devin")]
 use super::scan::{
@@ -57,7 +53,9 @@ use super::scan::{
     SourceScanHooks,
 };
 #[cfg(feature = "devin")]
-use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
+use super::sqlite_sync::{
+    Connection, ConnectionExt, Row, RowExt, open_read_only_with_snapshot_fallback, params,
+};
 #[cfg(feature = "devin")]
 use super::utils::{env_path_nonempty, path_is_excluded, unwrap_skill_invocations};
 #[cfg(feature = "devin")]
@@ -510,7 +508,7 @@ impl DevinConnector {
         conn: &Connection,
         session_id: &str,
     ) -> Result<(Vec<subagent_tree::ForestNode>, Vec<Option<i64>>)> {
-        let map_row = |row: &frankensqlite::Row| {
+        let map_row = |row: &Row<'_>| {
             Ok((
                 subagent_tree::ForestNode {
                     row_id: row.get_typed(0)?,
@@ -617,7 +615,7 @@ impl DevinConnector {
     fn load_sessions(conn: &Connection) -> Result<Vec<DevinSession>> {
         const COLUMNS: &str = "id, title, working_directory, model, agent_mode, \
                                created_at, last_activity_at, main_chain_id";
-        let map_row = |row: &frankensqlite::Row| {
+        let map_row = |row: &Row<'_>| {
             Ok(DevinSession {
                 id: row.get_typed::<Option<String>>(0)?.unwrap_or_default(),
                 title: row.get_typed(1)?,

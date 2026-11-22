@@ -676,9 +676,10 @@ fn read_sqlite_store(path: &Path) -> Result<DurableStore> {
 #[cfg(feature = "pi-durable")]
 #[allow(clippy::too_many_lines)]
 fn read_sqlite_store(path: &Path) -> Result<DurableStore> {
-    use super::sqlite_sync::{ConnectionExt, open_read_only_with_snapshot_fallback};
+    use super::sqlite_sync::{
+        ConnectionExt, ParamValue, RowExt, open_read_only_with_snapshot_fallback,
+    };
     use anyhow::Context as _;
-    use frankensqlite::compat::{ParamValue, RowExt};
 
     let conn = open_read_only_with_snapshot_fallback(path.to_string_lossy().as_ref())
         .with_context(|| format!("failed to open read-only: {}", path.display()))?;
@@ -2069,8 +2070,7 @@ mod tests {
     #[cfg(feature = "pi-durable")]
     mod sqlite {
         use super::*;
-        use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
-        use frankensqlite::compat::ParamValue;
+        use crate::connectors::sqlite_sync::{Connection, ConnectionExt, ParamValue, RowExt};
 
         /// The upstream schema (`storage/sqlite/migrations.ts`, version 1).
         const SCHEMA: &[&str] = &[
@@ -2102,7 +2102,7 @@ mod tests {
             if wal {
                 let mode: String = conn
                     .query_row_map("PRAGMA journal_mode=wal;", &[], |row| {
-                        frankensqlite::compat::RowExt::get_typed::<String>(row, 0)
+                        row.get_typed::<String>(0)
                     })
                     .unwrap();
                 assert_eq!(mode.to_ascii_lowercase(), "wal");

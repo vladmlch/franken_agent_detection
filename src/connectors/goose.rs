@@ -23,11 +23,12 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::RowExt;
-use frankensqlite::{Row, SqliteValue, params};
 
 use super::jsonl::JsonlLines;
-use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
+use super::sqlite_sync::{
+    Connection, ConnectionExt, Row, RowExt, SqliteValue, open_read_only_with_snapshot_fallback,
+    params,
+};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -910,13 +911,7 @@ fn looks_like_goose_sessions(path: &Path) -> bool {
 }
 
 fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
-    row.get(index).and_then(|value| {
-        if matches!(value, SqliteValue::Null) {
-            None
-        } else {
-            Some(value.clone())
-        }
-    })
+    row.get::<usize, Option<SqliteValue>>(index).ok().flatten()
 }
 
 /// Normalize a raw SQLite value to epoch milliseconds.
@@ -928,7 +923,7 @@ fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
 fn normalize_goose_ts_value(val: &SqliteValue) -> Option<i64> {
     match val {
         SqliteValue::Integer(i) => normalize_goose_timestamp(Some(*i)),
-        SqliteValue::Float(f) => {
+        SqliteValue::Real(f) => {
             if f.is_nan() || f.is_infinite() {
                 return None;
             }
@@ -1529,7 +1524,7 @@ mod tests {
 
     #[test]
     fn normalize_sqlite_ts_real() {
-        let val = SqliteValue::Float(1_700_000_000.5);
+        let val = SqliteValue::Real(1_700_000_000.5);
         let result = normalize_goose_ts_value(&val);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), 1_700_000_000_500);

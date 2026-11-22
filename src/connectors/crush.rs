@@ -11,15 +11,17 @@
 //! The `parts` column contains a JSON array of objects with `type` and `text` fields;
 //! text content is extracted from entries where `type == "text"`.
 //!
-//! **NOTE:** This connector uses `frankensqlite`. See AGENTS.md RULE 2.
+//! **NOTE:** This connector reads SQLite through the bundled `rusqlite`
+//! facade in `sqlite_sync`. See AGENTS.md RULE 2.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ParamValue, RowExt};
 
-use super::sqlite_sync::{ConnectionExt, open_read_only_with_snapshot_fallback};
+use super::sqlite_sync::{
+    ConnectionExt, ParamValue, RowExt, open_read_only_with_snapshot_fallback,
+};
 use serde::Deserialize;
 
 use super::scan::{
@@ -84,7 +86,7 @@ impl CrushConnector {
         dbs
     }
 
-    /// Extract sessions from a Crush `SQLite` database using frankensqlite.
+    /// Extract sessions from a Crush `SQLite` database via the bundled rusqlite facade.
     fn extract_from_sqlite(
         db_path: &Path,
         since_ts: Option<i64>,
@@ -565,8 +567,7 @@ fn flush_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::sqlite_sync::ConnectionExt;
-    use frankensqlite::params;
+    use crate::connectors::sqlite_sync::{ConnectionExt, params};
 
     #[test]
     fn extract_text_from_parts_basic() {

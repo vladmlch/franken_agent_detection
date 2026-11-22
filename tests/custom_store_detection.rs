@@ -215,8 +215,7 @@ fn write_opencode_legacy(root: &Path, id: &str) {
 ))]
 #[allow(clippy::too_many_lines)]
 fn write_sqlite(path: &Path, provider: &str, id: &str) {
-    use franken_agent_detection::connectors::sqlite_sync::{Connection, ConnectionExt};
-    use frankensqlite::params;
+    use franken_agent_detection::connectors::sqlite_sync::{Connection, ConnectionExt, params};
 
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let conn = Connection::open(path.to_str().unwrap()).unwrap();
@@ -717,8 +716,7 @@ fn cursor_configured_projects_are_detected_and_explicit_scans_stay_scoped() {
 #[cfg(feature = "cursor")]
 #[test]
 fn cursor_missing_projects_override_preserves_independent_composer_store() {
-    use franken_agent_detection::connectors::sqlite_sync::{Connection, ConnectionExt};
-    use frankensqlite::params;
+    use franken_agent_detection::connectors::sqlite_sync::{Connection, ConnectionExt, params};
 
     let fixture = Fixture::new("cursor");
     fixture.store("home/.cursor/projects", "default");

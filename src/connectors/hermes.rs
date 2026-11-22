@@ -23,10 +23,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::RowExt;
-use frankensqlite::params;
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
+use super::sqlite_sync::{
+    Connection, ConnectionExt, RowExt, open_read_only_with_snapshot_fallback, params,
+};
 
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
@@ -613,7 +613,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("state.db");
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
-        conn.execute(
+        conn.execute_batch(
             "CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
                 source TEXT,
@@ -804,7 +804,7 @@ mod tests {
     }
 
     fn create_hermes_schema(conn: &Connection) {
-        conn.execute(
+        conn.execute_batch(
             "CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
                 source TEXT,

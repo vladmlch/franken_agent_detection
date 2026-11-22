@@ -32,13 +32,11 @@ use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::SqliteValue;
-use frankensqlite::compat::RowExt;
-use frankensqlite::params;
 
 use super::jsonl::JsonlLines;
 use super::sqlite_sync::{
-    Connection, ConnectionExt, open_read_only_with_snapshot_fallback, store_is_provably_empty,
+    Connection, ConnectionExt, Row, RowExt, SqliteError, SqliteValueRef,
+    open_read_only_with_snapshot_fallback, params, store_is_provably_empty,
 };
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
@@ -70,10 +68,10 @@ mod bubble_type {
 type BubbleDataMap = HashMap<String, Value>;
 
 /// One key-prefix range of `cursorDiskKV` (`?1` inclusive, `?2` exclusive).
-/// It must stay a bare key range: frankensqlite plans any residual predicate
-/// (such as `value IS NOT NULL`) as a full table scan, and a real
-/// multi-gigabyte `state.vscdb` then reads the whole table once per composer
-/// (cass F8). Callers skip NULL values in the row mapper instead.
+/// It must stay a bare key range: a residual predicate (such as
+/// `value IS NOT NULL`) can push a planner off the key-range seek, and a
+/// real multi-gigabyte `state.vscdb` then reads the whole table once per
+/// composer (cass F8). Callers skip NULL values in the row mapper instead.
 const CURSOR_DISK_KV_RANGE_SQL: &str =
     "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?";
 
@@ -144,7 +142,7 @@ struct ComposerSubagentEvidence {
 /// same (`v.decode("utf-8", errors="ignore")` then `json.loads`,
 /// claude_viewer viewer/providers/cursor/discovery.py). Any other storage
 /// class (INTEGER, REAL) is evidence this connector cannot decode. Reading
-/// the raw `SqliteValue` instead of `Option<String>` keeps one such cell
+/// the raw `SqliteValueRef` instead of `Option<String>` keeps one such cell
 /// from aborting the whole range query (round-8 N6 residual); a genuinely
 /// undecodable row marks the store uncertain for false, not just its own id.
 enum ComposerDataCell {
@@ -707,16 +705,20 @@ impl CursorConnector {
     }
 
     fn text_or_bytes_column(
-        row: &frankensqlite::Row,
+        row: &Row<'_>,
         idx: usize,
-    ) -> std::result::Result<Option<String>, frankensqlite::FrankenError> {
-        match row.get_typed::<Option<String>>(idx) {
-            Ok(val) => Ok(val),
-            Err(err) => match row.get_typed::<Option<Vec<u8>>>(idx) {
-                Ok(Some(bytes)) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
-                Ok(None) => Ok(None),
-                Err(_) => Err(err),
-            },
+    ) -> std::result::Result<Option<String>, SqliteError> {
+        // TEXT and BLOB cells both decode through the same lossy UTF-8 view
+        // the typed `Option<String>`/`Option<Vec<u8>>` pair produced; any
+        // other storage class (or an unreadable column) is an error.
+        match row.get_ref(idx) {
+            Ok(SqliteValueRef::Null) => Ok(None),
+            Ok(SqliteValueRef::Text(bytes) | SqliteValueRef::Blob(bytes)) => {
+                Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+            }
+            _ => Err(SqliteError::Internal(format!(
+                "column {idx} is not TEXT, BLOB, or NULL"
+            ))),
         }
     }
 
@@ -726,14 +728,16 @@ impl CursorConnector {
         v as i64
     }
 
-    fn header_cell(row: &frankensqlite::Row, idx: usize) -> HeaderCell {
-        match row.get(idx) {
-            Some(SqliteValue::Null) => HeaderCell::Null,
-            Some(SqliteValue::Integer(i)) => HeaderCell::Int(*i),
-            Some(SqliteValue::Float(f)) => HeaderCell::Real(*f),
-            Some(SqliteValue::Text(s)) => HeaderCell::Text(s.as_str().to_string()),
-            Some(SqliteValue::Blob(b)) => HeaderCell::Blob(b.to_vec()),
-            None => HeaderCell::Unreadable,
+    fn header_cell(row: &Row<'_>, idx: usize) -> HeaderCell {
+        match row.get_ref(idx) {
+            Ok(SqliteValueRef::Null) => HeaderCell::Null,
+            Ok(SqliteValueRef::Integer(i)) => HeaderCell::Int(i),
+            Ok(SqliteValueRef::Real(f)) => HeaderCell::Real(f),
+            Ok(SqliteValueRef::Text(bytes)) => {
+                HeaderCell::Text(String::from_utf8_lossy(bytes).into_owned())
+            }
+            Ok(SqliteValueRef::Blob(bytes)) => HeaderCell::Blob(bytes.to_vec()),
+            Err(_) => HeaderCell::Unreadable,
         }
     }
 
@@ -742,7 +746,7 @@ impl CursorConnector {
     /// undecodable `isSubagent` cell sets `sub_unknown` so the composer does not
     /// get an own-header false, while the row's readable evidence is kept.
     fn read_composer_header_row(
-        row: &frankensqlite::Row,
+        row: &Row<'_>,
         sub_idx: Option<usize>,
         parent_idx: Option<usize>,
         value_idx: Option<usize>,
@@ -834,17 +838,15 @@ impl CursorConnector {
     /// lossy/ignore-errors recovery, because replacement characters inside
     /// an identifier would invent composers (e.g. `P�`) that can shadow a
     /// real parent or listing. Raw (non-UTF-8) TEXT gets the same verdict.
-    fn composer_data_cell(row: &frankensqlite::Row, idx: usize) -> ComposerDataCell {
-        match row.get(idx) {
-            Some(SqliteValue::Text(s)) => match s.as_str_checked() {
-                Some(t) => ComposerDataCell::Text(t.to_string()),
-                None => ComposerDataCell::Undecodable,
-            },
-            Some(SqliteValue::Blob(b)) => match std::str::from_utf8(b) {
-                Ok(t) => ComposerDataCell::Text(t.to_string()),
-                Err(_) => ComposerDataCell::Undecodable,
-            },
-            Some(SqliteValue::Null) => ComposerDataCell::Null,
+    fn composer_data_cell(row: &Row<'_>, idx: usize) -> ComposerDataCell {
+        match row.get_ref(idx) {
+            Ok(SqliteValueRef::Text(bytes) | SqliteValueRef::Blob(bytes)) => {
+                match std::str::from_utf8(bytes) {
+                    Ok(t) => ComposerDataCell::Text(t.to_string()),
+                    Err(_) => ComposerDataCell::Undecodable,
+                }
+            }
+            Ok(SqliteValueRef::Null) => ComposerDataCell::Null,
             _ => ComposerDataCell::Undecodable,
         }
     }
@@ -1002,7 +1004,7 @@ impl CursorConnector {
     ) -> ComposerSubagentEvidence {
         let prefix = "composerData:";
         let limit = Self::prefix_upper_bound(prefix);
-        // The raw SqliteValue capture keeps a single non-TEXT cell (e.g. a
+        // The raw SqliteValueRef capture keeps a single non-TEXT cell (e.g. a
         // BLOB under composerData) from voiding the whole range read —
         // every row that decodes keeps its positive/parent evidence.
         let rows = conn.query_map_collect(
@@ -3383,8 +3385,7 @@ impl Connector for CursorConnector {
 mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
-    use crate::connectors::sqlite_sync::ConnectionExt;
-    use frankensqlite::params;
+    use crate::connectors::sqlite_sync::{ConnectionExt, params};
     use serde_json::json;
     use serial_test::serial;
     use std::collections::HashSet;
@@ -4246,11 +4247,14 @@ mod tests {
         .unwrap();
 
         // The incident shape: every frame checkpointed into the db, so the
-        // `-wal` remains on disk at 0 bytes after the writer exits.
+        // `-wal` remains on disk at 0 bytes after the writer exits. C SQLite
+        // checkpoints and deletes `-wal`/`-shm` when the last writable
+        // connection closes, so the fixture opts out of close-time cleanup.
         conn.query_row_map::<(i64, i64, i64), _>("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
             Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
         })
         .unwrap();
+        conn.set_no_ckpt_on_close(true).unwrap();
         drop(conn);
 
         assert!(
@@ -4292,7 +4296,7 @@ mod tests {
     /// still be read, without modifying the user's files. The db and `-wal`
     /// are never written by any read-only open; the `-shm` is never written
     /// whenever the snapshot fallback engages, and `garbage`/`torn`
-    /// wal-indexes refuse the strict open on every frankensqlite build, so the
+    /// wal-indexes refuse the strict open on every engine build, so the
     /// fallback always engages for them.
     #[serial]
     #[test]
@@ -4459,9 +4463,10 @@ mod tests {
 
     /// Cursor declares `key TEXT UNIQUE`, so the key range is served by the
     /// `sqlite_autoindex_cursorDiskKV_1` index. A residual predicate in this
-    /// SQL (it once carried `value IS NOT NULL`) makes frankensqlite plan a
-    /// full table scan, which on a real 2.9 GB store read the whole table for
-    /// each of 1,488 composers: about 0.8 s each, 20+ minutes per scan.
+    /// SQL (it once carried `value IS NOT NULL`) can make a planner fall back
+    /// to a full table scan, which on a real 2.9 GB store read the whole
+    /// table for each of 1,488 composers: about 0.8 s each, 20+ minutes per
+    /// scan.
     #[test]
     fn cursor_disk_kv_range_query_seeks_the_key_index() {
         let dir = TempDir::new().unwrap();
@@ -5668,8 +5673,7 @@ mod cursor_fragment_merge_tests {
     //! id on both sides is what triggers the merge; transcript-only and
     //! composer-only shapes pin today's byte-for-byte behavior.
     use super::*;
-    use crate::connectors::sqlite_sync::ConnectionExt;
-    use frankensqlite::params;
+    use crate::connectors::sqlite_sync::{ConnectionExt, params};
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
@@ -10189,6 +10193,13 @@ mod cursor_fragment_merge_tests {
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("state.vscdb");
         let conn = verdict_test_db(&db);
+        // The injected writer must be able to commit while the reader's row
+        // statement is still active. A rollback-journal store cannot do that
+        // — the reader's SHARED lock holds the writer's COMMIT until after
+        // the header read — so the fixture runs in WAL mode, the shape a
+        // live Cursor store has, with its sidecars left on disk for the
+        // strict read-only open.
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
         for id in [c, other] {
             conn.execute_compat(
                 "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
@@ -10212,27 +10223,30 @@ mod cursor_fragment_merge_tests {
             )
             .unwrap();
         }
+        conn.set_no_ckpt_on_close(true).unwrap();
         drop(conn);
         let db_str = db.to_string_lossy().to_string();
         // Fires inside the composerData range read: one commit — C's header
         // flips to true. On the held-transaction implementation this attempt
         // is lock-blocked until after the verdict's snapshot; on the ordered
-        // reads it lands before the own-header read and is seen.
+        // reads it lands before the own-header read and is seen. The commit
+        // must come from a separate process: the strict read-only open's
+        // `readonly_shm` wal-index is read-only for every later opener in
+        // this process, so a same-process writer can never commit while the
+        // reader holds the store.
+        let exe = std::env::current_exe().unwrap();
         let inj = inject_on_tick(1, move || {
-            let Ok(w) = Connection::open(&db_str) else {
-                return false;
-            };
-            let ok = w.execute("BEGIN").is_ok()
-                && w.execute_compat(
-                    "UPDATE composerHeaders SET isSubagent = ? WHERE composerId = ?",
-                    params![1i64, c],
-                )
-                .is_ok()
-                && w.execute("COMMIT").is_ok();
-            if !ok {
-                let _ = w.execute("ROLLBACK");
-            }
-            ok
+            let output = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "connectors::cursor::cursor_fragment_merge_tests::\
+                     wal_store_commit_child_process_helper",
+                    "--nocapture",
+                ])
+                .env("FAD_CURSOR_WAL_WRITER_DB", &db_str)
+                .env("FAD_CURSOR_WAL_WRITER_COMPOSER", c)
+                .output();
+            matches!(output, Ok(output) if output.status.success())
         });
         let convs = CursorConnector::extract_from_db(&db, None, inj.tick.as_ref()).unwrap();
         assert!(
@@ -10255,6 +10269,33 @@ mod cursor_fragment_merge_tests {
              committed true (writer committed_at_tick={})",
             inj.committed.get()
         );
+    }
+
+    /// Child-process half of `extraction_reads_own_header_after_composer_rows`:
+    /// the parent spawns this test binary with the writer env vars set so the
+    /// commit comes from a separate process — the shape of the live Cursor app
+    /// writing while a scan reads. Without the env vars (an ordinary suite
+    /// run) it returns immediately.
+    #[test]
+    fn wal_store_commit_child_process_helper() {
+        let (Ok(db), Ok(composer)) = (
+            std::env::var("FAD_CURSOR_WAL_WRITER_DB"),
+            std::env::var("FAD_CURSOR_WAL_WRITER_COMPOSER"),
+        ) else {
+            return;
+        };
+        let w = Connection::open(&db).unwrap();
+        let ok = w.execute("BEGIN").is_ok()
+            && w.execute_compat(
+                "UPDATE composerHeaders SET isSubagent = ? WHERE composerId = ?",
+                params![1i64, composer.as_str()],
+            )
+            .is_ok()
+            && w.execute("COMMIT").is_ok();
+        if !ok {
+            let _ = w.execute("ROLLBACK");
+            std::process::exit(1);
+        }
     }
 
     /// M2 (round-7): an uninterpretable `isSubagent` component vetoes an

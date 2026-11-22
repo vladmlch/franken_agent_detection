@@ -1169,10 +1169,9 @@ pub fn session_to_conversation(
 /// in-memory map shape defensively.
 #[cfg(feature = "copilot-vscdb")]
 fn sessions_from_state_db(db_path: &Path) -> Vec<Value> {
-    use frankensqlite::compat::RowExt;
-    use frankensqlite::params;
-
-    use super::sqlite_sync::{ConnectionExt, open_read_only_with_snapshot_fallback};
+    use super::sqlite_sync::{
+        ConnectionExt, RowExt, open_read_only_with_snapshot_fallback, params,
+    };
 
     let conn = match open_read_only_with_snapshot_fallback(db_path.to_string_lossy().as_ref()) {
         Ok(conn) => conn,
@@ -2080,8 +2079,7 @@ mod tests {
     #[cfg(feature = "copilot-vscdb")]
     mod state_db {
         use super::*;
-        use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
-        use frankensqlite::params;
+        use crate::connectors::sqlite_sync::{Connection, ConnectionExt, params};
 
         fn write_state_db(db_path: &Path, sessions: &Value) {
             fs::create_dir_all(db_path.parent().expect("parent")).expect("mkdir");

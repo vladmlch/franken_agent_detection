@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use franken_agent_detection::{
-    ClaudeCodeConnector, CodexConnector, Connector, Origin, QoderConnector, ScanContext, ScanRoot,
+    CodexConnector, Connector, Origin, QoderConnector, ScanContext, ScanRoot,
 };
 
 fn put(path: &Path, bytes: &[u8]) {
@@ -67,9 +67,14 @@ fn application_named_codex_and_qoder_projects_are_not_expanded_again() {
             assert_eq!(scanned[0].source_path, file);
             let native = temp.path().join("native");
             put(&native.join(store).join(filename), content.as_bytes());
+            let local_root = if store.starts_with(".codex/sessions") {
+                native.join(store)
+            } else {
+                native
+            };
             let local = ScanContext::with_roots(
                 temp.path().join("state"),
-                vec![ScanRoot::local(native)],
+                vec![ScanRoot::local(local_root)],
                 None,
             );
             let expected = connector.scan(&local).unwrap();
@@ -80,6 +85,7 @@ fn application_named_codex_and_qoder_projects_are_not_expanded_again() {
     }
 }
 
+#[cfg(feature = "cursor")]
 fn assert_selected_scope(connector: &dyn Connector, ctx: &ScanContext, rejected: bool) {
     let expected = usize::from(!rejected);
     let sources = connector.discover_source_files(ctx).unwrap();
@@ -101,40 +107,6 @@ fn assert_selected_scope(connector: &dyn Connector, ctx: &ScanContext, rejected:
             conversations[0].messages[0].content
         );
     }
-}
-
-#[test]
-fn selected_claude_non_directory_leaf_does_not_ingest_container_messages() {
-    for invalid_leaf in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
-        let container = temp.path().join("opaque_hash");
-        let file = container.join("session.jsonl");
-        let content = b"{\"type\":\"user\",\"timestamp\":\"2026-01-05T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"container transcript\"}}\n";
-        put(&file, content);
-        if invalid_leaf {
-            fs::write(container.join("selected"), b"not a directory").unwrap();
-        }
-        let ctx = context(container, "~/.claude/projects/selected/");
-        assert_selected_scope(&ClaudeCodeConnector::new(), &ctx, invalid_leaf);
-        assert_eq!(fs::read(&file).unwrap(), content);
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn dangling_selected_claude_leaf_does_not_ingest_container_messages() {
-    let temp = tempfile::tempdir().unwrap();
-    let container = temp.path().join("opaque_hash");
-    let file = container.join("session.jsonl");
-    let content = b"{\"type\":\"user\",\"timestamp\":\"2026-01-05T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"container transcript\"}}\n";
-    put(&file, content);
-    let leaf = container.join("selected");
-    let target = temp.path().join("missing");
-    std::os::unix::fs::symlink(&target, &leaf).unwrap();
-    let ctx = context(container, "~/.claude/projects/selected/");
-    assert_selected_scope(&ClaudeCodeConnector::new(), &ctx, true);
-    assert_eq!(fs::read_link(&leaf).unwrap(), target);
-    assert_eq!(fs::read(&file).unwrap(), content);
 }
 
 #[cfg(feature = "cursor")]

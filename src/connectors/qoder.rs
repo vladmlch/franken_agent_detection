@@ -1877,6 +1877,7 @@ mod tests {
         feature = "qoder-sqlite"
     ))]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn main_sqlite_title_store_precedence_and_hermeticity() {
         use crate::connectors::sqlite_sync::Connection;
 

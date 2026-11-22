@@ -198,10 +198,7 @@ mod tests {
 
     #[test]
     fn owned_projects_named_like_application_roots_remain_projects() {
-        for store in [
-            &[".codex", "sessions"][..],
-            &[".qoder", "projects"][..],
-        ] {
+        for store in [&[".codex", "sessions"][..], &[".qoder", "projects"][..]] {
             for (slash, retained) in [(false, true), (true, true), (true, false)] {
                 let temp = tempfile::tempdir().unwrap();
                 let container = temp.path().join("opaque_hash");

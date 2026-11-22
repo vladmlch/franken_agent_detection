@@ -284,11 +284,7 @@ mod tests {
             "/local/qoder",
             Some(vec!["qoderwork".to_string()]),
         );
-        trie.insert(
-            "/remote/agy",
-            "/local/agy",
-            Some(vec!["agy".to_string()]),
-        );
+        trie.insert("/remote/agy", "/local/agy", Some(vec!["agy".to_string()]));
 
         // Canonical alias "codex-cli" matches emitted "codex".
         assert_eq!(

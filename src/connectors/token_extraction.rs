@@ -1233,7 +1233,8 @@ mod tests {
     #[test]
     fn extract_tokens_for_agent_unknown_falls_back() {
         let raw = Value::Null;
-        let usage = extract_tokens_for_agent("unknown_agent", &raw, "Some content here", "assistant");
+        let usage =
+            extract_tokens_for_agent("unknown_agent", &raw, "Some content here", "assistant");
         assert_eq!(usage.data_source, TokenDataSource::Estimated);
         assert!(usage.output_tokens.unwrap() > 0);
     }

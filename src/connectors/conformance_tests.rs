@@ -337,10 +337,7 @@ mod conformance {
             tick();
 
             assert_eq!(percent_decode_utf8("hello%20world"), "hello world");
-            assert_eq!(
-                crate::canonical_connector_slug("qoderwork"),
-                Some("qoder")
-            );
+            assert_eq!(crate::canonical_connector_slug("qoderwork"), Some("qoder"));
             assert_eq!(
                 crate::canonical_connector_slug("claude_code"),
                 Some("claude")
@@ -1318,7 +1315,6 @@ mod conformance {
                 }
             }
         }
-
     }
 
     // =========================================================================

@@ -1363,10 +1363,7 @@ mod tests {
             "tilde table must not repeat a connector"
         );
         for (slug, paths) in default_probe_paths_tilde() {
-            assert!(
-                !paths.is_empty(),
-                "connector {slug} has empty tilde paths"
-            );
+            assert!(!paths.is_empty(), "connector {slug} has empty tilde paths");
         }
 
         // 4. The compiled factory registry covers every scanning connector.

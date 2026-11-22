@@ -7,7 +7,6 @@
 
 use std::cell::Cell;
 use std::ffi::OsStr;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

@@ -8906,6 +8906,9 @@ mod cursor_fragment_merge_tests {
         // path (the root covers the whole installation), so the ws store is
         // discovered-then-skipped every run.
         fs::set_permissions(&ws_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        // Only run the assertion when the OS enforces directory permissions
+        // (e.g. non-root). Restore permissions before TempDir drops.
+        let enforced = fs::read_dir(&ws_dir).is_err();
         let ctx = ScanContext::with_roots(
             base.to_path_buf(),
             vec![ScanRoot::local(base.to_path_buf())],
@@ -8913,15 +8916,17 @@ mod cursor_fragment_merge_tests {
         );
         let convs = CursorConnector::new().scan(&ctx).unwrap();
         fs::set_permissions(&ws_dir, fs::Permissions::from_mode(0o755)).unwrap();
-        let cc = convs
-            .iter()
-            .find(|x| x.external_id.as_deref() == Some(c))
-            .unwrap();
-        assert_eq!(
-            cc.metadata["is_subagent"],
-            json!(false),
-            "an unreadable sibling workspace dir cannot withhold an own-header false"
-        );
+        if enforced {
+            let cc = convs
+                .iter()
+                .find(|x| x.external_id.as_deref() == Some(c))
+                .unwrap();
+            assert_eq!(
+                cc.metadata["is_subagent"],
+                json!(false),
+                "an unreadable sibling workspace dir cannot withhold an own-header false"
+            );
+        }
     }
 
     #[test]

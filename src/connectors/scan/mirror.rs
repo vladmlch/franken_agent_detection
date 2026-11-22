@@ -136,11 +136,11 @@ mod tests {
     fn ancestors_and_contents_copies_keep_the_existing_contract() {
         let temp = tempfile::tempdir().unwrap();
         let container = temp.path().join("opaque_hash");
-        fs::create_dir_all(container.join("qoder/projects")).unwrap();
+        fs::create_dir_all(container.join(".qoder/projects")).unwrap();
         let store = [".qoder", "projects"];
         assert_eq!(
             resolve(&container, "~/.qoder", &store),
-            Some(container.join("qoder/projects"))
+            Some(container.join(".qoder/projects"))
         );
         let contents = temp.path().join("contents_hash");
         fs::create_dir_all(contents.join("projects")).unwrap();

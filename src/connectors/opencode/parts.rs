@@ -26,8 +26,8 @@ use frankensqlite::{Row, SqliteValue};
 use walkdir::WalkDir;
 
 use super::models::{LoadedPart, MessageInfo, PartInfo, SessionInfo};
-use super::unwrap_skill_invocations;
-use super::utils::{file_modified_since, path_is_excluded, read_capped};
+use crate::connectors::unwrap_skill_invocations;
+use crate::connectors::utils::{file_modified_since, path_is_excluded, read_capped};
 use crate::types::{NormalizedInvocation, NormalizedMessage};
 
 pub(super) fn normalize_opencode_timestamp(ts: Option<i64>) -> Option<i64> {

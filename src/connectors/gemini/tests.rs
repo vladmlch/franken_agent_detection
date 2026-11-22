@@ -254,9 +254,8 @@ fn extract_workspace_prefers_agents_md_over_working_directory() {
         role: "user".into(),
         author: None,
         created_at: None,
-        content:
-            "Working directory: /tmp/wrong\n# AGENTS.md instructions for /data/projects/right"
-                .into(),
+        content: "Working directory: /tmp/wrong\n# AGENTS.md instructions for /data/projects/right"
+            .into(),
         extra: serde_json::Value::Null,
         snippets: vec![],
         invocations: vec![],
@@ -715,8 +714,7 @@ fn scan_sets_source_path() {
     let chats_dir = hash_dir.join("chats");
     fs::create_dir_all(&chats_dir).unwrap();
 
-    let session_json =
-        r#"{"sessionId": "s1", "messages": [{"type": "user", "content": "Hi"}]}"#;
+    let session_json = r#"{"sessionId": "s1", "messages": [{"type": "user", "content": "Hi"}]}"#;
     fs::write(chats_dir.join("session-1.json"), session_json).unwrap();
 
     let connector = GeminiConnector::new();
@@ -903,8 +901,7 @@ fn scan_falls_back_to_parent_dir_for_workspace() {
     fs::create_dir_all(&chats_dir).unwrap();
 
     // No workspace info in content
-    let session_json =
-        r#"{"sessionId": "s1", "messages": [{"type": "user", "content": "Hi"}]}"#;
+    let session_json = r#"{"sessionId": "s1", "messages": [{"type": "user", "content": "Hi"}]}"#;
     fs::write(chats_dir.join("session-1.json"), session_json).unwrap();
 
     let connector = GeminiConnector::new();
@@ -1243,7 +1240,8 @@ fn null_bytes_in_content_handled() {
     let chats_dir = hash_dir.join("chats");
     fs::create_dir_all(&chats_dir).unwrap();
 
-    let session_json = r#"{"sessionId": "s1", "messages": [{"type": "user", "content": "before\u0000after"}]}"#;
+    let session_json =
+        r#"{"sessionId": "s1", "messages": [{"type": "user", "content": "before\u0000after"}]}"#;
     fs::write(chats_dir.join("session-null.json"), session_json).unwrap();
 
     let connector = GeminiConnector::new();

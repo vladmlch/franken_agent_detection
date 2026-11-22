@@ -1110,11 +1110,8 @@ fn parse_nonexistent_file_returns_error() {
     let connector = ChatGptConnector {
         encryption_key: None,
     };
-    let result = connector.parse_conversation_file(
-        &PathBuf::from("/nonexistent/file.json"),
-        None,
-        false,
-    );
+    let result =
+        connector.parse_conversation_file(&PathBuf::from("/nonexistent/file.json"), None, false);
     assert!(result.is_err());
 }
 

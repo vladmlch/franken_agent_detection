@@ -26,8 +26,8 @@ use walkdir::WalkDir;
 
 use super::OpenCodeConnector;
 use super::parts::session_has_updates;
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{
+use crate::connectors::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use crate::connectors::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
 };
 

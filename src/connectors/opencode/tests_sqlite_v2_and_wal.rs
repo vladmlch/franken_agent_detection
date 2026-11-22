@@ -21,6 +21,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use frankensqlite::compat::RowExt;
 use frankensqlite::params;
 use serde_json::json;
 use serial_test::serial;

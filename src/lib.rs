@@ -204,14 +204,6 @@ fn home_join(parts: &[&str]) -> Option<PathBuf> {
     Some(path)
 }
 
-fn cwd_join(parts: &[&str]) -> Option<PathBuf> {
-    let mut path = std::env::current_dir().ok()?;
-    for part in parts {
-        path.push(part);
-    }
-    Some(path)
-}
-
 /// Qwen's runtime store follows its own environment precedence, including
 /// tilde expansion and paths relative to the process working directory.
 /// Keep this shared by detection and scanning so relocated stores agree.

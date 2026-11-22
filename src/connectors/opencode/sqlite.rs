@@ -36,7 +36,9 @@ use super::parts::{
     normalize_sqlite_ts_value, optional_sqlite_value, resolve_v1_model_id, resolve_v1_provider_id,
     sort_loaded_parts,
 };
-use crate::connectors::sqlite_sync::{Connection, ConnectionExt, open_read_only_with_snapshot_fallback};
+use crate::connectors::sqlite_sync::{
+    Connection, ConnectionExt, open_read_only_with_snapshot_fallback,
+};
 use crate::connectors::unwrap_skill_invocations;
 use crate::types::{NormalizedConversation, NormalizedInvocation, NormalizedMessage};
 

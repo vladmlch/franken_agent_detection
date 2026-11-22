@@ -3343,7 +3343,7 @@ mod tests {
         };
 
         assert!(
-            scan(&[full.clone()]).is_empty(),
+            scan(std::slice::from_ref(&full)).is_empty(),
             "an excluded transcript's mtime must not mark the conversation modified"
         );
         // Sanity: without the exclusion the fresh full file legitimately

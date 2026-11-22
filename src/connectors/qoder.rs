@@ -1569,6 +1569,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn companion_session_json_sidecar_backfills_workspace_metadata_and_boundaries() {
         let dir = TempDir::new().unwrap();
         let projects = dir.path().join("projects");

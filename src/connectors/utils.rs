@@ -289,21 +289,6 @@ pub(crate) fn open_regular_no_follow(path: &Path) -> std::io::Result<std::fs::Fi
     Ok(file)
 }
 
-/// Open a session-store file for line-oriented streaming if its size is within
-/// [`MAX_SCAN_FILE_BYTES`]. Returns `Ok(None)` when the file exceeds the cap.
-pub(crate) fn open_capped_reader(
-    path: &Path,
-) -> std::io::Result<Option<std::io::BufReader<std::fs::File>>> {
-    let file = open_regular_no_follow(path)?;
-    if file
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() > MAX_SCAN_FILE_BYTES)
-    {
-        return Ok(None);
-    }
-    Ok(Some(std::io::BufReader::new(file)))
-}
-
 /// True when a user message is harness-injected context rather than a
 /// human-authored prompt (`# AGENTS.md instructions …`,
 /// `<environment_context>`, `<session_context>`, `<user_instructions>`,
@@ -955,35 +940,6 @@ mod tests {
         if let Ok(dir_fd) = std::fs::File::open(dir.path()) {
             let err = ensure_regular_file_fd(&dir_fd).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        }
-    }
-
-    #[test]
-    fn open_capped_reader_reads_regular_file_and_enforces_cap_and_guard() {
-        use std::io::BufRead;
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let small = dir.path().join("small.jsonl");
-        std::fs::write(&small, "line1\nline2\n").unwrap();
-        let mut reader = open_capped_reader(&small).unwrap().unwrap();
-        let mut first = String::new();
-        reader.read_line(&mut first).unwrap();
-        assert_eq!(first, "line1\n");
-
-        let big = dir.path().join("big.jsonl");
-        let file = std::fs::File::create(&big).unwrap();
-        file.set_len(MAX_SCAN_FILE_BYTES + 1).unwrap();
-        drop(file);
-        assert!(open_capped_reader(&big).unwrap().is_none());
-
-        let dir_err = open_capped_reader(dir.path()).unwrap_err();
-        assert_eq!(dir_err.kind(), std::io::ErrorKind::InvalidInput);
-
-        #[cfg(unix)]
-        {
-            let link = dir.path().join("link.jsonl");
-            std::os::unix::fs::symlink(&small, &link).unwrap();
-            assert!(open_capped_reader(&link).is_err());
         }
     }
 

@@ -13,8 +13,7 @@
 #[allow(clippy::too_many_lines)]
 mod conformance {
     use crate::connectors::{
-        DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot, get_connector_factories,
-        parse_timestamp,
+        PathTrie, ScanContext, ScanRoot, get_connector_factories, parse_timestamp,
     };
     use crate::types::{NormalizedConversation, NormalizedMessage, PathMapping};
     use crate::{AgentDetectOptions, AgentDetectRootOverride, detect_installed_agents};
@@ -359,6 +358,7 @@ mod conformance {
         #[cfg(feature = "all-connectors")]
         #[test]
         fn all_connectors_scans_devin_sqlite_sessions() {
+            use crate::connectors::DiscoveredSourceRole;
             use crate::connectors::sqlite_sync::Connection;
 
             let retained = tempfile::Builder::new()

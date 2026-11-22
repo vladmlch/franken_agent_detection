@@ -79,14 +79,9 @@ fn strict_provider_project_mirrors_ingest_only_the_selected_payload() {
                 &native.join(case.source).join(case.file),
                 case.content.as_bytes(),
             );
-            let local_root = if case.source.starts_with(".codex/sessions") {
-                native.join(case.source)
-            } else {
-                native
-            };
             let local = ScanContext::with_roots(
                 temp.path().join("state"),
-                vec![ScanRoot::local(local_root)],
+                vec![ScanRoot::local(native.join(case.source))],
                 None,
             );
             let expected = case.connector.scan(&local).unwrap();

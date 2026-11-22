@@ -67,14 +67,9 @@ fn application_named_codex_and_qoder_projects_are_not_expanded_again() {
             assert_eq!(scanned[0].source_path, file);
             let native = temp.path().join("native");
             put(&native.join(store).join(filename), content.as_bytes());
-            let local_root = if store.starts_with(".codex/sessions") {
-                native.join(store)
-            } else {
-                native
-            };
             let local = ScanContext::with_roots(
                 temp.path().join("state"),
-                vec![ScanRoot::local(local_root)],
+                vec![ScanRoot::local(native.join(store))],
                 None,
             );
             let expected = connector.scan(&local).unwrap();

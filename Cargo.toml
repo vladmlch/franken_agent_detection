@@ -45,8 +45,6 @@ urlencoding = { version = "2", optional = true }
 # --- Optional: ChatGPT encrypted conversations ---
 aes-gcm = { version = "0.11", optional = true }
 base64 = { version = "0.23", optional = true }
-blake3 = { version = "1", optional = true }
-url = { version = "2", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
 frankensqlite = { version = "0.4.1", package = "fsqlite", optional = true }
@@ -60,9 +58,8 @@ asupersync = { version = "0.5.0", default-features = false, optional = true }
 # statvfs call rides fs4's safe API. default-features = false — only the
 # ungated `available_space` probe is used, not the file-lock traits.
 fs4 = { version = "0.13", default-features = false, optional = true }
-# OpenClaw 2.0 stores larger transcript events as a Zstandard frame in
-# `transcript_events.event_zstd` (with `event_json` NULL); see the
-# `openclaw-sqlite` feature. Kept on 0.13 to share cass's existing copy.
+# Codex stores compressed rollouts as Zstandard frames (`rollout-*.jsonl.zst`);
+# see the `codex-zstd` feature. Kept on 0.13 to share cass's existing copy.
 zstd = { version = "0.13", default-features = false, optional = true }
 
 [features]
@@ -83,56 +80,13 @@ chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
 cursor = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync", "dep:fs4"]
 # OpenCode: SQLite database access for v1.2+ opencode.db
 opencode = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync", "dep:fs4"]
-# Goose: SQLite database access for Goose sessions.db
-goose = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync", "dep:fs4"]
-# Hermes: SQLite database access for Hermes Agent state.db
-hermes = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync", "dep:fs4"]
-# Crush: SQLite database access for Charm's Crush agent
-crush = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:fs4"]
 # Devin CLI: read-only access to the shared ~/.local/share/devin/cli/sessions.db
 # (cass #449). Without it the devin connector is detection-only.
 devin = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync", "dep:fs4"]
-# Grok Bot desktop rolling replicas. Hosts must reconcile provider entry IDs
-# across FIFO rewrites before opting into ingestion (separate from Grok CLI).
-grok-bot = ["connectors"]
-# One shared on-disk CLI lineage; Freebuff and Codebuff cannot be attributed
-# separately from their identical Manicode store.
-codebuff = ["connectors"]
-# Shelley (boldsoftware/shelley): schema-aware read-only access to Shelley's
-# one-database-many-conversations shelley.db (WAL mode; cass gh#415). fts5 is
-# required because Shelley's schema declares an FTS5 messages index.
-shelley = [
-    "connectors",
-    "dep:frankensqlite",
-    "frankensqlite/fts5",
-    "dep:asupersync",
-    "dep:fs4",
-    "dep:blake3",
-    "dep:base64",
-    "dep:url",
-]
-# OpenClaw 2.0 (v2026.8.1+): per-agent SQLite transcript store at
-# agents/<agent>/agent/openclaw-agent.sqlite (transcript_events rows). Legacy
-# JSONL sessions need no SQLite and remain available with the base
-# `connectors` feature.
-openclaw-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:fs4", "dep:zstd"]
 # Codex: read `rollout-*.jsonl.zst`, the form Codex's
 # `local_thread_store_compression` feature gives a finished session. Without
 # it those sessions are not discovered.
 codex-zstd = ["connectors", "dep:zstd"]
-# Copilot legacy generation: pre-March-2025 VS Code chat sessions stored in
-# workspace/global `state.vscdb` (`ItemTable` key `interactive.sessions`).
-# The newer flat-JSON and append-log `chatSessions` generations need no SQLite
-# and are always available with the base `connectors` feature.
-copilot-vscdb = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:fs4"]
-# pi_agent_rust SQLite sessions (`<timestamp>_<uuid>.sqlite`, the
-# `session_store = "sqlite"` backend) for the pi-family connectors. JSONL
-# sessions need no SQLite.
-pi-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:fs4"]
-# Pi's experimental durable harness (`@earendil-works/pi-durable`): read-only
-# access to its WAL-mode session.sqlite stores. JSONL commit-log stores need no
-# SQLite and are read with the base `connectors` feature (#28).
-pi-durable = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:fs4"]
 # Qoder: read-only access to Electron main.sqlite native session titles
 qoder-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:fs4"]
 # All connectors enabled
@@ -140,19 +94,9 @@ all-connectors = [
     "connectors",
     "codex-zstd",
     "chatgpt",
-    "codebuff",
     "cursor",
     "devin",
     "opencode",
-    "goose",
-    "grok-bot",
-    "hermes",
-    "crush",
-    "shelley",
-    "openclaw-sqlite",
-    "copilot-vscdb",
-    "pi-durable",
-    "pi-sqlite",
     "qoder-sqlite",
 ]
 

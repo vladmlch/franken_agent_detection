@@ -310,70 +310,36 @@ mod conformance {
         #[test]
         fn crate_root_reexports_all_connector_types_and_helpers() {
             use crate::{
-                AiderConnector, AmpConnector, AntigravityConnector, ClaudeCodeConnector,
-                ClawdbotConnector, ClineConnector, CodexConnector, Connector, ContinueConnector,
-                CopilotCliConnector, CopilotConnector, DevinConnector, FactoryConnector,
-                GeminiConnector, GrokConnector, KimiConnector, KiroConnector, MuseConnector,
-                NormalizedInvocation, OmpConnector, OpenClawConnector, OpenHandsConnector,
-                PiAgentConnector, PiDurableConnector, PrimeAgentConnector, QwenConnector,
-                ScanProgressTick, VibeConnector, percent_decode_utf8, unwrap_skill_invocations,
+                AntigravityConnector, ClaudeCodeConnector, CodexConnector, Connector,
+                DevinConnector, GeminiConnector, NormalizedInvocation, QoderConnector,
+                QwenConnector, ScanProgressTick, percent_decode_utf8, unwrap_skill_invocations,
             };
 
             let core_connectors: Vec<Box<dyn Connector>> = vec![
-                Box::new(AiderConnector::new()),
-                Box::new(AmpConnector::new()),
                 Box::new(AntigravityConnector::new()),
                 Box::new(ClaudeCodeConnector::new()),
-                Box::new(ClawdbotConnector::new()),
-                Box::new(ClineConnector::new()),
                 Box::new(CodexConnector::new()),
-                Box::new(ContinueConnector::new()),
-                Box::new(CopilotConnector::new()),
-                Box::new(CopilotCliConnector::new()),
                 Box::new(DevinConnector::new()),
-                Box::new(FactoryConnector::new()),
                 Box::new(GeminiConnector::new()),
-                Box::new(GrokConnector::new()),
-                Box::new(KimiConnector::new()),
-                Box::new(KiroConnector::new()),
-                Box::new(MuseConnector::new()),
-                Box::new(OmpConnector::new()),
-                Box::new(OpenClawConnector::new()),
-                Box::new(OpenHandsConnector::new()),
-                Box::new(PiAgentConnector::new()),
-                Box::new(PiDurableConnector::new()),
-                Box::new(PrimeAgentConnector::new()),
+                Box::new(QoderConnector::new()),
                 Box::new(QwenConnector::new()),
-                Box::new(VibeConnector::new()),
             ];
-            assert_eq!(core_connectors.len(), 25);
+            assert_eq!(core_connectors.len(), 7);
 
             #[cfg(feature = "chatgpt")]
             let _ = crate::ChatGptConnector::new();
-            #[cfg(feature = "codebuff")]
-            let _ = crate::CodebuffConnector::new();
-            #[cfg(feature = "crush")]
-            let _ = crate::CrushConnector::new();
             #[cfg(feature = "cursor")]
             let _ = crate::CursorConnector::new();
-            #[cfg(feature = "goose")]
-            let _ = crate::GooseConnector::new();
-            #[cfg(feature = "grok-bot")]
-            let _ = crate::GrokBotConnector::new();
-            #[cfg(feature = "hermes")]
-            let _ = crate::HermesConnector::new();
             #[cfg(feature = "opencode")]
             let _ = crate::OpenCodeConnector::new();
-            #[cfg(feature = "shelley")]
-            let _ = crate::ShelleyConnector::new();
 
             let tick: ScanProgressTick = std::sync::Arc::new(|| {});
             tick();
 
             assert_eq!(percent_decode_utf8("hello%20world"), "hello world");
             assert_eq!(
-                crate::canonical_connector_slug("openclaw/main"),
-                Some("openclaw")
+                crate::canonical_connector_slug("qoderwork"),
+                Some("qoder")
             );
             assert_eq!(
                 crate::canonical_connector_slug("claude_code"),
@@ -564,12 +530,8 @@ mod conformance {
         use super::*;
 
         fn validate_conversation(conv: &NormalizedConversation, connector_slug: &str) {
-            // agent_slug must match canonical provider identity (OpenClaw qualifies per-agent stores as `openclaw/<agent>`)
             let slug_matches = match connector_slug {
                 "claude" => conv.agent_slug == "claude_code",
-                "openclaw" => {
-                    conv.agent_slug == "openclaw" || conv.agent_slug.starts_with("openclaw/")
-                }
                 _ => conv.agent_slug == connector_slug,
             };
             assert!(
@@ -718,7 +680,6 @@ mod conformance {
             let fixtures: &[(&str, &str)] = &[
                 ("antigravity", "fixtures/antigravity"),
                 ("codex", "fixtures/codex"),
-                ("openhands", "fixtures/openhands"),
             ];
 
             for &(slug, rel) in fixtures {
@@ -822,8 +783,7 @@ mod conformance {
                     "{slug}: scan_with_callback output differed from scan()"
                 );
 
-                let cross_source_connectors: &[&str] =
-                    &["cline", "copilot", "cursor", "opencode", "qwen"];
+                let cross_source_connectors: &[&str] = &["cursor", "opencode", "qwen"];
                 let expected_boundaries = !cross_source_connectors.contains(&slug);
                 assert_eq!(
                     connector.supports_source_boundaries(),
@@ -929,7 +889,6 @@ mod conformance {
             let root = match slug {
                 "antigravity" => manifest.join("fixtures/antigravity"),
                 "codex" => manifest.join("fixtures/codex"),
-                "openhands" => manifest.join("fixtures/openhands"),
                 "claude" => {
                     let r = base.join(".claude/projects");
                     write_fixture_file(
@@ -938,147 +897,11 @@ mod conformance {
                     );
                     r
                 }
-                "cline" => {
-                    let r = base.join("claude-dev");
-                    write_fixture_file(
-                        &r.join("task-001/ui_messages.json"),
-                        "[{\"role\":\"user\",\"content\":\"Hello Cline\",\"timestamp\":1733000000}]",
-                    );
-                    r
-                }
-                "continue" => {
-                    let r = base.join(".continue/sessions");
-                    write_fixture_file(
-                        &r.join("session-1.json"),
-                        "{\"sessionId\":\"session-1\",\"title\":\"Test\",\"workspaceDirectory\":\"/work\",\"history\":[{\"message\":{\"role\":\"user\",\"content\":\"Hello Continue\"}}]}",
-                    );
-                    r
-                }
                 "gemini" => {
                     let r = base.join("gemini");
                     write_fixture_file(
                         &r.join("gemini_project/chats/session-1.json"),
                         "{\"sessionId\":\"s1\",\"projectHash\":\"p1\",\"messages\":[{\"type\":\"user\",\"content\":\"Hello Gemini\",\"timestamp\":\"2025-01-15T10:00:00Z\"}]}",
-                    );
-                    r
-                }
-                "clawdbot" => {
-                    let r = base.join(".clawdbot/sessions");
-                    write_fixture_file(
-                        &r.join("sess-1.jsonl"),
-                        "{\"role\":\"user\",\"content\":\"Hello Clawdbot\",\"timestamp\":\"2026-03-01T00:00:00Z\"}\n",
-                    );
-                    r
-                }
-                "vibe" => {
-                    let r = base.join(".vibe/logs/session");
-                    write_fixture_file(
-                        &r.join("sess-1/messages.jsonl"),
-                        "{\"role\":\"user\",\"content\":\"Hello Vibe\",\"timestamp\":\"2026-03-01T00:00:00Z\"}\n",
-                    );
-                    r
-                }
-                "amp" => {
-                    let r = base.join("sourcegraph.amp");
-                    write_fixture_file(
-                        &r.join("conversation.json"),
-                        "{\"messages\":[{\"role\":\"user\",\"content\":\"Hello Amp\",\"created_at\":1700000000000}]}",
-                    );
-                    r
-                }
-                "aider" => {
-                    let r = base.join("aider-project");
-                    write_fixture_file(
-                        &r.join(".aider.chat.history.md"),
-                        "# aider chat started at 2026-03-01 10:00:00\nMain model: claude-sonnet-4-5 with diff edit format\n\n#### /run cargo test\n\nHi from Aider!\n",
-                    );
-                    r
-                }
-                "pi_agent" => {
-                    let r = base.join(".pi/agent");
-                    write_fixture_file(
-                        &r.join("sessions/2026-10-09T00-00-00_s1.jsonl"),
-                        "{\"type\":\"session\",\"id\":\"0192aa11-0000-7000-8000-000000000001\",\"cwd\":\"/work\",\"version\":3}\n{\"type\":\"message\",\"id\":\"m1\",\"message\":{\"role\":\"user\",\"content\":\"Hello Pi\"}}\n",
-                    );
-                    r
-                }
-                "omp" => {
-                    let r = base.join(".omp/agent");
-                    write_fixture_file(
-                        &r.join("sessions/2026-10-09T00-00-00_s1.jsonl"),
-                        "{\"type\":\"session\",\"id\":\"0192aa11-0000-7000-8000-000000000001\",\"cwd\":\"/work\",\"version\":3}\n{\"type\":\"message\",\"id\":\"m1\",\"message\":{\"role\":\"user\",\"content\":\"Hello OMP\"}}\n",
-                    );
-                    r
-                }
-                "pi_durable" => {
-                    let r = base.join("durable");
-                    write_fixture_file(
-                        &r.join("main.jsonl"),
-                        "{\"format\":1,\"type\":\"commit\",\"seq\":1,\"writes\":[{\"type\":\"conversation\",\"value\":{\"id\":1}},{\"type\":\"entry\",\"value\":{\"id\":2,\"conversationId\":1,\"kind\":\"pi.user\",\"model\":[{\"role\":\"user\",\"content\":\"Hello Pi Durable\"}]}}]}\n",
-                    );
-                    r
-                }
-                "prime_agent" => {
-                    let r = base.join(".prime/agent/sessions");
-                    write_fixture_file(
-                        &r.join("0192aa11-0000-7000-8000-000000000001.jsonl"),
-                        "{\"type\":\"session\",\"id\":\"0192aa11-0000-7000-8000-000000000001\",\"cwd\":\"/work\",\"version\":3}\n{\"type\":\"message\",\"id\":\"a1b2c3d4\",\"parentId\":null,\"timestamp\":\"2026-10-09T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"Hello Prime\"}}\n",
-                    );
-                    r
-                }
-                "factory" => {
-                    let r = base.join(".factory/sessions");
-                    write_fixture_file(
-                        &r.join("-work-demo/sess-1.jsonl"),
-                        "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-10-09T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Hello Factory\"}}\n",
-                    );
-                    r
-                }
-                "kimi" => {
-                    let r = base.join(".kimi-code/sessions");
-                    write_fixture_file(
-                        &r.join("workdir/sess-1/agents/main/wire.jsonl"),
-                        "{\"type\":\"turn.prompt\",\"time\":\"2026-10-09T00:00:00Z\",\"input\":\"Hello Kimi\"}\n{\"type\":\"llm.request\",\"time\":\"2026-10-09T00:00:01Z\",\"model\":\"kimi-k2-0711-preview\"}\n{\"type\":\"context.append_loop_event\",\"time\":\"2026-10-09T00:00:02Z\",\"event\":{\"type\":\"tool.call\",\"toolCallId\":\"tc1\",\"name\":\"load_skill\",\"args\":{\"name\":\"debugging\"}}}\n{\"type\":\"context.append_loop_event\",\"time\":\"2026-10-09T00:00:03Z\",\"event\":{\"type\":\"content.part\",\"part\":{\"type\":\"text\",\"text\":\"Hi from Kimi\"}}}\n{\"type\":\"usage.record\",\"time\":\"2026-10-09T00:00:04Z\",\"usage\":{\"input_tokens\":100,\"output_tokens\":25}}\n",
-                    );
-                    r
-                }
-                "kiro" => {
-                    let r = base.join(".kiro/sessions/cli");
-                    write_fixture_file(
-                        &r.join("session.jsonl"),
-                        "{\"kind\":\"Prompt\",\"data\":{\"content\":\"Hello Kiro\"}}\n",
-                    );
-                    r
-                }
-                "muse" => {
-                    let r = base.join(".local/share/muse/sessions");
-                    write_fixture_file(
-                        &r.join("019cccd3-9f97-7351-824f-6b1eb5f199f2/session.jsonl"),
-                        "{\"schema_version\":\"v1\",\"stream_id\":\"019cccd3-9f97-7351-824f-6b1eb5f199f2\",\"seq\":1,\"recorded_at_ms\":1772962994000,\"payload_type\":\"runtime.session\",\"payload\":{\"kind\":\"run\",\"event\":{\"kind\":\"started\",\"prompt\":\"Hello Muse\"}}}\n",
-                    );
-                    r
-                }
-                "openclaw" => {
-                    let r = base.join(".openclaw/agents/main/sessions");
-                    write_fixture_file(
-                        &r.join("sess-1.jsonl"),
-                        "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-10-09T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Hello OpenClaw\"}}\n{\"type\":\"message\",\"id\":\"m2\",\"timestamp\":\"2026-10-09T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-4-6\",\"content\":[{\"type\":\"text\",\"text\":\"Hi from OpenClaw\"},{\"type\":\"toolCall\",\"id\":\"tc1\",\"name\":\"exec\",\"arguments\":{\"cmd\":\"ls\"}},{\"type\":\"toolCall\",\"id\":\"tc2\",\"name\":\"load_skill\",\"arguments\":{\"name\":\"deploy\"}}],\"usage\":{\"input\":180,\"output\":60,\"cacheRead\":30,\"cacheWrite\":10}}}\n",
-                    );
-                    r
-                }
-                "copilot" => {
-                    let r = base.join(".config");
-                    write_fixture_file(
-                        &r.join("Code/User/globalStorage/github.copilot-chat/conversations.json"),
-                        "[{\"id\":\"conv-1\",\"workspaceFolder\":\"/work\",\"turns\":[{\"request\":{\"message\":\"Hello Copilot\",\"timestamp\":1700000000000},\"response\":{\"message\":\"Hi\",\"timestamp\":1700000001000}}]}]",
-                    );
-                    r
-                }
-                "copilot_cli" => {
-                    let r = base.join(".copilot/session-state");
-                    write_fixture_file(
-                        &r.join("abc-123/events.jsonl"),
-                        "{\"type\":\"sessionStart\",\"session_id\":\"abc-123\",\"timestamp\":1700000000000,\"cwd\":\"/work\"}\n{\"type\":\"user.message\",\"role\":\"user\",\"content\":\"Hello Copilot CLI\",\"timestamp\":1700000001000}\n",
                     );
                     r
                 }
@@ -1098,51 +921,11 @@ mod conformance {
                     );
                     r
                 }
-                "grok" => {
-                    let r = base.join(".grok/sessions");
-                    write_fixture_file(
-                        &r.join("group-1/sess-1/updates.jsonl"),
-                        "{\"timestamp\":\"2026-10-09T00:00:00Z\",\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Hello Grok\"}}}\n",
-                    );
-                    r
-                }
-                "codebuff" => {
-                    let r = base.join(".config/manicode/projects");
-                    write_fixture_file(
-                        &r.join("demo/chats/2026-10-09T00-00-00.000Z/chat-messages.json"),
-                        "[{\"id\":\"user-1700000000000\",\"variant\":\"user\",\"content\":\"Hello Codebuff\",\"timestamp\":\"2026-10-09T00:00:00.000Z\"}]",
-                    );
-                    r
-                }
                 "chatgpt" => {
                     let r = base.join("com.openai.chat");
                     write_fixture_file(
                         &r.join("conversations-v1/conv-1.json"),
                         "{\"id\":\"conv-1\",\"title\":\"ChatGPT\",\"mapping\":{\"u1\":{\"parent\":null,\"message\":{\"author\":{\"role\":\"user\"},\"content\":{\"parts\":[\"Hello ChatGPT\"]},\"create_time\":1700000000.0}}}}",
-                    );
-                    r
-                }
-                "grok_bot" => {
-                    let r = base.join("grok_bot");
-                    let key = "sand.client.slice.account.auth0%7Cuser_00000000000000000000000000.transcript.replicas.81da155f-cc4c-58b3-aadf-770858d5e55c";
-                    let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
-                    let bits: Vec<bool> = key
-                        .bytes()
-                        .flat_map(|byte| (0..8).rev().map(move |bit| byte & (1 << bit) != 0))
-                        .collect();
-                    let encoded: String = bits
-                        .chunks(5)
-                        .map(|chunk| {
-                            let val = chunk
-                                .iter()
-                                .fold(0_usize, |v, bit| (v << 1) | usize::from(*bit))
-                                << (5 - chunk.len());
-                            char::from(alphabet[val])
-                        })
-                        .collect();
-                    write_fixture_file(
-                        &r.join(format!("{encoded}.blob")),
-                        include_str!("../../tests/fixtures/grok_bot_reporter_0440.json"),
                     );
                     r
                 }
@@ -1159,14 +942,6 @@ mod conformance {
                     write_fixture_file(
                         &r.join("part/msg-001/part-001.json"),
                         "{\"id\":\"part-001\",\"messageID\":\"msg-001\",\"type\":\"text\",\"text\":\"Hello OpenCode\"}",
-                    );
-                    r
-                }
-                "goose" => {
-                    let r = base.join(".goose");
-                    write_fixture_file(
-                        &r.join("sessions/session1.jsonl"),
-                        "{\"role\":\"user\",\"content\":\"Hello Goose\",\"created_at\":1700000000}\n",
                     );
                     r
                 }
@@ -1210,55 +985,6 @@ mod conformance {
                          INSERT INTO cursorDiskKV VALUES ('composerData:c1', '{\"text\":\"Hello Cursor\"}');",
                     )
                     .expect("populate Cursor db");
-                    db_path
-                }
-                #[cfg(feature = "crush")]
-                "crush" => {
-                    let db_path = base.join("crush.db");
-                    let conn = crate::connectors::sqlite_sync::Connection::open(
-                        db_path.to_string_lossy().as_ref(),
-                    )
-                    .expect("open Crush db");
-                    conn.execute_batch(
-                        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, cost REAL);
-                         CREATE TABLE messages (session_id TEXT, role TEXT, parts TEXT, created_at INTEGER, model TEXT, provider TEXT);
-                         INSERT INTO sessions VALUES ('s1', 'Crush', 1, 2, 0.01);
-                         INSERT INTO messages VALUES ('s1', 'user', '[{\"type\":\"text\",\"text\":\"Hello Crush\"}]', 1733000000000, 'm', 'p');",
-                    )
-                    .expect("populate Crush db");
-                    db_path
-                }
-                #[cfg(feature = "hermes")]
-                "hermes" => {
-                    let db_path = base.join("state.db");
-                    let conn = crate::connectors::sqlite_sync::Connection::open(
-                        db_path.to_string_lossy().as_ref(),
-                    )
-                    .expect("open Hermes db");
-                    conn.execute_batch(
-                        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model TEXT, title TEXT, parent_session_id TEXT, started_at REAL, ended_at REAL, end_reason TEXT, message_count INTEGER, tool_call_count INTEGER, input_tokens INTEGER, output_tokens INTEGER);
-                         CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, tool_calls TEXT, tool_name TEXT, tool_call_id TEXT, reasoning TEXT, timestamp REAL);
-                         INSERT INTO sessions VALUES ('s1', 'cli', 'm', 'Hermes', NULL, 1700000000.0, 1700000010.0, 'completed', 1, 0, 10, 5);
-                         INSERT INTO messages VALUES ('s1', 'user', 'Hello Hermes', NULL, NULL, NULL, NULL, 1700000001.0);",
-                    )
-                    .expect("populate Hermes db");
-                    base.to_path_buf()
-                }
-                #[cfg(feature = "shelley")]
-                "shelley" => {
-                    let db_path = base.join("shelley.db");
-                    let conn = crate::connectors::sqlite_sync::Connection::open(
-                        db_path.to_string_lossy().as_ref(),
-                    )
-                    .expect("open Shelley db");
-                    conn.execute_batch(
-                        "CREATE TABLE migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, migration_number INTEGER NOT NULL, migration_name TEXT NOT NULL UNIQUE, executed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
-                         CREATE TABLE conversations (conversation_id TEXT PRIMARY KEY, slug TEXT, user_initiated BOOLEAN NOT NULL DEFAULT TRUE, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, cwd TEXT, archived BOOLEAN NOT NULL DEFAULT FALSE, parent_conversation_id TEXT, model TEXT, conversation_options TEXT NOT NULL DEFAULT '{}', current_generation INTEGER NOT NULL DEFAULT 0, tags TEXT NOT NULL DEFAULT '[]', is_draft BOOLEAN NOT NULL DEFAULT FALSE, draft TEXT NOT NULL DEFAULT '', queued_messages TEXT NOT NULL DEFAULT '[]');
-                         CREATE TABLE messages (message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL, type TEXT NOT NULL, llm_data TEXT, user_data TEXT, usage_data TEXT, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, display_data TEXT, excluded_from_context BOOLEAN NOT NULL DEFAULT FALSE, generation INTEGER NOT NULL DEFAULT 0, llm_api_url TEXT, model_name TEXT, forked_from_message_id TEXT, user_email TEXT, other_usage_data TEXT);
-                         INSERT INTO conversations (conversation_id, slug, user_initiated, created_at, updated_at, cwd) VALUES ('c1', 'shelley-test', 1, '2026-08-01 10:00:00', '2026-08-01 11:00:00', '/work');
-                         INSERT INTO messages (message_id, conversation_id, sequence_id, type, llm_data, created_at) VALUES ('m1', 'c1', 0, 'user', '{\"Role\":0,\"Content\":[{\"Type\":2,\"Text\":\"Hello Shelley\"}]}', '2026-08-01 10:30:00');",
-                    )
-                    .expect("populate Shelley db");
                     db_path
                 }
                 other => panic!("no schema conformance fixture defined for connector {other}"), // ubs:ignore[rust.ownership.panic-macro] — Fail fast if a new connector factory is added without a schema conformance fixture.
@@ -1403,8 +1129,7 @@ mod conformance {
                     "{slug}: scan_with_callback output differed from scan()"
                 );
 
-                let cross_source_connectors: &[&str] =
-                    &["cline", "copilot", "cursor", "opencode", "qwen"];
+                let cross_source_connectors: &[&str] = &["cursor", "opencode", "qwen"];
                 let expected_boundaries = !cross_source_connectors.contains(&slug);
                 assert_eq!(
                     connector.supports_source_boundaries(),
@@ -1531,7 +1256,7 @@ mod conformance {
                             r.with_agent_rewrite(
                                 orig_ws,
                                 "/wrong-agent-workspace",
-                                vec!["windsurf".to_string()],
+                                vec![if slug == "codex" { "claude" } else { "codex" }.to_string()],
                             )
                             .with_agent_rewrite(
                                 orig_ws,
@@ -1594,144 +1319,6 @@ mod conformance {
             }
         }
 
-        #[test]
-        fn openclaw_qualified_slug_and_kimi_aider_end_to_end_token_and_invocation_conformance() {
-            use crate::connectors::Connector;
-            let tmp = TempDir::new().expect("tempdir");
-
-            // 1. OpenClaw multi-agent store (`conv.agent_slug == "openclaw/main"`)
-            let openclaw_ctx =
-                build_connector_fixture_context("openclaw", tmp.path()).expect("openclaw ctx");
-            let openclaw_convs = crate::connectors::openclaw::OpenClawConnector::new()
-                .scan(&openclaw_ctx)
-                .expect("scan openclaw");
-            assert_eq!(openclaw_convs.len(), 1);
-            let oc_conv = &openclaw_convs[0];
-            assert_eq!(oc_conv.agent_slug, "openclaw/main");
-            assert_eq!(oc_conv.messages.len(), 2);
-            let oc_asst = &oc_conv.messages[1];
-            assert_eq!(oc_asst.invocations.len(), 2);
-            assert_eq!(oc_asst.invocations[0].kind, "tool");
-            assert_eq!(oc_asst.invocations[0].name, "exec");
-            assert_eq!(oc_asst.invocations[1].kind, "skill");
-            assert_eq!(oc_asst.invocations[1].name, "deploy");
-            assert_eq!(
-                oc_asst.invocations[1].raw_name.as_deref(),
-                Some("load_skill")
-            );
-            let oc_usage = crate::connectors::extract_tokens_for_agent(
-                &oc_conv.agent_slug,
-                &oc_asst.extra,
-                &oc_asst.content,
-                &oc_asst.role,
-            );
-            assert_eq!(
-                oc_usage.data_source,
-                crate::connectors::TokenDataSource::Api
-            );
-            assert_eq!(oc_usage.model_name.as_deref(), Some("claude-opus-4-6"));
-            assert_eq!(oc_usage.provider.as_deref(), Some("anthropic"));
-            assert_eq!(oc_usage.input_tokens, Some(180));
-            assert_eq!(oc_usage.output_tokens, Some(60));
-            assert_eq!(oc_usage.cache_read_tokens, Some(30));
-            assert_eq!(oc_usage.cache_creation_tokens, Some(10));
-            assert!(oc_usage.has_tool_calls);
-            assert_eq!(oc_usage.tool_call_count, 2);
-
-            // 2. Kimi Code (`conv.agent_slug == "kimi"`)
-            let kimi_ctx = build_connector_fixture_context("kimi", tmp.path()).expect("kimi ctx");
-            let kimi_convs = crate::connectors::kimi::KimiConnector::new()
-                .scan(&kimi_ctx)
-                .expect("scan kimi");
-            assert_eq!(kimi_convs.len(), 1);
-            let kimi_conv = &kimi_convs[0];
-            assert_eq!(kimi_conv.messages.len(), 3);
-            let kimi_tool_msg = &kimi_conv.messages[1];
-            assert_eq!(kimi_tool_msg.invocations.len(), 1);
-            assert_eq!(kimi_tool_msg.invocations[0].kind, "skill");
-            assert_eq!(kimi_tool_msg.invocations[0].name, "debugging");
-            assert_eq!(
-                kimi_tool_msg.invocations[0].raw_name.as_deref(),
-                Some("load_skill")
-            );
-            let kimi_tool_usage = crate::connectors::extract_tokens_for_agent(
-                &kimi_conv.agent_slug,
-                &kimi_tool_msg.extra,
-                &kimi_tool_msg.content,
-                &kimi_tool_msg.role,
-            );
-            assert_eq!(
-                kimi_tool_usage.model_name.as_deref(),
-                Some("kimi-k2-0711-preview")
-            );
-            assert_eq!(kimi_tool_usage.provider.as_deref(), Some("moonshot"));
-            assert!(kimi_tool_usage.has_tool_calls);
-            assert_eq!(kimi_tool_usage.tool_call_count, 1);
-
-            let kimi_reply_msg = &kimi_conv.messages[2];
-            let kimi_reply_usage = crate::connectors::extract_tokens_for_agent(
-                &kimi_conv.agent_slug,
-                &kimi_reply_msg.extra,
-                &kimi_reply_msg.content,
-                &kimi_reply_msg.role,
-            );
-            assert_eq!(
-                kimi_reply_usage.data_source,
-                crate::connectors::TokenDataSource::Api
-            );
-            assert_eq!(
-                kimi_reply_usage.model_name.as_deref(),
-                Some("kimi-k2-0711-preview")
-            );
-            assert_eq!(kimi_reply_usage.provider.as_deref(), Some("moonshot"));
-            assert_eq!(kimi_reply_usage.input_tokens, Some(100));
-            assert_eq!(kimi_reply_usage.output_tokens, Some(25));
-
-            // 3. Aider (`conv.agent_slug == "aider"`)
-            let aider_ctx =
-                build_connector_fixture_context("aider", tmp.path()).expect("aider ctx");
-            let aider_convs = crate::connectors::aider::AiderConnector::new()
-                .scan(&aider_ctx)
-                .expect("scan aider");
-            assert_eq!(aider_convs.len(), 1);
-            let aider_conv = &aider_convs[0];
-            let aider_user_msg = aider_conv
-                .messages
-                .iter()
-                .find(|m| m.role == "user")
-                .expect("aider user message");
-            assert_eq!(aider_user_msg.invocations.len(), 1);
-            assert_eq!(aider_user_msg.invocations[0].name, "run");
-            assert_eq!(
-                aider_user_msg.invocations[0].raw_name.as_deref(),
-                Some("/run")
-            );
-            let aider_user_usage = crate::connectors::extract_tokens_for_agent(
-                &aider_conv.agent_slug,
-                &aider_user_msg.extra,
-                &aider_user_msg.content,
-                &aider_user_msg.role,
-            );
-            assert!(aider_user_usage.has_tool_calls);
-            assert_eq!(aider_user_usage.tool_call_count, 1);
-
-            let aider_asst_msg = aider_conv
-                .messages
-                .iter()
-                .find(|m| m.role == "assistant")
-                .expect("aider assistant message");
-            let aider_asst_usage = crate::connectors::extract_tokens_for_agent(
-                &aider_conv.agent_slug,
-                &aider_asst_msg.extra,
-                &aider_asst_msg.content,
-                &aider_asst_msg.role,
-            );
-            assert_eq!(
-                aider_asst_usage.model_name.as_deref(),
-                Some("claude-sonnet-4-5")
-            );
-            assert_eq!(aider_asst_usage.provider.as_deref(), Some("anthropic"));
-        }
     }
 
     // =========================================================================
@@ -1797,7 +1384,7 @@ mod conformance {
             let tmp = TempDir::new().expect("create temp dir");
 
             // Create multiple connectors
-            let connectors = ["aider", "amp", "claude", "codex", "gemini"];
+            let connectors = ["antigravity", "claude", "codex", "gemini", "qwen"];
             for conn in &connectors {
                 let root = tmp.path().join(conn);
                 fs::create_dir_all(&root).expect("create dir");
@@ -2142,38 +1729,6 @@ mod conformance {
         fn mirror_cases() -> Vec<MirrorCase> {
             vec![
                 MirrorCase {
-                    detect_slug: "kiro",
-                    factory_slug: "kiro",
-                    tilde_source: "~/.kiro/sessions/cli",
-                    leaf_dir: "cli",
-                    rel_file: "a1b2c3d4-0000-0000-0000-000000000001.jsonl",
-                    payload: "{\"kind\":\"Prompt\",\"data\":{\"content\":\"hello kiro\"},\"timestamp\":\"2026-03-01T00:00:00Z\"}\n",
-                },
-                MirrorCase {
-                    detect_slug: "pi_agent",
-                    factory_slug: "pi_agent",
-                    tilde_source: "~/.pi/agent/sessions",
-                    leaf_dir: "sessions",
-                    rel_file: "--work--/2026-03-01_s1.jsonl",
-                    payload: "{\"type\":\"session\",\"id\":\"pi-s1\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"cwd\":\"/work\"}\n{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-03-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hello pi\"}}\n",
-                },
-                MirrorCase {
-                    detect_slug: "omp",
-                    factory_slug: "omp",
-                    tilde_source: "~/.omp/agent/sessions",
-                    leaf_dir: "sessions",
-                    rel_file: "--work--/2026-03-01_s1.jsonl",
-                    payload: "{\"type\":\"session\",\"id\":\"omp-s1\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"cwd\":\"/work\"}\n{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-03-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hello omp\"}}\n",
-                },
-                MirrorCase {
-                    detect_slug: "kimi",
-                    factory_slug: "kimi",
-                    tilde_source: "~/.kimi/sessions",
-                    leaf_dir: "sessions",
-                    rel_file: "wkey/sess1/wire.jsonl",
-                    payload: "{\"type\":\"metadata\",\"protocol_version\":\"1.3\"}\n{\"timestamp\":1770000000.0,\"message\":{\"type\":\"TurnBegin\",\"payload\":{\"role\":\"human\",\"content\":\"hello kimi\"}}}\n",
-                },
-                MirrorCase {
                     detect_slug: "qoder",
                     factory_slug: "qoder",
                     tilde_source: "~/.qoder/projects",
@@ -2190,30 +1745,6 @@ mod conformance {
                     payload: "{\"uuid\":\"u1\",\"parentUuid\":null,\"sessionId\":\"0123456789abcdef0123456789abcdef\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"parts\":[{\"text\":\"hello qwen\"}]}}\n",
                 },
                 MirrorCase {
-                    detect_slug: "grok",
-                    factory_slug: "grok",
-                    tilde_source: "~/.grok/sessions",
-                    leaf_dir: "sessions",
-                    rel_file: "%2Fwork/sess1/updates.jsonl",
-                    payload: "{\"timestamp\":1784388059,\"method\":\"_x.ai/session/update\",\"params\":{\"sessionId\":\"sess1\",\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"hello grok\"}}}}\n",
-                },
-                MirrorCase {
-                    detect_slug: "muse",
-                    factory_slug: "muse",
-                    tilde_source: "~/.local/share/muse/sessions",
-                    leaf_dir: "sessions",
-                    rel_file: "2026/03/01/sess1/session.jsonl",
-                    payload: "{\"schema_version\":1,\"id\":\"705d0e90-0000-0000-0000-000000000001\",\"stream\":{\"kind\":\"session\",\"id\":\"sess1\"},\"sequence\":1,\"recorded_at\":1785972468194395,\"record_type\":\"event\",\"durability\":\"durable\",\"causation_id\":null,\"payload_type\":\"runtime.session\",\"payload\":{\"kind\":\"run\",\"event\":{\"kind\":\"started\",\"prompt\":\"hello muse\"}}}\n",
-                },
-                MirrorCase {
-                    detect_slug: "continue",
-                    factory_slug: "continue",
-                    tilde_source: "~/.continue/sessions",
-                    leaf_dir: "sessions",
-                    rel_file: "sess1.json",
-                    payload: "{\"sessionId\":\"sess1\",\"title\":\"Continue\",\"workspaceDirectory\":\"/work\",\"history\":[{\"message\":{\"role\":\"user\",\"content\":\"hello continue\"}}]}\n",
-                },
-                MirrorCase {
                     detect_slug: "claude",
                     factory_slug: "claude",
                     tilde_source: "~/.claude/projects",
@@ -2228,22 +1759,6 @@ mod conformance {
                     leaf_dir: "sessions",
                     rel_file: "2026/03/01/rollout-2026-03-01T00-00-00-sess1.jsonl",
                     payload: "{\"timestamp\":\"2026-03-01T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello codex\"}}\n",
-                },
-                MirrorCase {
-                    detect_slug: "prime_agent",
-                    factory_slug: "prime_agent",
-                    tilde_source: "~/.prime/agent/sessions",
-                    leaf_dir: "sessions",
-                    rel_file: "proj/sess1.jsonl",
-                    payload: "{\"type\":\"session\",\"id\":\"prime-s1\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"cwd\":\"/work\"}\n{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-03-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hello prime\"}}\n",
-                },
-                MirrorCase {
-                    detect_slug: "factory",
-                    factory_slug: "factory",
-                    tilde_source: "~/.factory/sessions",
-                    leaf_dir: "sessions",
-                    rel_file: "proj/sess1.jsonl",
-                    payload: "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello factory\"}]}}\n",
                 },
             ]
         }

@@ -22,31 +22,14 @@ pub(super) fn resolve(container: &Path, source: &str, store: &[&str]) -> Option<
     }
 
     // Recognize a complete owned store before shorter ancestor suffixes.
-    // A project named `.factory` below `.factory/sessions` is still a
+    // A project named `.codex` below `.codex/sessions` is still a
     // selected project, not a new application root needing `sessions/`.
     // Structural connectors use their own subtree/identity handling.
     let strict_layout = matches!(
         store,
-        [
-            ".factory"
-                | ".kimi-code"
-                | ".kimi"
-                | ".grok"
-                | ".continue"
-                | ".codex"
-                | ".clawdbot"
-                | ".goose",
-            "sessions",
-        ] | [".prime" | ".pi" | ".omp", "agent", "sessions"]
-            | [".local", "share", "omp" | "muse" | "goose", "sessions"]
+        [".codex", "sessions"]
             | [".qwen" | ".claude" | ".qoder", "projects"]
             | [".qwen", "tmp"]
-            | [".kiro", "sessions", "cli"]
-            | [".openhands" | ".openhands-state", "conversations"]
-            | [".copilot", "session-state" | "history-session-state"]
-            | [".config", "gh-copilot"]
-            | [".config", "gh", "copilot"]
-            | [".local", "share", "github-copilot"]
             | [".gemini", "antigravity" | "antigravity-cli", "brain"]
     );
     let matched = if strict_layout
@@ -121,14 +104,8 @@ mod tests {
     #[test]
     fn qualified_subtrees_remain_narrow_for_strict_layout_providers() {
         for (source, store) in [
-            (
-                "~/.factory/sessions/project-a",
-                &[".factory", "sessions"][..],
-            ),
-            (
-                "~/.prime/agent/sessions/project-a",
-                &[".prime", "agent", "sessions"][..],
-            ),
+            ("~/.codex/sessions/project-a", &[".codex", "sessions"][..]),
+            ("~/.qoder/projects/project-a", &[".qoder", "projects"][..]),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let container = temp.path().join("opaque_hash");
@@ -153,34 +130,25 @@ mod tests {
             )
             .is_none()
         );
-        fs::create_dir_all(temp.path().join("run-a")).unwrap();
-        assert!(
-            resolve(
-                temp.path(),
-                "~/.vibe/logs/session/run-a",
-                &[".vibe", "logs", "session"]
-            )
-            .is_none()
-        );
     }
 
     #[test]
     fn ancestors_and_contents_copies_keep_the_existing_contract() {
         let temp = tempfile::tempdir().unwrap();
         let container = temp.path().join("opaque_hash");
-        fs::create_dir_all(container.join("logs/session")).unwrap();
-        let store = [".vibe", "logs", "session"];
+        fs::create_dir_all(container.join("qoder/projects")).unwrap();
+        let store = [".qoder", "projects"];
         assert_eq!(
-            resolve(&container, "~/.vibe/logs", &store),
-            Some(container.join("logs/session"))
+            resolve(&container, "~/.qoder", &store),
+            Some(container.join("qoder/projects"))
         );
         let contents = temp.path().join("contents_hash");
-        fs::create_dir_all(contents.join("session")).unwrap();
+        fs::create_dir_all(contents.join("projects")).unwrap();
         assert_eq!(
-            resolve(&contents, "~/.vibe/logs/", &store),
-            Some(contents.join("session"))
+            resolve(&contents, "~/.qoder/", &store),
+            Some(contents.join("projects"))
         );
-        assert!(resolve(&contents, "~/.vibe/logs", &store).is_none());
+        assert!(resolve(&contents, "~/.qoder", &store).is_none());
     }
 
     #[test]
@@ -188,22 +156,22 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("project")).unwrap();
         for source in [
-            "~/.pi/agent/sessions/project",
-            "~/.omp/agent/sessions/project",
-            "~/.prime-backup/agent/sessions/project",
-            "~/.prime/agent/sessions-extra/project",
-            "~/.prime/agent/sessions/../project",
-            "~/.prime/agent/sessions/./project",
-            "~/.prime/agent/sessions/\nproject",
-            "~/sessions/project",
+            "~/.claude/projects/project",
+            "~/.qwen/projects/project",
+            "~/.qoder-backup/projects/project",
+            "~/.qoder/projects-extra/project",
+            "~/.qoder/projects/../project",
+            "~/.qoder/projects/./project",
+            "~/.qoder/projects/\nproject",
+            "~/projects/project",
         ] {
             assert!(
-                resolve(temp.path(), source, &[".prime", "agent", "sessions"]).is_none(),
+                resolve(temp.path(), source, &[".qoder", "projects"]).is_none(),
                 "{source}"
             );
         }
-        for store in [&[][..], &[".prime", "../project"][..], &["/project"][..]] {
-            assert!(resolve(temp.path(), "~/.prime/project", store).is_none());
+        for store in [&[][..], &[".qoder", "../project"][..], &["/project"][..]] {
+            assert!(resolve(temp.path(), "~/.qoder/project", store).is_none());
         }
     }
 
@@ -217,21 +185,22 @@ mod tests {
         fs::create_dir_all(real.join("sessions")).unwrap();
         let linked = temp.path().join("linked");
         symlink(&real, &linked).unwrap();
-        let store = [".factory", "sessions"];
-        assert!(resolve(&linked, "~/.factory/sessions", &store).is_none());
-        assert!(resolve(&linked, "~/.factory/sessions/", &store).is_none());
+        let store = [".codex", "sessions"];
+        assert!(resolve(&linked, "~/.codex/sessions", &store).is_none());
+        assert!(resolve(&linked, "~/.codex/sessions/", &store).is_none());
         let alias = temp.path().join("alias");
         fs::create_dir_all(alias.join("owned")).unwrap();
         symlink(alias.join("owned"), alias.join("sessions")).unwrap();
-        assert!(resolve(&alias, "~/.factory/sessions", &store).is_none());
+        assert!(resolve(&alias, "~/.codex/sessions", &store).is_none());
         let parent_path = real.join("sessions/..");
-        assert!(resolve(&parent_path, "~/.factory/sessions", &store).is_none());
+        assert!(resolve(&parent_path, "~/.codex/sessions", &store).is_none());
     }
+
     #[test]
     fn owned_projects_named_like_application_roots_remain_projects() {
         for store in [
-            &[".factory", "sessions"][..],
-            &[".prime", "agent", "sessions"][..],
+            &[".codex", "sessions"][..],
+            &[".qoder", "projects"][..],
         ] {
             for (slash, retained) in [(false, true), (true, true), (true, false)] {
                 let temp = tempfile::tempdir().unwrap();
@@ -262,10 +231,10 @@ mod tests {
     #[test]
     fn contents_copy_fallback_requires_an_absent_leaf_for_every_provider() {
         for store in [
-            &[".factory", "sessions"][..],
-            &[".prime", "agent", "sessions"][..],
+            &[".codex", "sessions"][..],
+            &[".qoder", "projects"][..],
             &[".gemini", "tmp"][..],
-            &[".vibe", "logs", "session"][..],
+            &[".claude", "projects"][..],
             &["Cursor", "User"][..],
         ] {
             let temp = tempfile::tempdir().unwrap();
@@ -287,10 +256,10 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         for store in [
-            &[".factory", "sessions"][..],
-            &[".prime", "agent", "sessions"][..],
+            &[".codex", "sessions"][..],
+            &[".qoder", "projects"][..],
             &[".gemini", "tmp"][..],
-            &[".vibe", "logs", "session"][..],
+            &[".claude", "projects"][..],
             &["Cursor", "User"][..],
         ] {
             for target_exists in [false, true] {

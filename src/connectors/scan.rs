@@ -524,16 +524,10 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn remote_mirrors_discover_and_scan_provider_stores() {
-        #[cfg(feature = "codebuff")]
-        use crate::connectors::codebuff::CodebuffConnector;
-        #[cfg(feature = "goose")]
-        use crate::connectors::goose::GooseConnector;
         use crate::connectors::{
-            Connector, amp::AmpConnector, antigravity::AntigravityConnector,
-            clawdbot::ClawdbotConnector, cline::ClineConnector, copilot::CopilotConnector,
-            copilot_cli::CopilotCliConnector, factory::FactoryConnector, gemini::GeminiConnector,
-            openclaw::OpenClawConnector, openhands::OpenHandsConnector,
-            prime_agent::PrimeAgentConnector, vibe::VibeConnector,
+            Connector, antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
+            codex::CodexConnector, gemini::GeminiConnector, qoder::QoderConnector,
+            qwen::QwenConnector,
         };
         struct MirrorCase {
             slug: &'static str,
@@ -544,15 +538,18 @@ mod tests {
         }
         let cases = vec![
             MirrorCase {
-                slug: "factory",
-                store: ".factory/sessions",
-                relative: "project/session.jsonl",
-                content: concat!(
-                    r#"{"type":"session_start","id":"factory-test","cwd":"/work/project"}"#,
-                    "\n",
-                    r#"{"type":"message","timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"Hello"}}"#
-                ),
-                connector: Box::new(FactoryConnector::new()),
+                slug: "claude_code",
+                store: ".claude/projects",
+                relative: "proj/sess-1.jsonl",
+                content: r#"{"type":"user","timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"Hello"}}"#,
+                connector: Box::new(ClaudeCodeConnector::new()),
+            },
+            MirrorCase {
+                slug: "codex",
+                store: ".codex/sessions",
+                relative: "2026/01/05/rollout-2026-01-05T10-00-00-sess-1.jsonl",
+                content: r#"{"timestamp":"2026-01-05T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Hello"}}"#,
+                connector: Box::new(CodexConnector::new()),
             },
             MirrorCase {
                 slug: "gemini",
@@ -562,68 +559,6 @@ mod tests {
                 connector: Box::new(GeminiConnector::new()),
             },
             MirrorCase {
-                slug: "vibe",
-                store: ".vibe/logs/session",
-                relative: "session-test/messages.jsonl",
-                content: r#"{"role":"user","content":"Hello","timestamp":"2026-01-05T10:00:01Z"}"#,
-                connector: Box::new(VibeConnector::new()),
-            },
-            MirrorCase {
-                slug: "prime_agent",
-                store: ".prime/agent/sessions",
-                relative: "session.jsonl",
-                content: concat!(
-                    r#"{"type":"session","version":3,"id":"prime-test","timestamp":"2026-01-05T10:00:00Z","cwd":"/work/project"}"#,
-                    "\n",
-                    r#"{"type":"message","id":"aaaa0001","parentId":null,"timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"Hello"}}"#
-                ),
-                connector: Box::new(PrimeAgentConnector::new()),
-            },
-            MirrorCase {
-                slug: "clawdbot",
-                store: ".clawdbot/sessions",
-                relative: "session.jsonl",
-                content: r#"{"role":"user","content":"Hello","timestamp":"2026-01-05T10:00:01Z"}"#,
-                connector: Box::new(ClawdbotConnector::new()),
-            },
-            MirrorCase {
-                slug: "openclaw",
-                store: ".openclaw/agents",
-                relative: "openclaw/sessions/session.jsonl",
-                content: r#"{"type":"message","id":"m1","timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"Hello"}}"#,
-                connector: Box::new(OpenClawConnector::new()),
-            },
-            MirrorCase {
-                slug: "openhands",
-                store: ".openhands/conversations",
-                relative: "conv-1/events/event-00000-1.json",
-                content: r#"{"kind":"MessageEvent","source":"user","timestamp":"2026-01-05T10:00:01Z","llm_message":{"role":"user","content":[{"type":"text","text":"Hello"}]}}"#,
-                connector: Box::new(OpenHandsConnector::new()),
-            },
-            MirrorCase {
-                slug: "copilot_cli",
-                store: ".copilot/session-state",
-                relative: "sess-1/events.jsonl",
-                content: r#"{"type":"user.message","id":"e1","timestamp":"2026-01-05T10:00:01Z","data":{"content":"Hello"}}"#,
-                connector: Box::new(CopilotCliConnector::new()),
-            },
-            #[cfg(feature = "goose")]
-            MirrorCase {
-                slug: "goose",
-                store: ".local/share/goose/sessions",
-                relative: "sess.jsonl",
-                content: r#"{"role":"user","content":[{"type":"text","text":"Hello"}],"created_at":1700000000}"#,
-                connector: Box::new(GooseConnector::new()),
-            },
-            #[cfg(feature = "codebuff")]
-            MirrorCase {
-                slug: "codebuff",
-                store: ".config/manicode/projects",
-                relative: "demo/chats/2026-01-05T10-00-00.000Z/chat-messages.json",
-                content: r#"[{"id":"user-1700000000000","variant":"user","content":"Hello","timestamp":"2026-01-05T10:00:00.000Z"}]"#,
-                connector: Box::new(CodebuffConnector::new()),
-            },
-            MirrorCase {
                 slug: "antigravity",
                 store: ".gemini/antigravity/brain",
                 relative: "00000000-0000-0000-0000-000000000001/.system_generated/logs/transcript.jsonl",
@@ -631,25 +566,18 @@ mod tests {
                 connector: Box::new(AntigravityConnector::new()),
             },
             MirrorCase {
-                slug: "amp",
-                store: ".local/share/amp",
-                relative: "thread-1.json",
-                content: r#"{"id":"thread-1","title":"Test","messages":[{"role":"user","content":"Hello","createdAt":1700000000000}]}"#,
-                connector: Box::new(AmpConnector::new()),
+                slug: "qoder",
+                store: ".qoder/projects",
+                relative: "proj/11111111-1111-4111-8111-111111111111.jsonl",
+                content: r#"{"uuid":"u1","parentUuid":null,"sessionId":"11111111-1111-4111-8111-111111111111","timestamp":"2026-01-05T10:00:01Z","type":"user","message":{"role":"user","content":"Hello"}}"#,
+                connector: Box::new(QoderConnector::new()),
             },
             MirrorCase {
-                slug: "cline",
-                store: ".config/Code/User/globalStorage",
-                relative: "saoudrizwan.claude-dev/tasks/task-1/ui_messages.json",
-                content: r#"[{"ts":1700000000000,"type":"say","say":"text","text":"Hello"}]"#,
-                connector: Box::new(ClineConnector::new()),
-            },
-            MirrorCase {
-                slug: "copilot",
-                store: ".config/Code/User/globalStorage/github.copilot-chat",
-                relative: "session-1.json",
-                content: r#"{"id":"conv-1","workspaceFolder":"/work/project","turns":[{"request":{"message":"Hello","timestamp":1700000000000}}]}"#,
-                connector: Box::new(CopilotConnector::new()),
+                slug: "qwen",
+                store: ".qwen/projects",
+                relative: "proj/chats/0123456789abcdef0123456789abcdef.jsonl",
+                content: r#"{"uuid":"u1","parentUuid":null,"sessionId":"0123456789abcdef0123456789abcdef","timestamp":"2026-01-05T10:00:01Z","type":"user","message":{"role":"user","parts":[{"text":"Hello"}]}}"#,
+                connector: Box::new(QwenConnector::new()),
             },
         ];
         for MirrorCase {
@@ -694,18 +622,6 @@ mod tests {
                 assert_eq!(conversations.len(), 1, "{slug} at depth {depth}");
                 assert_eq!(conversations[0].agent_slug, slug);
                 assert_eq!(conversations[0].source_path, target);
-                if matches!(slug, "factory" | "prime_agent" | "copilot") {
-                    assert_eq!(
-                        conversations[0].workspace,
-                        Some(PathBuf::from("/local/work/project"))
-                    );
-                    assert_eq!(
-                        conversations[0]
-                            .metadata
-                            .pointer("/cass/workspace_original"),
-                        Some(&serde_json::json!("/work/project"))
-                    );
-                }
             }
         }
     }
@@ -714,27 +630,27 @@ mod tests {
     fn mirrored_store_requires_remote_provider_identity_and_safe_containment() {
         let tmp = tempfile::tempdir().unwrap();
         let wrapper = tmp.path().join("opaque_hash");
-        let sessions = wrapper.join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let store = [".prime", "agent", "sessions"];
+        let projects = wrapper.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let store = [".qoder", "projects"];
         for source in [
-            "~/sessions",
-            "~/.pi/agent/sessions",
-            "~/.prime/agent/../sessions",
-            "~/.prime/agent/sessions-extra",
+            "~/projects",
+            "~/.claude/projects",
+            "~/.qoder/../projects",
+            "~/.qoder/projects-extra",
         ] {
             let root = ScanRoot::remote(wrapper.clone(), Origin::remote("laptop"), None)
                 .with_mirrored_source_path(source);
             assert!(root.mirrored_store(&store).is_none(), "{source}");
         }
         let root = ScanRoot::remote(wrapper.clone(), Origin::remote("laptop"), None)
-            .with_mirrored_source_path("/home/u/.prime/agent/sessions/");
-        assert_eq!(root.mirrored_store(&store), Some(sessions.clone()));
+            .with_mirrored_source_path("/home/u/.qoder/projects/");
+        assert_eq!(root.mirrored_store(&store), Some(projects.clone()));
         assert!(root.clone().mirrored_store(&store).is_some());
-        assert!(root.with_path(sessions).mirrored_store(&store).is_none());
+        assert!(root.with_path(projects).mirrored_store(&store).is_none());
         assert!(
             ScanRoot::local(wrapper)
-                .with_mirrored_source_path("~/.prime/agent/sessions")
+                .with_mirrored_source_path("~/.qoder/projects")
                 .mirrored_store(&store)
                 .is_none()
         );
@@ -743,22 +659,18 @@ mod tests {
     #[test]
     fn mirrored_store_supports_rsync_contents_and_missing_stores() {
         let tmp = tempfile::tempdir().unwrap();
-        let wrapper = tmp.path().join(".vibe_logs_hash");
-        std::fs::create_dir_all(wrapper.join("session")).unwrap();
+        let wrapper = tmp.path().join(".qwen_tmp_hash");
+        std::fs::create_dir_all(wrapper.join("tmp")).unwrap();
         let root = ScanRoot::remote(wrapper.clone(), Origin::remote("laptop"), None)
-            .with_mirrored_source_path("~/.vibe/logs/");
+            .with_mirrored_source_path("~/.qwen/");
         assert_eq!(
-            root.mirrored_store(&[".vibe", "logs", "session"]),
-            Some(wrapper.join("session"))
+            root.mirrored_store(&[".qwen", "tmp"]),
+            Some(wrapper.join("tmp"))
         );
-        assert!(root.mirrored_store(&[".factory", "sessions"]).is_none());
+        assert!(root.mirrored_store(&[".codex", "sessions"]).is_none());
         let missing = ScanRoot::remote(tmp.path().join("missing"), Origin::remote("laptop"), None)
-            .with_mirrored_source_path("~/.vibe/logs");
-        assert!(
-            missing
-                .mirrored_store(&[".vibe", "logs", "session"])
-                .is_none()
-        );
+            .with_mirrored_source_path("~/.qwen");
+        assert!(missing.mirrored_store(&[".qwen", "tmp"]).is_none());
     }
 
     #[cfg(unix)]
@@ -771,8 +683,8 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, wrapper.join("sessions")).unwrap();
         let root = ScanRoot::remote(wrapper, Origin::remote("laptop"), None)
-            .with_mirrored_source_path("~/.factory/sessions");
-        assert!(root.mirrored_store(&[".factory", "sessions"]).is_none());
+            .with_mirrored_source_path("~/.codex/sessions");
+        assert!(root.mirrored_store(&[".codex", "sessions"]).is_none());
     }
 
     #[test]
@@ -967,14 +879,14 @@ mod tests {
     fn scan_root_apply_workspace_rewrite_preserves_workspace_original() {
         let root = ScanRoot::local(PathBuf::from("/home")).with_rewrite("/remote/work", "/local");
         let mut conv = crate::types::NormalizedConversation {
-            agent_slug: "openhands".to_string(),
-            external_id: Some("oh-1".to_string()),
+            agent_slug: "codex".to_string(),
+            external_id: Some("codex-1".to_string()),
             title: Some("test".to_string()),
             workspace: Some(PathBuf::from("/remote/work/app")),
-            source_path: PathBuf::from("/tmp/oh-1"),
+            source_path: PathBuf::from("/tmp/codex-1"),
             started_at: None,
             ended_at: None,
-            metadata: serde_json::json!({"source": "openhands"}),
+            metadata: serde_json::json!({"source": "codex"}),
             messages: Vec::new(),
         };
 

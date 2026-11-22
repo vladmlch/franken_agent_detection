@@ -22,15 +22,10 @@ use serde_json::json;
 use tempfile::TempDir;
 
 const CHILD_CASE: &str = "FAD_CUSTOM_STORE_CASE";
-const OVERRIDES: [&str; 10] = [
+const OVERRIDES: [&str; 5] = [
     "GEMINI_HOME",
     "OPENCODE_STORAGE_ROOT",
     "OPENCODE_SQLITE_DB",
-    "HERMES_HOME",
-    "HERMES_SQLITE_DB",
-    "CRUSH_SQLITE_DB",
-    "GOOSE_PATH_ROOT",
-    "GOOSE_SQLITE_DB",
     "CASS_CURSOR_PROJECTS_ROOT",
     "CASS_EXCLUDE_PATHS",
 ];
@@ -169,21 +164,9 @@ fn write_store(root: &Path, provider: &str, id: &str) -> PathBuf {
             );
             root.to_path_buf()
         }
-        #[cfg(any(
-            feature = "opencode",
-            feature = "hermes",
-            feature = "crush",
-            feature = "goose"
-        ))]
-        "opencode" | "hermes" | "crush" | "goose" => {
-            let filename = match provider {
-                "opencode" => "opencode.db",
-                "hermes" => "state.db",
-                "crush" => "crush.db",
-                "goose" => "sessions.db",
-                _ => unreachable!(),
-            };
-            let path = root.join(filename);
+        #[cfg(feature = "opencode")]
+        "opencode" => {
+            let path = root.join("opencode.db");
             write_sqlite(&path, provider, id);
             path
         }
@@ -207,13 +190,7 @@ fn write_opencode_legacy(root: &Path, id: &str) {
     );
 }
 
-#[cfg(any(
-    feature = "opencode",
-    feature = "hermes",
-    feature = "crush",
-    feature = "goose"
-))]
-#[allow(clippy::too_many_lines)]
+#[cfg(feature = "opencode")]
 fn write_sqlite(path: &Path, provider: &str, id: &str) {
     use franken_agent_detection::connectors::sqlite_sync::{Connection, ConnectionExt};
     use frankensqlite::params;
@@ -244,69 +221,6 @@ fn write_sqlite(path: &Path, provider: &str, id: &str) {
             conn.execute_compat(
                 "INSERT INTO part VALUES ('part', 'message', ?, ?, 1700000000000, 1700000000000)",
                 params![id, json!({"type": "text", "text": id}).to_string()],
-            )
-            .unwrap();
-        }
-        "hermes" => {
-            conn.execute_batch(
-                "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model TEXT, title TEXT,
-                    parent_session_id TEXT, started_at REAL, ended_at REAL, end_reason TEXT,
-                    message_count INTEGER, tool_call_count INTEGER, input_tokens INTEGER,
-                    output_tokens INTEGER);
-                 CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, tool_calls TEXT,
-                    tool_name TEXT, tool_call_id TEXT, reasoning TEXT, timestamp REAL);",
-            )
-            .unwrap();
-            conn.execute_compat(
-                "INSERT INTO sessions VALUES (?, 'cli', 'model', ?, NULL, 1700000000,
-                    1700000001, 'completed', 1, 0, 10, 5)",
-                params![id, id],
-            )
-            .unwrap();
-            conn.execute_compat(
-                "INSERT INTO messages VALUES (?, 'user', ?, NULL, NULL, NULL, NULL, 1700000000)",
-                params![id, id],
-            )
-            .unwrap();
-        }
-        "crush" => {
-            conn.execute_batch(
-                "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, prompt_tokens INTEGER,
-                    completion_tokens INTEGER, cost REAL);
-                 CREATE TABLE messages (session_id TEXT, role TEXT, parts TEXT, created_at INTEGER,
-                    model TEXT, provider TEXT);",
-            )
-            .unwrap();
-            conn.execute_compat(
-                "INSERT INTO sessions VALUES (?, ?, 10, 5, 0.1)",
-                params![id, id],
-            )
-            .unwrap();
-            conn.execute_compat(
-                "INSERT INTO messages VALUES (?, 'user', ?, 1700000000000, 'model', 'provider')",
-                params![id, json!([{"type": "text", "text": id}]).to_string()],
-            )
-            .unwrap();
-        }
-        "goose" => {
-            conn.execute_batch(
-                "CREATE TABLE sessions (id TEXT PRIMARY KEY, description TEXT, working_dir TEXT,
-                    created_at INTEGER, updated_at INTEGER, provider_name TEXT,
-                    model_config_json TEXT, session_type TEXT);
-                 CREATE TABLE messages (session_id TEXT, role TEXT, content_json TEXT,
-                    created_timestamp INTEGER, tokens INTEGER, metadata_json TEXT,
-                    message_id TEXT PRIMARY KEY);",
-            )
-            .unwrap();
-            conn.execute_compat(
-                "INSERT INTO sessions VALUES (?, ?, NULL, 1700000000, 1700000001,
-                    'provider', NULL, NULL)",
-                params![id, id],
-            )
-            .unwrap();
-            conn.execute_compat(
-                "INSERT INTO messages VALUES (?, 'user', ?, 1700000000, 5, NULL, 'message')",
-                params![id, json!([{"type": "text", "text": id}]).to_string()],
             )
             .unwrap();
         }
@@ -561,132 +475,6 @@ fn opencode_missing_or_blank_overrides_preserve_default_stores() {
         ],
         &["default-db", "default-json"],
         Some(&db),
-    );
-}
-
-#[cfg(feature = "hermes")]
-#[test]
-fn hermes_configured_database_precedes_home_and_falls_back_when_missing() {
-    let fixture = Fixture::new("hermes");
-    let db = fixture.store("custom-db", "database");
-    let home_db = fixture.store("custom-home", "home");
-    let home = home_db.parent().unwrap().to_path_buf();
-    fixture.run(
-        &[("HERMES_SQLITE_DB", db.clone().into())],
-        &["database"],
-        Some(&db),
-    );
-    fixture.run(
-        &[("HERMES_HOME", home.clone().into())],
-        &["home"],
-        Some(&home_db),
-    );
-    fixture.run(
-        &[
-            ("HERMES_SQLITE_DB", db.into()),
-            ("HERMES_HOME", home.clone().into()),
-        ],
-        &["database"],
-        None,
-    );
-    fixture.run(
-        &[
-            ("HERMES_SQLITE_DB", fixture.path("absent.db").into()),
-            ("HERMES_HOME", home.into()),
-        ],
-        &["home"],
-        Some(&home_db),
-    );
-    fixture.store("home/.hermes", "default");
-    fixture.run(&[], &["default"], None);
-    fs::create_dir(fixture.path("directory.db")).unwrap();
-    for value in [
-        OsString::new(),
-        " \t ".into(),
-        fixture.path("absent").into(),
-        fixture.path("directory.db").into(),
-    ] {
-        fixture.run(
-            &[("HERMES_SQLITE_DB", value.clone()), ("HERMES_HOME", value)],
-            &["default"],
-            None,
-        );
-    }
-}
-
-#[cfg(any(feature = "crush", feature = "goose"))]
-fn assert_database_override_and_fallback(provider: &'static str, key: &str, default: &str) {
-    let fixture = Fixture::new(provider);
-    let db = fixture.store("custom", "custom");
-    fixture.run(&[(key, db.clone().into())], &["custom"], Some(&db));
-    fixture.store(default, "default");
-    fixture.run(&[(key, db.into())], &["custom"], None);
-    fixture.run(&[], &["default"], None);
-    let wrong_kind = fixture.path("directory.db");
-    fs::create_dir(&wrong_kind).unwrap();
-    for value in [
-        OsString::new(),
-        " \t ".into(),
-        fixture.path("absent.db").into(),
-        wrong_kind.into(),
-    ] {
-        fixture.run(&[(key, value)], &["default"], None);
-    }
-}
-
-#[cfg(feature = "crush")]
-#[test]
-fn crush_configured_database_is_detected_without_losing_default_fallback() {
-    assert_database_override_and_fallback("crush", "CRUSH_SQLITE_DB", "home/.crush");
-}
-
-#[cfg(feature = "crush")]
-#[test]
-fn crush_default_scan_keeps_project_store_and_db_handoff_stays_scoped() {
-    let fixture = Fixture::new("crush");
-    let db = fixture.store("custom", "custom");
-    fixture.store(".crush", "project");
-    fixture.run_with_handoff(
-        &[("CRUSH_SQLITE_DB", db.into())],
-        &["custom", "project"],
-        None,
-        &["custom"],
-    );
-}
-
-#[cfg(feature = "goose")]
-#[test]
-fn goose_configured_database_is_detected_without_losing_default_fallback() {
-    assert_database_override_and_fallback(
-        "goose",
-        "GOOSE_SQLITE_DB",
-        "home/.local/share/goose/sessions",
-    );
-}
-
-#[cfg(feature = "goose")]
-#[test]
-fn goose_explicit_database_survives_an_absent_path_root() {
-    let fixture = Fixture::new("goose");
-    let db = fixture.store("custom", "custom");
-    fixture.run(
-        &[
-            ("GOOSE_SQLITE_DB", db.clone().into()),
-            ("GOOSE_PATH_ROOT", fixture.path("absent").into()),
-        ],
-        &["custom"],
-        Some(&db),
-    );
-    let path_root = fixture.path("goose-root");
-    let legacy = path_root.join("data/sessions/legacy.jsonl");
-    write_json(&legacy, &json!({"role": "user", "content": "legacy"}));
-    fixture.run(
-        &[
-            ("GOOSE_SQLITE_DB", db.into()),
-            ("GOOSE_PATH_ROOT", path_root.into()),
-        ],
-        &["custom", "legacy"],
-        None,
     );
 }
 

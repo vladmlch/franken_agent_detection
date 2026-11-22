@@ -45,22 +45,10 @@ pub use types::{
 // Re-export connector infrastructure at crate root.
 #[cfg(feature = "chatgpt")]
 pub use connectors::chatgpt::ChatGptConnector;
-#[cfg(feature = "codebuff")]
-pub use connectors::codebuff::CodebuffConnector;
-#[cfg(feature = "crush")]
-pub use connectors::crush::CrushConnector;
 #[cfg(feature = "cursor")]
 pub use connectors::cursor::CursorConnector;
-#[cfg(feature = "goose")]
-pub use connectors::goose::GooseConnector;
-#[cfg(feature = "grok-bot")]
-pub use connectors::grok_bot::GrokBotConnector;
-#[cfg(feature = "hermes")]
-pub use connectors::hermes::HermesConnector;
 #[cfg(feature = "opencode")]
 pub use connectors::opencode::OpenCodeConnector;
-#[cfg(feature = "shelley")]
-pub use connectors::shelley::ShelleyConnector;
 #[cfg(feature = "connectors")]
 pub use connectors::token_extraction::{
     ExtractedTokenUsage, ModelInfo, TokenDataSource, extract_devin_tokens,
@@ -69,19 +57,13 @@ pub use connectors::token_extraction::{
 #[cfg(feature = "connectors")]
 pub use connectors::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanProgressTick,
-    ScanRoot, SourceCompletion, SourceScanHooks, WorkspaceCache, aider::AiderConnector,
-    amp::AmpConnector, antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
-    clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
-    continue_dev::ContinueConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
-    devin::DevinConnector, estimate_tokens_from_content, extract_claude_code_tokens,
-    extract_codex_tokens, extract_invocations_from_content_blocks, extract_tokens_for_agent,
-    factory::FactoryConnector, file_modified_since, flatten_content,
-    franken_detection_for_connector, gemini::GeminiConnector, get_connector_factories,
-    grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector, muse::MuseConnector,
-    normalize_model, omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
-    parse_timestamp, percent_decode_utf8, pi_agent::PiAgentConnector,
-    pi_durable::PiDurableConnector, prime_agent::PrimeAgentConnector, qoder::QoderConnector,
-    qwen::QwenConnector, token_extraction, unwrap_skill_invocations, vibe::VibeConnector,
+    ScanRoot, SourceCompletion, SourceScanHooks, WorkspaceCache, antigravity::AntigravityConnector,
+    claude_code::ClaudeCodeConnector, codex::CodexConnector, devin::DevinConnector,
+    estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,
+    extract_invocations_from_content_blocks, extract_tokens_for_agent, file_modified_since,
+    flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
+    get_connector_factories, normalize_model, parse_timestamp, percent_decode_utf8,
+    qoder::QoderConnector, qwen::QwenConnector, token_extraction, unwrap_skill_invocations,
 };
 
 use serde::{Deserialize, Serialize};
@@ -141,47 +123,20 @@ pub enum AgentDetectError {
 }
 
 const KNOWN_CONNECTORS: &[&str] = &[
-    "aider",
-    "amp",
     "antigravity",
     "chatgpt",
     "claude",
-    "clawdbot",
-    "cline",
-    "codebuff",
     "codex",
-    "continue",
-    "copilot_cli",
-    "crush",
     "cursor",
     "devin",
-    "factory",
     "gemini",
-    "github-copilot",
-    "goose",
-    "grok",
-    "grok_bot",
-    "hermes",
-    "kimi",
-    "kiro",
-    "muse",
-    "omp",
     "opencode",
-    "openclaw",
-    "openhands",
-    "pi_agent",
-    "pi_durable",
-    "prime_agent",
     "qoder",
     "qwen",
-    "shelley",
-    "vibe",
-    "windsurf",
 ];
 
 /// Resolve any known connector slug, alias, or emitted conversation `agent_slug`
-/// (including qualified `openclaw/<agent>` slugs) to its canonical entry in
-/// `KNOWN_CONNECTORS`.
+/// to its canonical entry in `KNOWN_CONNECTORS`.
 #[must_use]
 pub fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
     let trimmed = slug.trim();
@@ -190,51 +145,20 @@ pub fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
     }
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
-        "aider" | "aider-cli" => Some("aider"),
-        "amp" | "amp-cli" => Some("amp"),
         "antigravity" | "agy" | "antigravity-cli" | "antigravity-ide" => Some("antigravity"),
         "chatgpt" | "chat-gpt" | "chatgpt-desktop" => Some("chatgpt"),
         // The connector emits `agent_slug = "claude_code"`; the registry's
         // public slug stays `claude`. Both must resolve.
         "claude" | "claude-code" | "claude_code" => Some("claude"),
-        "clawdbot" | "clawd-bot" => Some("clawdbot"),
-        "cline" => Some("cline"),
-        "codebuff" | "freebuff" | "manicode" | "codebuff-lineage" => Some("codebuff"),
         "codex" | "codex-cli" => Some("codex"),
-        "continue" | "continue-dev" | "continue_dev" => Some("continue"),
-        "copilot_cli" | "copilot-cli" | "gh-copilot" => Some("copilot_cli"),
-        "crush" | "charm-crush" => Some("crush"),
         "cursor" => Some("cursor"),
         "devin" | "devin-cli" => Some("devin"),
-        "factory" | "factory-droid" => Some("factory"),
         "gemini" | "gemini-cli" => Some("gemini"),
-        "github-copilot" | "github_copilot" | "copilot" | "copilot_vscode" | "copilot-vscode" => {
-            Some("github-copilot")
-        }
-        "goose" | "goose-ai" => Some("goose"),
-        "grok" | "grok-cli" | "grok-build" | "xai-grok" => Some("grok"),
-        "grok_bot" | "grok-bot" => Some("grok_bot"),
-        "hermes" | "hermes-agent" => Some("hermes"),
-        "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
-        "kiro" | "kiro-cli" | "kirocli" => Some("kiro"),
-        "muse" | "muse-code" | "muse_code" | "musecode" | "meta-muse" => Some("muse"),
-        "omp" | "oh-my-pi" | "oh_my_pi" => Some("omp"),
         "opencode" | "open-code" => Some("opencode"),
-        "openclaw" | "open-claw" => Some("openclaw"),
-        s if s.starts_with("openclaw/") && !s["openclaw/".len()..].trim().is_empty() => {
-            Some("openclaw")
-        }
-        "openhands" | "open-hands" => Some("openhands"),
-        "pi_agent" | "pi-agent" | "piagent" | "pi_mono" | "pi-mono" => Some("pi_agent"),
-        "pi_durable" | "pi-durable" | "pidurable" => Some("pi_durable"),
-        "prime_agent" | "prime-agent" | "primeagent" => Some("prime_agent"),
         "qoder" | "qoder-cli" | "qoder_cli" | "qoder-cn" | "qoder_cn" | "qoderwork" => {
             Some("qoder")
         }
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
-        "shelley" | "shelley-db" => Some("shelley"),
-        "vibe" | "vibe-cli" => Some("vibe"),
-        "windsurf" => Some("windsurf"),
         _ => None,
     }
 }
@@ -327,175 +251,12 @@ pub(crate) fn qwen_runtime_root_from_env() -> Option<PathBuf> {
     Some(normalized)
 }
 
-fn amp_xdg_probe_root_from_env_value(xdg_data_home: &str) -> Option<PathBuf> {
-    let trimmed = xdg_data_home.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(trimmed).join("amp"))
-}
-
-fn amp_xdg_probe_root_from_env() -> Option<PathBuf> {
-    std::env::var("XDG_DATA_HOME")
-        .ok()
-        .and_then(|value| amp_xdg_probe_root_from_env_value(&value))
-}
-
-fn kiro_env_home() -> Option<PathBuf> {
-    std::env::var_os("KIRO_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-/// Kiro 2.3 introduced `KIRO_HOME` for relocating its global state, including
-/// the v2 CLI session store. A configured path replaces the default even when
-/// missing; explicit scan and detection roots are handled separately.
-#[cfg(feature = "connectors")]
-pub(crate) fn kiro_home() -> Option<PathBuf> {
-    kiro_env_home().or_else(|| home_join(&[".kiro"]))
-}
-
-/// Cline SDK histories are independent of the legacy extension task stores.
-/// Match `resolveSessionDataDir` in Cline's shared storage paths: trim blank
-/// overrides, keep literal tildes, and normalize joined paths without following
-/// symlinks. Explicit scan/detection roots still take precedence over this.
-pub(crate) fn cline_sdk_sessions_root() -> Option<PathBuf> {
-    let read = |key: &str| {
-        std::env::var(key)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    };
-    let path = read("CLINE_SESSION_DATA_DIR")
-        .or_else(|| read("CLINE_DATA_DIR").map(|root| root.join("sessions")))
-        .or_else(|| read("CLINE_DIR").map(|root| root.join("data/sessions")))
-        .or_else(|| {
-            // The SDK deliberately uses HOME first on every platform, then
-            // USERPROFILE and the Windows drive/path pair before OS lookup.
-            let home = read("HOME")
-                .filter(|home| home != Path::new("~"))
-                .or_else(|| read("USERPROFILE"))
-                .or_else(|| {
-                    let mut home = read("HOMEDRIVE")?.into_os_string();
-                    home.push(read("HOMEPATH")?.as_os_str());
-                    Some(PathBuf::from(home))
-                })
-                .or_else(|| {
-                    dirs::home_dir().and_then(|home| {
-                        home.to_str()
-                            .map(str::trim)
-                            .filter(|home| !home.is_empty() && *home != "~")
-                            .map(PathBuf::from)
-                    })
-                })?;
-            Some(home.join(".cline/data/sessions"))
-        })?;
-
-    // Node's path.join removes `..` lexically. Canonicalization would resolve
-    // symlinks first and would require missing intermediate paths to exist.
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if normalized.file_name().is_some_and(|name| name != "..") {
-                    normalized.pop();
-                } else if !normalized.has_root() {
-                    normalized.push("..");
-                }
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        normalized.push(".");
-    }
-    Some(normalized)
-}
-
-fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    for ext in ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"] {
-        roots.push(home.join(".config/Code/User/globalStorage").join(ext));
-        roots.push(
-            home.join(".config/Code - Insiders/User/globalStorage")
-                .join(ext),
-        );
-        roots.push(home.join(".config/VSCodium/User/globalStorage").join(ext));
-        roots.push(home.join(".config/Cursor/User/globalStorage").join(ext));
-        roots.push(
-            home.join("Library/Application Support/Code/User/globalStorage")
-                .join(ext),
-        );
-        roots.push(
-            home.join("Library/Application Support/Code - Insiders/User/globalStorage")
-                .join(ext),
-        );
-        roots.push(
-            home.join("Library/Application Support/VSCodium/User/globalStorage")
-                .join(ext),
-        );
-        roots.push(
-            home.join("Library/Application Support/Cursor/User/globalStorage")
-                .join(ext),
-        );
-        roots.push(
-            home.join("AppData/Roaming/Code/User/globalStorage")
-                .join(ext),
-        );
-        roots.push(
-            home.join("AppData/Roaming/Code - Insiders/User/globalStorage")
-                .join(ext),
-        );
-        roots.push(
-            home.join("AppData/Roaming/VSCodium/User/globalStorage")
-                .join(ext),
-        );
-        roots.push(
-            home.join("AppData/Roaming/Cursor/User/globalStorage")
-                .join(ext),
-        );
-    }
-    roots
-}
-
-/// Continue's native global-home override, shared by detection and ingestion.
-/// `core/util/paths.ts` resolves relative paths against CWD and treats `~`
-/// literally. An empty value selects the ordinary home-directory default.
-pub(crate) fn continue_env_global_dir() -> Option<PathBuf> {
-    let raw = std::env::var_os("CONTINUE_GLOBAL_DIR").filter(|value| !value.is_empty())?;
-    let root = PathBuf::from(raw);
-    Some(if root.is_absolute() {
-        root
-    } else {
-        std::env::current_dir().unwrap_or_default().join(root)
-    })
-}
-
 #[allow(clippy::too_many_lines)]
 fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
     let read = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string());
     let read_path = |key: &str| read(key).filter(|v| !v.is_empty()).map(PathBuf::from);
 
     match slug {
-        "codebuff" => {
-            let root = read("CASS_CODEBUFF_DATA_ROOT")?;
-            if root.is_empty() {
-                return None;
-            }
-            Some(vec![expand_leading_tilde(
-                &root,
-                dirs::home_dir().as_deref(),
-            )])
-        }
-        "aider" => {
-            let root = read("CASS_AIDER_DATA_ROOT")?;
-            if root.is_empty() {
-                return None;
-            }
-            Some(vec![PathBuf::from(root)])
-        }
         "antigravity" => {
             let root = read("CASS_ANTIGRAVITY_DATA_ROOT")?;
             if root.is_empty() {
@@ -503,38 +264,7 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root)])
         }
-        "kiro" => {
-            let home = kiro_env_home()?;
-            // A configured but missing or invalid home remains an explicit
-            // override, so detection cannot fall back to another profile.
-            Some(
-                [home.join("sessions/cli"), home]
-                    .into_iter()
-                    .filter(|path| path.is_dir())
-                    .collect(),
-            )
-        }
         "claude" => claude_env_override_roots(read("CLAUDE_CONFIG_DIR").as_deref()),
-        "cline" => {
-            ["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]
-                .into_iter()
-                .find_map(read_path)?;
-            // Only the SDK store moves. Existing extension UI/API task
-            // histories remain independently discoverable after migration.
-            Some(default_probe_roots(slug))
-        }
-        "continue" => {
-            // Continue resolves this global home relative to the process CWD,
-            // without shell-style tilde expansion. It replaces the default
-            // store even when the configured directory has not been created.
-            let root = continue_env_global_dir()?;
-            Some(
-                [root.join("sessions"), root]
-                    .into_iter()
-                    .filter(|path| path.is_dir())
-                    .collect(),
-            )
-        }
         "devin" => {
             // Mirrors DevinConnector's CASS_DEVIN_DATA_ROOT resolution
             // (CLI `sessions.db`, IDE `acp-messages`, or parent `devin` / `Devin`
@@ -562,9 +292,6 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root).join("sessions")])
         }
-        "crush" => read_path("CRUSH_SQLITE_DB")
-            .filter(|path| path.is_file())
-            .map(|path| vec![path]),
         "cursor" => {
             let projects = read_path("CASS_CURSOR_PROJECTS_ROOT")?;
             let mut roots: Vec<_> = projects.is_dir().then_some(projects).into_iter().collect();
@@ -586,21 +313,6 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             let admitted = root.is_dir() || (root.is_file() && is_gemini_session_file(&root));
             Some(admitted.then_some(root).into_iter().collect())
         }
-        "hermes" => read_path("HERMES_SQLITE_DB")
-            .filter(|path| path.is_file())
-            .or_else(|| {
-                read_path("HERMES_HOME")
-                    .map(|home| home.join("state.db"))
-                    .filter(|path| path.is_file())
-            })
-            .map(|path| vec![path]),
-        "kimi" => {
-            let root = read("KIMI_CODE_HOME")?;
-            if root.is_empty() {
-                return None;
-            }
-            Some(vec![PathBuf::from(root).join("sessions")])
-        }
         "qoder" => qoder_env_override_roots(
             read("QODER_PROJECTS_DIR").as_deref(),
             read("QODER_HOME").as_deref(),
@@ -616,13 +328,6 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                     .filter(|path| path.is_dir())
                     .collect(),
             )
-        }
-        "openhands" => {
-            let root = read("CASS_OPENHANDS_DATA_ROOT")?;
-            if root.is_empty() {
-                return None;
-            }
-            Some(vec![PathBuf::from(root)])
         }
         "opencode" => {
             // The legacy storage root and SQLite databases are independent.
@@ -643,121 +348,6 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                 }
             }
             Some(roots)
-        }
-        "pi_agent" => {
-            // A sessions-only override is additive: the connector still
-            // scans ~/.pi/agent unless PI_CODING_AGENT_DIR pins its home.
-            // Keep that fallback even when PI_SESSIONS_DIR does not exist.
-            let mut roots = Vec::new();
-            if let Some(sessions) = read("PI_SESSIONS_DIR").filter(|v| !v.is_empty()) {
-                roots.push(PathBuf::from(sessions));
-            }
-            if let Some(agent) = read("PI_CODING_AGENT_DIR").filter(|v| !v.is_empty()) {
-                roots.push(PathBuf::from(agent).join("sessions"));
-            } else if !roots.is_empty() {
-                roots.extend(default_probe_roots(slug));
-            }
-            (!roots.is_empty()).then_some(roots)
-        }
-        "pi_durable" => {
-            // The durable host keeps its stores under the same agent dir.
-            let root = read("PI_CODING_AGENT_DIR")?;
-            if root.is_empty() {
-                return None;
-            }
-            Some(vec![
-                expand_leading_tilde(&root, dirs::home_dir().as_deref())
-                    .join("experimental")
-                    .join("durable-sessions"),
-            ])
-        }
-        "prime_agent" => {
-            // Prime's own precedence: PRIME_AGENT_SESSION_DIR (direct
-            // sessions dir) > legacy PRIME_AGENT_CODING_AGENT_SESSION_DIR >
-            // PRIME_AGENT_CODING_AGENT_DIR (agent home; sessions beneath).
-            // Prime expands a leading `~` in all three, so detection must
-            // resolve the same directory the connector will scan.
-            let home = dirs::home_dir();
-            let expand = |raw: &str| expand_leading_tilde(raw, home.as_deref());
-            if let Some(dir) = read("PRIME_AGENT_SESSION_DIR").filter(|v| !v.is_empty()) {
-                return Some(vec![expand(&dir)]);
-            }
-            if let Some(dir) =
-                read("PRIME_AGENT_CODING_AGENT_SESSION_DIR").filter(|v| !v.is_empty())
-            {
-                return Some(vec![expand(&dir)]);
-            }
-            let root = read("PRIME_AGENT_CODING_AGENT_DIR")?;
-            if root.is_empty() {
-                return None;
-            }
-            Some(vec![expand(&root).join("sessions")])
-        }
-        "goose" => {
-            let explicit_db = read_path("GOOSE_SQLITE_DB");
-            let explicit_root = read_path("GOOSE_PATH_ROOT");
-            if explicit_db.is_none() && explicit_root.is_none() {
-                return None;
-            }
-            let mut sessions: Vec<_> = explicit_root
-                .map(|root| root.join("data/sessions"))
-                .into_iter()
-                .collect();
-            if let Some(data) = dirs::data_local_dir() {
-                sessions.push(data.join("goose/sessions"));
-            }
-            if let Some(home) = dirs::home_dir() {
-                sessions.push(home.join(".local/share/goose/sessions"));
-                sessions.push(home.join(".goose/sessions"));
-            }
-            let mut seen = HashSet::new();
-            sessions.retain(|path| seen.insert(path.clone()));
-
-            // SQLite and legacy JSONL select their fallbacks independently.
-            // In particular, a missing GOOSE_PATH_ROOT must not mask an
-            // explicit database, nor may that DB hide default JSONL history.
-            let db = explicit_db
-                .into_iter()
-                .chain(sessions.iter().map(|root| root.join("sessions.db")))
-                .find(|path| path.is_file());
-            let directory = sessions.into_iter().find(|path| path.is_dir());
-            let roots: Vec<_> = db.into_iter().chain(directory).collect();
-            (!roots.is_empty()).then_some(roots)
-        }
-        "muse" => {
-            let root = read("CASS_MUSE_DATA_ROOT")?;
-            if root.is_empty() {
-                return None;
-            }
-            Some(vec![PathBuf::from(root)])
-        }
-        "grok" => {
-            // Mirrors GrokConnector::base_root(): scans honor $GROK_HOME,
-            // so detection must too — otherwise a relocated install reports
-            // not-found while scan finds sessions.
-            let root = read("GROK_HOME")?;
-            if root.is_empty() {
-                return None;
-            }
-            let root = PathBuf::from(root);
-            Some(vec![root.join("sessions"), root])
-        }
-        "grok_bot" => {
-            let root = read("CASS_GROK_BOT_DATA_ROOT")?;
-            if root.trim().is_empty() {
-                return None;
-            }
-            Some(vec![expand_leading_tilde(
-                &root,
-                dirs::home_dir().as_deref(),
-            )])
-        }
-        "omp" => {
-            let root = read("CASS_OMP_DATA_ROOT")?;
-            if root.is_empty() {
-                return None;
-            }
-            Some(vec![PathBuf::from(root)])
         }
         _ => None,
     }
@@ -874,125 +464,11 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
     match slug {
-        "aider" => {
-            maybe_push(&mut out, &[".aider.chat.history.md"]);
-            maybe_push(&mut out, &[".aider"]);
-            if let Some(cwd_marker) = cwd_join(&[".aider.chat.history.md"]) {
-                out.push(cwd_marker);
-            }
-        }
-        "amp" => {
-            if let Some(path) = amp_xdg_probe_root_from_env() {
-                out.push(path);
-            }
-            maybe_push(&mut out, &[".local", "share", "amp"]);
-            maybe_push(&mut out, &["Library", "Application Support", "amp"]);
-            maybe_push(&mut out, &["AppData", "Roaming", "amp"]);
-            maybe_push(
-                &mut out,
-                &[
-                    ".config",
-                    "Code",
-                    "User",
-                    "globalStorage",
-                    "sourcegraph.amp",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    ".config",
-                    "Code - Insiders",
-                    "User",
-                    "globalStorage",
-                    "sourcegraph.amp",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    ".config",
-                    "VSCodium",
-                    "User",
-                    "globalStorage",
-                    "sourcegraph.amp",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "Code",
-                    "User",
-                    "globalStorage",
-                    "sourcegraph.amp",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "Code - Insiders",
-                    "User",
-                    "globalStorage",
-                    "sourcegraph.amp",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "VSCodium",
-                    "User",
-                    "globalStorage",
-                    "sourcegraph.amp",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "AppData",
-                    "Roaming",
-                    "Code",
-                    "User",
-                    "globalStorage",
-                    "sourcegraph.amp",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "AppData",
-                    "Roaming",
-                    "Code - Insiders",
-                    "User",
-                    "globalStorage",
-                    "sourcegraph.amp",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "AppData",
-                    "Roaming",
-                    "VSCodium",
-                    "User",
-                    "globalStorage",
-                    "sourcegraph.amp",
-                ],
-            );
-        }
         "chatgpt" => {
             maybe_push(
                 &mut out,
                 &["Library", "Application Support", "com.openai.chat"],
             );
-        }
-        "codebuff" => {
-            maybe_push(&mut out, &[".config", "manicode", "projects"]);
         }
         "claude" => {
             let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
@@ -1029,35 +505,8 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
                 }
             }
         }
-        "clawdbot" => {
-            maybe_push(&mut out, &[".clawdbot"]);
-            maybe_push(&mut out, &[".clawdbot", "sessions"]);
-        }
-        "cline" => {
-            if let Some(sessions) = cline_sdk_sessions_root().filter(|path| path.is_dir()) {
-                out.push(sessions);
-            }
-            if let Some(home) = dirs::home_dir() {
-                out.extend(cline_storage_probe_roots_from_home(&home));
-            }
-        }
         "codex" => {
             maybe_push(&mut out, &[".codex", "sessions"]);
-        }
-        "continue" => {
-            maybe_push(&mut out, &[".continue", "sessions"]);
-            maybe_push(&mut out, &[".continue"]);
-        }
-        "copilot_cli" => {
-            maybe_push(&mut out, &[".copilot", "session-state"]);
-            maybe_push(&mut out, &[".copilot", "history-session-state"]);
-            maybe_push(&mut out, &[".config", "gh-copilot"]);
-            maybe_push(&mut out, &[".config", "gh", "copilot"]);
-            maybe_push(&mut out, &[".local", "share", "github-copilot"]);
-        }
-        "crush" => {
-            maybe_push(&mut out, &[".crush"]);
-            maybe_push(&mut out, &[".crush", "crush.db"]);
         }
         "cursor" => {
             maybe_push(&mut out, &[".cursor"]);
@@ -1095,12 +544,6 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             );
             maybe_push(&mut out, &["AppData", "Roaming", "Devin", "User"]);
         }
-        "factory" => {
-            maybe_push(&mut out, &[".factory"]);
-            maybe_push(&mut out, &[".factory", "sessions"]);
-            maybe_push(&mut out, &[".factory-droid"]);
-            maybe_push(&mut out, &[".config", "factory-droid"]);
-        }
         "antigravity" => {
             // Two products, two stores (cass #454): the Antigravity IDE
             // (`~/.gemini/antigravity`) and the `agy` CLI
@@ -1116,160 +559,6 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".gemini"]);
             maybe_push(&mut out, &[".config", "gemini"]);
         }
-        "github-copilot" => {
-            maybe_push(&mut out, &[".github-copilot"]);
-            maybe_push(&mut out, &[".config", "github-copilot"]);
-            maybe_push(
-                &mut out,
-                &[
-                    ".config",
-                    "Code",
-                    "User",
-                    "globalStorage",
-                    "github.copilot-chat",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    ".config",
-                    "Code - Insiders",
-                    "User",
-                    "globalStorage",
-                    "github.copilot-chat",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    ".config",
-                    "VSCodium",
-                    "User",
-                    "globalStorage",
-                    "github.copilot-chat",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "Code",
-                    "User",
-                    "globalStorage",
-                    "github.copilot-chat",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "Code - Insiders",
-                    "User",
-                    "globalStorage",
-                    "github.copilot-chat",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "VSCodium",
-                    "User",
-                    "globalStorage",
-                    "github.copilot-chat",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "AppData",
-                    "Roaming",
-                    "Code",
-                    "User",
-                    "globalStorage",
-                    "github.copilot-chat",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "AppData",
-                    "Roaming",
-                    "Code - Insiders",
-                    "User",
-                    "globalStorage",
-                    "github.copilot-chat",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "AppData",
-                    "Roaming",
-                    "VSCodium",
-                    "User",
-                    "globalStorage",
-                    "github.copilot-chat",
-                ],
-            );
-        }
-        "goose" => {
-            maybe_push(&mut out, &[".local", "share", "goose", "sessions"]);
-            maybe_push(&mut out, &[".config", "goose"]);
-            maybe_push(&mut out, &[".goose", "sessions"]);
-            maybe_push(&mut out, &[".goose"]);
-        }
-        "grok" => {
-            // xAI Grok CLI / Grok Build TUI keep their state under ~/.grok/.
-            // Probe the sessions directory first (the highest-signal artifact),
-            // then the parent so detection still fires for fresh installs that
-            // haven't created a session yet. The auth.json file is universally
-            // present once `grok` has been authenticated and is a useful
-            // additional probe target for accounts that wipe sessions between
-            // runs.
-            maybe_push(&mut out, &[".grok", "sessions"]);
-            maybe_push(&mut out, &[".grok", "auth.json"]);
-            maybe_push(&mut out, &[".grok"]);
-        }
-        "grok_bot" => {
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "Grok Bot",
-                    "sand-client-persistence",
-                ],
-            );
-        }
-        "hermes" => {
-            maybe_push(&mut out, &[".hermes", "state.db"]);
-            maybe_push(&mut out, &[".hermes"]);
-        }
-        "kimi" => {
-            // Modern Kimi Code (0.28+) stores sessions under ~/.kimi-code/;
-            // probe it first so detection surfaces the current layout. The
-            // legacy ~/.kimi/ layout is retained for older installs.
-            maybe_push(&mut out, &[".kimi-code", "sessions"]);
-            maybe_push(&mut out, &[".kimi-code"]);
-            maybe_push(&mut out, &[".kimi", "sessions"]);
-            maybe_push(&mut out, &[".kimi"]);
-        }
-        "muse" => {
-            // Meta's Muse Code CLI (Aug 2026). Layout per a field report
-            // (issue #15): XDG data dir holds sessions, XDG config holds
-            // auth. Probe the sessions tree first (highest-signal), then
-            // auth.json (present once authenticated, survives session
-            // wipes), then the parents. macOS placement is unverified —
-            // XDG paths only until confirmed.
-            maybe_push(&mut out, &[".local", "share", "muse", "sessions"]);
-            maybe_push(&mut out, &[".config", "muse", "auth.json"]);
-            maybe_push(&mut out, &[".local", "share", "muse"]);
-            maybe_push(&mut out, &[".config", "muse"]);
-        }
         "opencode" => {
             // The canonical v1.2+ SQLite database. Probed first so diagnostic
             // output surfaces the data file (not the sibling config directory)
@@ -1279,76 +568,6 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".local", "share", "opencode"]);
             maybe_push(&mut out, &[".config", "opencode", "opencode.db"]);
             maybe_push(&mut out, &[".config", "opencode"]);
-        }
-        "openclaw" => {
-            maybe_push(&mut out, &[".openclaw"]);
-            maybe_push(&mut out, &[".openclaw", "agents"]);
-        }
-        "openhands" => {
-            maybe_push(&mut out, &[".openhands", "conversations"]);
-            maybe_push(&mut out, &[".openhands"]);
-        }
-        "omp" => {
-            // Oh My Pi (`omp`, https://omp.sh) v18 resolves its store via
-            // profiles + XDG (see connectors::omp). Probe the launch-time
-            // session override first when set, then the sessions directory
-            // (highest-signal), then the parent so detection still fires for
-            // fresh installs that haven't created a session yet, then
-            // named-profile and XDG homes.
-            if let Some(session_dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-            {
-                out.push(PathBuf::from(session_dir));
-            }
-            let cfg = std::env::var("PI_CONFIG_DIR")
-                .ok()
-                .map(|v| v.trim().trim_start_matches(['/', '\\']).to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| ".omp".to_string());
-            maybe_push(&mut out, &[&cfg, "agent", "sessions"]);
-            maybe_push(&mut out, &[&cfg, "agent"]);
-            maybe_push(&mut out, &[&cfg, "profiles"]);
-            if let Some(xdg) = std::env::var("XDG_DATA_HOME")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-            {
-                let app = PathBuf::from(xdg).join("omp");
-                out.push(app.join("sessions"));
-                out.push(app);
-            } else {
-                maybe_push(&mut out, &[".local", "share", "omp", "sessions"]);
-                maybe_push(&mut out, &[".local", "share", "omp"]);
-            }
-        }
-        "pi_agent" => {
-            maybe_push(&mut out, &[".pi", "agent", "sessions"]);
-        }
-        "pi_durable" => {
-            maybe_push(
-                &mut out,
-                &[".pi", "agent", "experimental", "durable-sessions"],
-            );
-        }
-        "prime_agent" => {
-            maybe_push(&mut out, &[".prime", "agent", "sessions"]);
-            maybe_push(&mut out, &[".prime", "agent"]);
-        }
-        "kiro" => {
-            maybe_push(&mut out, &[".kiro", "sessions", "cli"]);
-            maybe_push(&mut out, &[".kiro"]);
-        }
-        "shelley" => {
-            // Display/probe hints only: Shelley detection never trusts bare
-            // path existence — entry_from_detect routes the slug through
-            // schema-aware admission (cass gh#415).
-            maybe_push(&mut out, &[".config", "shelley", "shelley.db"]);
-            if let Some(cwd_db) = cwd_join(&["shelley.db"]) {
-                out.push(cwd_db);
-            }
-            maybe_push(&mut out, &["shelley.db"]);
         }
         "qoder" => {
             maybe_push(&mut out, &[".qoder", "projects"]);
@@ -1400,14 +619,6 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".qwen", "tmp"]);
             maybe_push(&mut out, &[".qwen"]);
         }
-        "vibe" => {
-            maybe_push(&mut out, &[".vibe"]);
-            maybe_push(&mut out, &[".vibe", "logs", "session"]);
-        }
-        "windsurf" => {
-            maybe_push(&mut out, &[".windsurf"]);
-            maybe_push(&mut out, &[".config", "windsurf"]);
-        }
         _ => {}
     }
 
@@ -1451,70 +662,7 @@ fn detect_roots(
     }
 }
 
-/// Schema-aware detection for Shelley: path existence is never sufficient
-/// because any SQLite file could be named `shelley.db` (and a real Shelley
-/// database can have any name). Candidates are opened read-only and admitted
-/// only on the Shelley schema signature (cass gh#415).
-fn shelley_detection_entry(roots: Option<&[PathBuf]>) -> InstalledAgentDetectionEntry {
-    #[cfg(feature = "shelley")]
-    {
-        let mut detected = false;
-        let mut evidence: Vec<String> = Vec::new();
-        let mut root_paths: Vec<String> = Vec::new();
-        let candidates: Vec<(PathBuf, bool)> = roots
-            .map_or_else(connectors::shelley::detection_candidates, |roots| {
-                roots.iter().map(|root| (root.clone(), true)).collect()
-            });
-        if candidates.is_empty() {
-            evidence.push("no Shelley candidate databases available".to_string());
-        }
-        for (path, explicit) in candidates {
-            let file = if path.is_dir() {
-                path.join("shelley.db")
-            } else {
-                path
-            };
-            let file_display = file.display().to_string();
-            if !file.is_file() {
-                evidence.push(format!("candidate missing: {file_display}"));
-                continue;
-            }
-            match connectors::shelley::probe_candidate(&file, explicit) {
-                Ok(()) => {
-                    detected = true;
-                    root_paths.push(file_display.clone());
-                    evidence.push(format!("schema-admitted Shelley database: {file_display}"));
-                }
-                Err(err) => {
-                    evidence.push(format!("candidate rejected ({file_display}): {err:#}"));
-                }
-            }
-        }
-        InstalledAgentDetectionEntry {
-            slug: "shelley".to_string(),
-            detected,
-            evidence,
-            root_paths,
-        }
-    }
-    #[cfg(not(feature = "shelley"))]
-    {
-        let _ = roots;
-        InstalledAgentDetectionEntry {
-            slug: "shelley".to_string(),
-            detected: false,
-            evidence: vec!["compiled without the `shelley` cargo feature".to_string()],
-            root_paths: Vec::new(),
-        }
-    }
-}
-
 fn entry_from_detect(slug: &'static str) -> InstalledAgentDetectionEntry {
-    if slug == "shelley" {
-        // Never path-existence-only for Shelley; CASS_SHELLEY_DB is handled
-        // inside the schema-aware candidate expansion.
-        return shelley_detection_entry(None);
-    }
     if let Some(override_roots) = env_override_roots(slug) {
         return detect_roots(slug, &override_roots, "env");
     }
@@ -1523,9 +671,6 @@ fn entry_from_detect(slug: &'static str) -> InstalledAgentDetectionEntry {
 }
 
 fn entry_from_override(slug: &'static str, roots: &[PathBuf]) -> InstalledAgentDetectionEntry {
-    if slug == "shelley" {
-        return shelley_detection_entry(Some(roots));
-    }
     detect_roots(slug, roots, "override")
 }
 
@@ -1595,82 +740,6 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
         .iter()
         .map(|&slug| {
             let paths: Vec<String> = match slug {
-                "codebuff" => vec![tilde(&[".config", "manicode", "projects"])],
-                "aider" => vec![tilde(&[".aider.chat.history.md"]), tilde(&[".aider"])],
-                "amp" => vec![
-                    tilde(&[".local", "share", "amp"]),
-                    tilde(&["Library", "Application Support", "amp"]),
-                    tilde(&["AppData", "Roaming", "amp"]),
-                    tilde(&[
-                        ".config",
-                        "Code",
-                        "User",
-                        "globalStorage",
-                        "sourcegraph.amp",
-                    ]),
-                    tilde(&[
-                        ".config",
-                        "Code - Insiders",
-                        "User",
-                        "globalStorage",
-                        "sourcegraph.amp",
-                    ]),
-                    tilde(&[
-                        ".config",
-                        "VSCodium",
-                        "User",
-                        "globalStorage",
-                        "sourcegraph.amp",
-                    ]),
-                    tilde(&[
-                        "Library",
-                        "Application Support",
-                        "Code",
-                        "User",
-                        "globalStorage",
-                        "sourcegraph.amp",
-                    ]),
-                    tilde(&[
-                        "Library",
-                        "Application Support",
-                        "Code - Insiders",
-                        "User",
-                        "globalStorage",
-                        "sourcegraph.amp",
-                    ]),
-                    tilde(&[
-                        "Library",
-                        "Application Support",
-                        "VSCodium",
-                        "User",
-                        "globalStorage",
-                        "sourcegraph.amp",
-                    ]),
-                    tilde(&[
-                        "AppData",
-                        "Roaming",
-                        "Code",
-                        "User",
-                        "globalStorage",
-                        "sourcegraph.amp",
-                    ]),
-                    tilde(&[
-                        "AppData",
-                        "Roaming",
-                        "Code - Insiders",
-                        "User",
-                        "globalStorage",
-                        "sourcegraph.amp",
-                    ]),
-                    tilde(&[
-                        "AppData",
-                        "Roaming",
-                        "VSCodium",
-                        "User",
-                        "globalStorage",
-                        "sourcegraph.amp",
-                    ]),
-                ],
                 "chatgpt" => vec![tilde(&[
                     "Library",
                     "Application Support",
@@ -1717,103 +786,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&["AppData", "Roaming", "Claude", "claude-code-sessions"]),
                     tilde(&["AppData", "Roaming", "Claude", "local-agent-mode-sessions"]),
                 ],
-                "clawdbot" => vec![tilde(&[".clawdbot", "sessions"]), tilde(&[".clawdbot"])],
-                "cline" => {
-                    let mut paths = vec![tilde(&[".cline", "data", "sessions"])];
-                    for ext in ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"] {
-                        paths.push(tilde(&[".config", "Code", "User", "globalStorage", ext]));
-                        paths.push(tilde(&[
-                            ".config",
-                            "Code - Insiders",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                        paths.push(tilde(&[
-                            ".config",
-                            "VSCodium",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                        paths.push(tilde(&[".config", "Cursor", "User", "globalStorage", ext]));
-                        paths.push(tilde(&[
-                            "Library",
-                            "Application Support",
-                            "Code",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                        paths.push(tilde(&[
-                            "Library",
-                            "Application Support",
-                            "Code - Insiders",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                        paths.push(tilde(&[
-                            "Library",
-                            "Application Support",
-                            "VSCodium",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                        paths.push(tilde(&[
-                            "Library",
-                            "Application Support",
-                            "Cursor",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                        paths.push(tilde(&[
-                            "AppData",
-                            "Roaming",
-                            "Code",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                        paths.push(tilde(&[
-                            "AppData",
-                            "Roaming",
-                            "Code - Insiders",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                        paths.push(tilde(&[
-                            "AppData",
-                            "Roaming",
-                            "VSCodium",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                        paths.push(tilde(&[
-                            "AppData",
-                            "Roaming",
-                            "Cursor",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                    }
-                    paths
-                }
                 "codex" => vec![tilde(&[".codex", "sessions"])],
-                "continue" => vec![tilde(&[".continue", "sessions"]), tilde(&[".continue"])],
-                "copilot_cli" => vec![
-                    tilde(&[".copilot", "session-state"]),
-                    tilde(&[".copilot", "history-session-state"]),
-                    tilde(&[".config", "gh-copilot"]),
-                    tilde(&[".config", "gh", "copilot"]),
-                    tilde(&[".local", "share", "github-copilot"]),
-                ],
-                "crush" => vec![tilde(&[".crush", "crush.db"]), tilde(&[".crush"])],
                 "cursor" => vec![
                     tilde(&[".cursor"]),
                     tilde(&[".config", "Cursor"]),
@@ -1838,12 +811,6 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&["AppData", "Roaming", "Devin", "User", "acp-messages"]),
                     tilde(&["AppData", "Roaming", "Devin", "User"]),
                 ],
-                "factory" => vec![
-                    tilde(&[".factory"]),
-                    tilde(&[".factory", "sessions"]),
-                    tilde(&[".factory-droid"]),
-                    tilde(&[".config", "factory-droid"]),
-                ],
                 "antigravity" => vec![
                     tilde(&[".gemini", "antigravity", "conversations"]),
                     tilde(&[".gemini", "antigravity", "brain"]),
@@ -1857,109 +824,6 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".gemini"]),
                     tilde(&[".config", "gemini"]),
                 ],
-                "github-copilot" => vec![
-                    tilde(&[".github-copilot"]),
-                    tilde(&[".config", "github-copilot"]),
-                    tilde(&[
-                        ".config",
-                        "Code",
-                        "User",
-                        "globalStorage",
-                        "github.copilot-chat",
-                    ]),
-                    tilde(&[
-                        ".config",
-                        "Code - Insiders",
-                        "User",
-                        "globalStorage",
-                        "github.copilot-chat",
-                    ]),
-                    tilde(&[
-                        ".config",
-                        "VSCodium",
-                        "User",
-                        "globalStorage",
-                        "github.copilot-chat",
-                    ]),
-                    tilde(&[
-                        "Library",
-                        "Application Support",
-                        "Code",
-                        "User",
-                        "globalStorage",
-                        "github.copilot-chat",
-                    ]),
-                    tilde(&[
-                        "Library",
-                        "Application Support",
-                        "Code - Insiders",
-                        "User",
-                        "globalStorage",
-                        "github.copilot-chat",
-                    ]),
-                    tilde(&[
-                        "Library",
-                        "Application Support",
-                        "VSCodium",
-                        "User",
-                        "globalStorage",
-                        "github.copilot-chat",
-                    ]),
-                    tilde(&[
-                        "AppData",
-                        "Roaming",
-                        "Code",
-                        "User",
-                        "globalStorage",
-                        "github.copilot-chat",
-                    ]),
-                    tilde(&[
-                        "AppData",
-                        "Roaming",
-                        "Code - Insiders",
-                        "User",
-                        "globalStorage",
-                        "github.copilot-chat",
-                    ]),
-                    tilde(&[
-                        "AppData",
-                        "Roaming",
-                        "VSCodium",
-                        "User",
-                        "globalStorage",
-                        "github.copilot-chat",
-                    ]),
-                ],
-                "goose" => vec![
-                    tilde(&[".local", "share", "goose", "sessions"]),
-                    tilde(&[".config", "goose"]),
-                    tilde(&[".goose", "sessions"]),
-                    tilde(&[".goose"]),
-                ],
-                "grok" => vec![
-                    tilde(&[".grok", "sessions"]),
-                    tilde(&[".grok", "auth.json"]),
-                    tilde(&[".grok"]),
-                ],
-                "grok_bot" => vec![tilde(&[
-                    "Library",
-                    "Application Support",
-                    "Grok Bot",
-                    "sand-client-persistence",
-                ])],
-                "hermes" => vec![tilde(&[".hermes", "state.db"]), tilde(&[".hermes"])],
-                "kimi" => vec![
-                    tilde(&[".kimi-code", "sessions"]),
-                    tilde(&[".kimi-code"]),
-                    tilde(&[".kimi", "sessions"]),
-                    tilde(&[".kimi"]),
-                ],
-                "muse" => vec![
-                    tilde(&[".local", "share", "muse", "sessions"]),
-                    tilde(&[".config", "muse", "auth.json"]),
-                    tilde(&[".local", "share", "muse"]),
-                    tilde(&[".config", "muse"]),
-                ],
                 "opencode" => vec![
                     // Direct path to the v1.2+ SQLite database — probed first
                     // so display/diagnostics surface the data file (not the
@@ -1969,40 +833,6 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".config", "opencode", "opencode.db"]),
                     tilde(&[".config", "opencode"]),
                 ],
-                "openclaw" => vec![tilde(&[".openclaw", "agents"]), tilde(&[".openclaw"])],
-                "openhands" => vec![
-                    tilde(&[".openhands", "conversations"]),
-                    tilde(&[".openhands"]),
-                ],
-                "omp" => vec![
-                    // Oh My Pi (`omp`, https://omp.sh) canonical stores; the
-                    // dedicated omp connector owns these roots. Remote
-                    // probes are static paths, so named profiles use the
-                    // profiles parent and XDG uses the conventional
-                    // ~/.local/share location.
-                    tilde(&[".omp", "agent", "sessions"]),
-                    tilde(&[".omp", "agent"]),
-                    tilde(&[".omp", "profiles"]),
-                    tilde(&[".local", "share", "omp", "sessions"]),
-                    tilde(&[".local", "share", "omp"]),
-                ],
-                "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
-                // Like Shelley, deliberately no remote probes: the default
-                // durable store is a live WAL-mode SQLite database, which
-                // cannot be SSH-synced as one consistent bundle.
-                #[allow(clippy::match_same_arms)]
-                "pi_durable" => vec![],
-                "prime_agent" => vec![
-                    tilde(&[".prime", "agent", "sessions"]),
-                    tilde(&[".prime", "agent"]),
-                ],
-                "kiro" => vec![tilde(&[".kiro", "sessions", "cli"]), tilde(&[".kiro"])],
-                // Shelley intentionally has NO remote tilde probes: a live
-                // SQLite database plus WAL cannot be SSH-synced as one
-                // consistent bundle yet (cass gh#415). The explicit arm (vs
-                // the wildcard) documents that this emptiness is deliberate.
-                #[allow(clippy::match_same_arms)]
-                "shelley" => vec![],
                 "qoder" => vec![
                     tilde(&[".qoder", "projects"]),
                     tilde(&[".qoderwork", "projects"]),
@@ -2031,8 +861,6 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".qwen", "tmp"]),
                     tilde(&[".qwen"]),
                 ],
-                "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],
-                "windsurf" => vec![tilde(&[".windsurf"]), tilde(&[".config", "windsurf"])],
                 _ => vec![],
             };
             (slug, paths)
@@ -2101,41 +929,6 @@ pub fn detect_installed_agents(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gh423_product_aliases_resolve_to_one_shared_lineage() {
-        for alias in ["codebuff", "freebuff", "manicode", "codebuff-lineage"] {
-            assert_eq!(canonical_connector_slug(alias), Some("codebuff"));
-        }
-        assert_eq!(
-            KNOWN_CONNECTORS
-                .iter()
-                .filter(|slug| **slug == "codebuff")
-                .count(),
-            1
-        );
-        assert!(!KNOWN_CONNECTORS.contains(&"freebuff"));
-        let dir = tempfile::tempdir().unwrap();
-        let report = detect_installed_agents(&AgentDetectOptions {
-            only_connectors: Some(vec!["freebuff".into(), "codebuff".into()]),
-            include_undetected: true,
-            root_overrides: vec![AgentDetectRootOverride {
-                slug: "freebuff".into(),
-                root: dir.path().into(),
-            }],
-        })
-        .unwrap();
-        assert_eq!(report.installed_agents.len(), 1);
-        assert_eq!(report.installed_agents[0].slug, "codebuff");
-        #[cfg(feature = "codebuff")]
-        assert_eq!(
-            get_connector_factories()
-                .iter()
-                .filter(|(slug, _)| *slug == "codebuff")
-                .count(),
-            1
-        );
-    }
 
     // cass #448: the Claude Code detection probe must agree with the
     // connector's root resolver (CLAUDE_CONFIG_DIR, then XDG_CONFIG_HOME,
@@ -2362,30 +1155,6 @@ mod tests {
     }
 
     #[test]
-    fn omp_connector_detects_via_overrides_and_aliases() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let sessions = tmp.path().join(".omp").join("agent").join("sessions");
-        std::fs::create_dir_all(&sessions).expect("mkdir omp sessions");
-
-        // "oh-my-pi" alias must canonicalize to the omp connector.
-        let report = detect_installed_agents(&AgentDetectOptions {
-            only_connectors: Some(vec!["oh-my-pi".to_string()]),
-            include_undetected: true,
-            root_overrides: vec![AgentDetectRootOverride {
-                slug: "omp".to_string(),
-                root: sessions,
-            }],
-        })
-        .expect("detect");
-
-        assert_eq!(report.summary.total_count, 1);
-        assert_eq!(report.summary.detected_count, 1);
-        let entry = &report.installed_agents[0];
-        assert_eq!(entry.slug, "omp");
-        assert!(entry.detected);
-    }
-
-    #[test]
     fn unknown_connectors_are_rejected() {
         let err = detect_installed_agents(&AgentDetectOptions {
             only_connectors: Some(vec!["not-a-real-connector".to_string()]),
@@ -2433,139 +1202,48 @@ mod tests {
     fn cass_connectors_and_aliases_detect_via_overrides() {
         let tmp = tempfile::tempdir().expect("tempdir");
 
-        let aider_file = tmp.path().join("aider").join(".aider.chat.history.md");
-        std::fs::create_dir_all(aider_file.parent().expect("aider parent")).expect("mkdir aider");
-        std::fs::write(&aider_file, "stub").expect("write aider file");
-
-        let amp_root = tmp.path().join("amp-root");
-        std::fs::create_dir_all(&amp_root).expect("mkdir amp");
-
         let chatgpt_root = tmp.path().join("chatgpt-root");
         std::fs::create_dir_all(&chatgpt_root).expect("mkdir chatgpt");
 
-        let clawdbot_sessions = tmp.path().join("clawdbot").join("sessions");
-        std::fs::create_dir_all(&clawdbot_sessions).expect("mkdir clawdbot");
+        let antigravity_root = tmp.path().join("antigravity-root");
+        std::fs::create_dir_all(&antigravity_root).expect("mkdir antigravity");
 
-        let openclaw_agents = tmp.path().join("openclaw").join("agents");
-        std::fs::create_dir_all(&openclaw_agents).expect("mkdir openclaw");
-
-        let pi_sessions = tmp.path().join("pi").join("agent").join("sessions");
-        std::fs::create_dir_all(&pi_sessions).expect("mkdir pi");
-
-        let vibe_sessions = tmp.path().join("vibe").join("logs").join("session");
-        std::fs::create_dir_all(&vibe_sessions).expect("mkdir vibe");
+        let qoder_root = tmp.path().join("qoder-root");
+        std::fs::create_dir_all(&qoder_root).expect("mkdir qoder");
 
         let report = detect_installed_agents(&AgentDetectOptions {
             only_connectors: Some(vec![
-                "aider".to_string(),
-                "amp".to_string(),
+                "agy".to_string(),
                 "chatgpt".to_string(),
-                "clawdbot".to_string(),
-                "open-claw".to_string(),
-                "pi-agent".to_string(),
-                "vibe".to_string(),
+                "qoder-cli".to_string(),
             ]),
             include_undetected: true,
             root_overrides: vec![
                 AgentDetectRootOverride {
-                    slug: "aider-cli".to_string(),
-                    root: aider_file,
-                },
-                AgentDetectRootOverride {
-                    slug: "amp".to_string(),
-                    root: amp_root,
+                    slug: "antigravity-cli".to_string(),
+                    root: antigravity_root,
                 },
                 AgentDetectRootOverride {
                     slug: "chatgpt-desktop".to_string(),
                     root: chatgpt_root,
                 },
                 AgentDetectRootOverride {
-                    slug: "clawdbot".to_string(),
-                    root: clawdbot_sessions,
-                },
-                AgentDetectRootOverride {
-                    slug: "open-claw".to_string(),
-                    root: openclaw_agents,
-                },
-                AgentDetectRootOverride {
-                    slug: "pi-agent".to_string(),
-                    root: pi_sessions.clone(),
-                },
-                AgentDetectRootOverride {
-                    slug: "vibe-cli".to_string(),
-                    root: vibe_sessions,
+                    slug: "qoderwork".to_string(),
+                    root: qoder_root,
                 },
             ],
         })
         .expect("detect");
 
-        assert_eq!(report.summary.total_count, 7);
-        assert_eq!(report.summary.detected_count, 7);
+        assert_eq!(report.summary.total_count, 3);
+        assert_eq!(report.summary.detected_count, 3);
 
         let slugs: Vec<&str> = report
             .installed_agents
             .iter()
             .map(|entry| entry.slug.as_str())
             .collect();
-        assert_eq!(
-            slugs,
-            vec![
-                "aider", "amp", "chatgpt", "clawdbot", "openclaw", "pi_agent", "vibe"
-            ]
-        );
-
-        let pi = report
-            .installed_agents
-            .iter()
-            .find(|entry| entry.slug == "pi_agent")
-            .expect("pi_agent entry");
-        assert_eq!(pi.root_paths, vec![pi_sessions.display().to_string()]);
-    }
-
-    #[test]
-    fn amp_xdg_probe_root_uses_trimmed_env_value() {
-        let root = amp_xdg_probe_root_from_env_value("  /tmp/cass-xdg  ").expect("amp xdg root");
-        assert_eq!(root, PathBuf::from("/tmp/cass-xdg").join("amp"));
-    }
-
-    #[test]
-    fn amp_xdg_probe_root_rejects_blank_env_value() {
-        assert!(amp_xdg_probe_root_from_env_value("   ").is_none());
-    }
-
-    #[test]
-    fn cline_storage_probe_roots_cover_vscode_and_cursor_layouts() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let roots = cline_storage_probe_roots_from_home(tmp.path());
-
-        assert!(
-            roots.contains(
-                &tmp.path()
-                    .join(".config/Code/User/globalStorage/saoudrizwan.claude-dev")
-            ),
-            "expected VS Code Cline storage root in {roots:?}"
-        );
-        assert!(
-            roots.contains(
-                &tmp.path()
-                    .join(".config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev")
-            ),
-            "expected VS Code Insiders Cline storage root in {roots:?}"
-        );
-        assert!(
-            roots.contains(
-                &tmp.path()
-                    .join(".config/VSCodium/User/globalStorage/saoudrizwan.claude-dev")
-            ),
-            "expected VSCodium Cline storage root in {roots:?}"
-        );
-        assert!(
-            roots.contains(
-                &tmp.path()
-                    .join(".config/Cursor/User/globalStorage/rooveterinaryinc.roo-cline")
-            ),
-            "expected Cursor Roo-Cline storage root in {roots:?}"
-        );
+        assert_eq!(slugs, vec!["antigravity", "chatgpt", "qoder"]);
     }
 
     #[test]
@@ -2576,104 +1254,15 @@ mod tests {
             by_slug.insert(slug, paths);
         }
 
-        let factory = by_slug.get("factory").expect("factory paths");
-        assert!(factory.contains(&"~/.factory".to_string()));
-        assert!(factory.contains(&"~/.factory/sessions".to_string()));
-        assert!(factory.contains(&"~/.factory-droid".to_string()));
-        assert!(factory.contains(&"~/.config/factory-droid".to_string()));
-
-        let amp = by_slug.get("amp").expect("amp paths");
-        assert!(
-            amp.contains(
-                &"~/.config/Code - Insiders/User/globalStorage/sourcegraph.amp".to_string()
-            )
-        );
-        assert!(
-            amp.contains(
-                &"~/Library/Application Support/VSCodium/User/globalStorage/sourcegraph.amp"
-                    .to_string()
-            )
-        );
-
         let opencode = by_slug.get("opencode").expect("opencode paths");
         assert!(opencode.contains(&"~/.local/share/opencode".to_string()));
         assert!(opencode.contains(&"~/.config/opencode".to_string()));
-
-        let copilot = by_slug.get("github-copilot").expect("github-copilot paths");
-        assert!(
-            copilot.contains(&"~/.config/Code/User/globalStorage/github.copilot-chat".to_string())
-        );
-        assert!(
-            copilot.contains(
-                &"~/Library/Application Support/Code/User/globalStorage/github.copilot-chat"
-                    .to_string()
-            )
-        );
-        assert!(copilot.contains(
-            &"~/AppData/Roaming/Code/User/globalStorage/github.copilot-chat".to_string()
-        ));
-        assert!(copilot.contains(&"~/.github-copilot".to_string()));
-        assert!(copilot.contains(&"~/.config/github-copilot".to_string()));
 
         let cursor = by_slug.get("cursor").expect("cursor paths");
         assert!(cursor.contains(&"~/.config/Cursor".to_string()));
         assert!(cursor.contains(&"~/.config/Cursor/User".to_string()));
         assert!(cursor.contains(&"~/Library/Application Support/Cursor/User".to_string()));
         assert!(cursor.contains(&"~/AppData/Roaming/Cursor/User".to_string()));
-
-        let windsurf = by_slug.get("windsurf").expect("windsurf paths");
-        assert!(windsurf.contains(&"~/.config/windsurf".to_string()));
-
-        let hermes = by_slug.get("hermes").expect("hermes paths");
-        assert!(hermes.contains(&"~/.hermes/state.db".to_string()));
-        assert!(hermes.contains(&"~/.hermes".to_string()));
-
-        let grok = by_slug.get("grok").expect("grok paths");
-        assert!(grok.contains(&"~/.grok/sessions".to_string()));
-        assert!(grok.contains(&"~/.grok/auth.json".to_string()));
-        assert!(grok.contains(&"~/.grok".to_string()));
-        assert_eq!(
-            by_slug.get("grok_bot").expect("Grok Bot paths"),
-            &vec!["~/Library/Application Support/Grok Bot/sand-client-persistence".to_string()]
-        );
-
-        let muse = by_slug.get("muse").expect("muse paths");
-        assert!(muse.contains(&"~/.local/share/muse/sessions".to_string()));
-        assert!(muse.contains(&"~/.config/muse/auth.json".to_string()));
-        assert!(muse.contains(&"~/.local/share/muse".to_string()));
-        assert!(muse.contains(&"~/.config/muse".to_string()));
-
-        let kimi = by_slug.get("kimi").expect("kimi paths");
-        assert!(kimi.contains(&"~/.kimi-code/sessions".to_string()));
-        assert!(kimi.contains(&"~/.kimi-code".to_string()));
-        assert!(kimi.contains(&"~/.kimi/sessions".to_string()));
-        assert!(kimi.contains(&"~/.kimi".to_string()));
-
-        // Oh My Pi (`omp`) now has its own first-class connector; pi_agent
-        // is scoped back to the upstream pi-mono home only.
-        let pi_agent = by_slug.get("pi_agent").expect("pi_agent paths");
-        assert!(pi_agent.contains(&"~/.pi/agent/sessions".to_string()));
-        assert!(!pi_agent.iter().any(|p| p.contains(".omp")));
-
-        let omp = by_slug.get("omp").expect("omp paths");
-        assert!(omp.contains(&"~/.omp/agent/sessions".to_string()));
-        assert!(omp.contains(&"~/.omp/agent".to_string()));
-
-        let cline = by_slug.get("cline").expect("cline paths");
-        assert!(
-            cline.contains(&"~/.config/Code/User/globalStorage/saoudrizwan.claude-dev".to_string())
-        );
-        assert!(cline.contains(
-            &"~/.config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev".to_string()
-        ));
-        assert!(
-            cline.contains(
-                &"~/.config/VSCodium/User/globalStorage/saoudrizwan.claude-dev".to_string()
-            )
-        );
-        assert!(cline.contains(
-            &"~/AppData/Roaming/Cursor/User/globalStorage/rooveterinaryinc.roo-cline".to_string()
-        ));
 
         let qoder = by_slug.get("qoder").expect("qoder paths");
         assert!(qoder.contains(&"~/.qoder/projects".to_string()));
@@ -2704,8 +1293,7 @@ mod tests {
     /// (`KNOWN_CONNECTORS`, `canonical_connector_slug`,
     /// `default_probe_roots`, `default_probe_paths_tilde`, and the factory
     /// list) must agree exactly. Range-editing one table has twice silently
-    /// dropped a sibling row (kimi/openclaw module arms, "open-claw" alias);
-    /// this pins every table to the slug set mechanically.
+    /// dropped a sibling row; this pins every table to the slug set mechanically.
     /// Every `agent_slug` a connector writes into its conversations must be
     /// accepted by detection, so a consumer can go from a conversation back
     /// to `detect_installed_agents` (bead 8np: `claude_code` vs `claude`).
@@ -2713,20 +1301,10 @@ mod tests {
     fn emitted_conversation_slugs_resolve_in_the_registry() {
         for (emitted, canonical) in [
             ("claude_code", "claude"),
-            ("copilot", "github-copilot"),
-            ("copilot_vscode", "github-copilot"),
-            ("copilot_cli", "copilot_cli"),
-            ("continue", "continue"),
-            ("continue_dev", "continue"),
-            ("openclaw/main", "openclaw"),
-            ("openclaw/coder", "openclaw"),
-            ("pi_agent", "pi_agent"),
-            ("pi_mono", "pi_agent"),
-            ("pi_durable", "pi_durable"),
-            ("omp", "omp"),
-            ("oh_my_pi", "omp"),
-            ("prime_agent", "prime_agent"),
-            ("grok_bot", "grok_bot"),
+            ("codex-cli", "codex"),
+            ("qoder-cli", "qoder"),
+            ("qoderwork", "qoder"),
+            ("agy", "antigravity"),
         ] {
             assert_eq!(
                 canonical_connector_slug(emitted),
@@ -2734,15 +1312,13 @@ mod tests {
                 "{emitted}"
             );
         }
-        for (query, expected_slug) in [("claude_code", "claude"), ("openclaw/main", "openclaw")] {
-            let report = detect_installed_agents(&AgentDetectOptions {
-                only_connectors: Some(vec![query.into()]),
-                include_undetected: true,
-                root_overrides: Vec::new(),
-            })
-            .expect("emitted slug resolves");
-            assert_eq!(report.installed_agents[0].slug, expected_slug);
-        }
+        let report = detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec!["claude_code".into()]),
+            include_undetected: true,
+            root_overrides: Vec::new(),
+        })
+        .expect("emitted slug resolves");
+        assert_eq!(report.installed_agents[0].slug, "claude");
     }
 
     #[test]
@@ -2787,48 +1363,20 @@ mod tests {
             "tilde table must not repeat a connector"
         );
         for (slug, paths) in default_probe_paths_tilde() {
-            // Shelley's arm is intentionally empty: no safe remote
-            // export/sync of a live SQLite database exists yet (cass gh#415).
             assert!(
-                !paths.is_empty() || slug == "shelley" || slug == "pi_durable",
+                !paths.is_empty(),
                 "connector {slug} has empty tilde paths"
             );
         }
 
         // 4. The compiled factory registry covers every scanning connector.
-        // Detection-only slugs (no scan implementation) are enumerated so a
-        // new full connector can't be forgotten: add it to
-        // `get_connector_factories` or to this allowlist. Connectors that
-        // live behind their own cargo feature (SQLite/crypto deps) register
-        // only when compiled in, so they are checked against `cfg!` rather
-        // than assumed present — this leg must hold for `--features
-        // connectors`, `--all-features`, and every mix in between. The
-        // factory list itself only exists with `connectors` (`default = []`),
-        // so the leg is gated; checks 1-3 still run under a plain
-        // `cargo test`.
         #[cfg(feature = "connectors")]
         {
-            // Slugs with no scan implementation at all (no module under
-            // `connectors/`). Everything else must register a factory.
-            let detection_only: HashSet<&str> = HashSet::from(["windsurf"]);
             let feature_gated: HashMap<&str, bool> = HashMap::from([
                 ("chatgpt", cfg!(feature = "chatgpt")),
-                ("codebuff", cfg!(feature = "codebuff")),
-                ("crush", cfg!(feature = "crush")),
                 ("cursor", cfg!(feature = "cursor")),
-                ("goose", cfg!(feature = "goose")),
-                ("grok_bot", cfg!(feature = "grok-bot")),
-                ("hermes", cfg!(feature = "hermes")),
                 ("opencode", cfg!(feature = "opencode")),
-                ("shelley", cfg!(feature = "shelley")),
             ]);
-            // Factory slugs are the connector-native names (e.g. `copilot`
-            // for VS Code Copilot chat, which this registry knows as
-            // `github-copilot`), so compare after canonicalising. Every
-            // factory must map into KNOWN_CONNECTORS: a factory registered
-            // under a slug the registry cannot name is unreachable from
-            // `franken_detection_for_connector`, and a slug registered twice
-            // means two factories fight over one connector.
             let mut factory_slugs: HashSet<&str> = HashSet::new();
             for (raw, _) in get_connector_factories() {
                 let canonical = canonical_connector_slug(raw).unwrap_or_else(|| {
@@ -2841,13 +1389,6 @@ mod tests {
                 );
             }
             for slug in KNOWN_CONNECTORS {
-                if detection_only.contains(slug) {
-                    assert!(
-                        !factory_slugs.contains(slug),
-                        "connector {slug} has a factory and must leave the detection-only allowlist"
-                    );
-                    continue;
-                }
                 match feature_gated.get(slug) {
                     Some(false) => assert!(
                         !factory_slugs.contains(slug),

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use franken_agent_detection::{
-    Connector, FactoryConnector, Origin, PrimeAgentConnector, ScanContext, ScanRoot, VibeConnector,
+    ClaudeCodeConnector, CodexConnector, Connector, Origin, QoderConnector, ScanContext, ScanRoot,
 };
 
 fn put(path: &Path, bytes: &[u8]) {
@@ -26,20 +26,25 @@ fn context(container: PathBuf, source: &str) -> ScanContext {
 }
 
 #[test]
-fn application_named_factory_and_prime_projects_are_not_expanded_again() {
-    let cases: [(&str, &str, Box<dyn Connector>); 2] = [
+fn application_named_codex_and_qoder_projects_are_not_expanded_again() {
+    let cases: [(&str, &str, &str, Box<dyn Connector>); 2] = [
         (
-            ".factory/sessions/.factory",
-            "{\"type\":\"session_start\",\"id\":\"factory-owned\"}\n",
-            Box::new(FactoryConnector::new()),
+            ".codex/sessions/.codex",
+            "rollout-2026-01-05T10-00-00-s1.jsonl",
+            concat!(
+                "{\"timestamp\":\"2026-01-05T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-owned\"}}\n",
+                "{\"timestamp\":\"2026-01-05T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"selected project\"}}\n"
+            ),
+            Box::new(CodexConnector::new()),
         ),
         (
-            ".prime/agent/sessions/.prime",
-            "{\"type\":\"session\",\"version\":1,\"id\":\"prime-owned\"}\n",
-            Box::new(PrimeAgentConnector::new()),
+            ".qoder/projects/.qoder",
+            "11111111-1111-4111-8111-111111111111.jsonl",
+            "{\"uuid\":\"u1\",\"parentUuid\":null,\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"timestamp\":\"2026-01-05T10:00:00Z\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"selected project\"}}\n",
+            Box::new(QoderConnector::new()),
         ),
     ];
-    for (store, header, connector) in cases {
+    for (store, filename, content, connector) in cases {
         for (slash, retained) in [(false, true), (true, true), (true, false)] {
             let temp = tempfile::tempdir().unwrap();
             let container = temp.path().join("opaque_hash");
@@ -48,11 +53,7 @@ fn application_named_factory_and_prime_projects_are_not_expanded_again() {
             } else {
                 container.clone()
             };
-            let file = payload.join("session.jsonl");
-            let content = format!(
-                "{header}{}\n",
-                r#"{"type":"message","message":{"role":"user","content":"selected project"}}"#
-            );
+            let file = payload.join(filename);
             put(&file, content.as_bytes());
             let source = format!("~/{store}{}", if slash { "/" } else { "" });
             let ctx = context(container, &source);
@@ -65,10 +66,7 @@ fn application_named_factory_and_prime_projects_are_not_expanded_again() {
             assert_eq!(scanned[0].messages[0].content, "selected project");
             assert_eq!(scanned[0].source_path, file);
             let native = temp.path().join("native");
-            put(
-                &native.join(store).join("session.jsonl"),
-                content.as_bytes(),
-            );
+            put(&native.join(store).join(filename), content.as_bytes());
             let local = ScanContext::with_roots(
                 temp.path().join("state"),
                 vec![ScanRoot::local(native)],
@@ -106,35 +104,35 @@ fn assert_selected_scope(connector: &dyn Connector, ctx: &ScanContext, rejected:
 }
 
 #[test]
-fn selected_vibe_non_directory_leaf_does_not_ingest_container_messages() {
+fn selected_claude_non_directory_leaf_does_not_ingest_container_messages() {
     for invalid_leaf in [false, true] {
         let temp = tempfile::tempdir().unwrap();
         let container = temp.path().join("opaque_hash");
-        let file = container.join("messages.jsonl");
-        let content = b"{\"role\":\"user\",\"content\":\"container transcript\"}\n";
+        let file = container.join("session.jsonl");
+        let content = b"{\"type\":\"user\",\"timestamp\":\"2026-01-05T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"container transcript\"}}\n";
         put(&file, content);
         if invalid_leaf {
             fs::write(container.join("selected"), b"not a directory").unwrap();
         }
-        let ctx = context(container, "~/.vibe/logs/session/selected/");
-        assert_selected_scope(&VibeConnector::new(), &ctx, invalid_leaf);
+        let ctx = context(container, "~/.claude/projects/selected/");
+        assert_selected_scope(&ClaudeCodeConnector::new(), &ctx, invalid_leaf);
         assert_eq!(fs::read(&file).unwrap(), content);
     }
 }
 
 #[cfg(unix)]
 #[test]
-fn dangling_selected_vibe_leaf_does_not_ingest_container_messages() {
+fn dangling_selected_claude_leaf_does_not_ingest_container_messages() {
     let temp = tempfile::tempdir().unwrap();
     let container = temp.path().join("opaque_hash");
-    let file = container.join("messages.jsonl");
-    let content = b"{\"role\":\"user\",\"content\":\"container transcript\"}\n";
+    let file = container.join("session.jsonl");
+    let content = b"{\"type\":\"user\",\"timestamp\":\"2026-01-05T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"container transcript\"}}\n";
     put(&file, content);
     let leaf = container.join("selected");
     let target = temp.path().join("missing");
     std::os::unix::fs::symlink(&target, &leaf).unwrap();
-    let ctx = context(container, "~/.vibe/logs/session/selected/");
-    assert_selected_scope(&VibeConnector::new(), &ctx, true);
+    let ctx = context(container, "~/.claude/projects/selected/");
+    assert_selected_scope(&ClaudeCodeConnector::new(), &ctx, true);
     assert_eq!(fs::read_link(&leaf).unwrap(), target);
     assert_eq!(fs::read(&file).unwrap(), content);
 }

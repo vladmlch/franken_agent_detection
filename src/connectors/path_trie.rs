@@ -218,8 +218,8 @@ mod tests {
         );
         trie.insert(
             "/remote/home",
-            "/local/copilot",
-            Some(vec!["copilot".to_string()]),
+            "/local/codex",
+            Some(vec!["codex".to_string()]),
         );
 
         assert_eq!(
@@ -227,8 +227,8 @@ mod tests {
             "/local/claude/project"
         );
         assert_eq!(
-            trie.lookup("/remote/home/project", Some("copilot")),
-            "/local/copilot/project"
+            trie.lookup("/remote/home/project", Some("codex")),
+            "/local/codex/project"
         );
         // None agent should not match agent-specific mappings
         assert_eq!(
@@ -267,60 +267,56 @@ mod tests {
     }
 
     #[test]
-    fn path_trie_agent_filter_matches_canonical_connector_aliases_and_openclaw_subagents() {
+    fn path_trie_agent_filter_matches_canonical_connector_aliases_and_subagents() {
         let mut trie = PathTrie::new();
         trie.insert(
-            "/remote/openclaw",
-            "/local/openclaw",
-            Some(vec!["openclaw".to_string()]),
+            "/remote/codex",
+            "/local/codex",
+            Some(vec!["codex-cli".to_string()]),
         );
         trie.insert(
-            "/remote/openclaw-main",
-            "/local/openclaw-main",
-            Some(vec!["openclaw/main".to_string()]),
+            "/remote/codex-main",
+            "/local/codex-main",
+            Some(vec!["codex/main".to_string()]),
         );
         trie.insert(
-            "/remote/copilot",
-            "/local/copilot",
-            Some(vec!["github-copilot".to_string()]),
+            "/remote/qoder",
+            "/local/qoder",
+            Some(vec!["qoderwork".to_string()]),
         );
         trie.insert(
-            "/remote/codebuff",
-            "/local/codebuff",
-            Some(vec!["freebuff".to_string()]),
+            "/remote/agy",
+            "/local/agy",
+            Some(vec!["agy".to_string()]),
         );
 
-        // Connector-level "openclaw" matches qualified "openclaw/<agent>" slugs.
+        // Canonical alias "codex-cli" matches emitted "codex".
         assert_eq!(
-            trie.lookup("/remote/openclaw/proj", Some("openclaw/main")),
-            "/local/openclaw/proj"
+            trie.lookup("/remote/codex/proj", Some("codex")),
+            "/local/codex/proj"
+        );
+        // Subagent-qualified "codex/main" matches only "codex/main", not "codex/coder".
+        assert_eq!(
+            trie.lookup("/remote/codex-main/proj", Some("codex/main")),
+            "/local/codex-main/proj"
         );
         assert_eq!(
-            trie.lookup("/remote/openclaw/proj", Some("openclaw/coder")),
-            "/local/openclaw/proj"
+            trie.lookup("/remote/codex-main/proj", Some("codex/coder")),
+            "/remote/codex-main/proj"
         );
-        // Subagent-qualified "openclaw/main" matches only "openclaw/main", not "openclaw/coder".
+        // "qoderwork" alias matches "qoder" and "qoder-cli".
         assert_eq!(
-            trie.lookup("/remote/openclaw-main/proj", Some("openclaw/main")),
-            "/local/openclaw-main/proj"
-        );
-        assert_eq!(
-            trie.lookup("/remote/openclaw-main/proj", Some("openclaw/coder")),
-            "/remote/openclaw-main/proj"
-        );
-        // "github-copilot" matches emitted "copilot" and "copilot_vscode".
-        assert_eq!(
-            trie.lookup("/remote/copilot/proj", Some("copilot")),
-            "/local/copilot/proj"
+            trie.lookup("/remote/qoder/proj", Some("qoder")),
+            "/local/qoder/proj"
         );
         assert_eq!(
-            trie.lookup("/remote/copilot/proj", Some("copilot_vscode")),
-            "/local/copilot/proj"
+            trie.lookup("/remote/qoder/proj", Some("qoder-cli")),
+            "/local/qoder/proj"
         );
-        // Product alias "freebuff" matches emitted "codebuff".
+        // Product alias "agy" matches emitted "antigravity".
         assert_eq!(
-            trie.lookup("/remote/codebuff/proj", Some("codebuff")),
-            "/local/codebuff/proj"
+            trie.lookup("/remote/agy/proj", Some("antigravity")),
+            "/local/agy/proj"
         );
     }
 

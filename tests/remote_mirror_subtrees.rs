@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use franken_agent_detection::{
-    Connector, FactoryConnector, Origin, Platform, PrimeAgentConnector, ScanContext, ScanRoot,
+    CodexConnector, Connector, Origin, Platform, QoderConnector, ScanContext, ScanRoot,
 };
 
 fn put(path: &Path, bytes: &[u8]) {
@@ -23,22 +23,19 @@ struct Case {
 fn strict_provider_project_mirrors_ingest_only_the_selected_payload() {
     let cases = [
         Case {
-            connector: Box::new(FactoryConnector::new()),
-            source: ".factory/sessions/project-a",
-            file: "session.jsonl",
+            connector: Box::new(CodexConnector::new()),
+            source: ".codex/sessions/2026",
+            file: "rollout-2026-01-05T10-00-00-s1.jsonl",
             content: concat!(
-                "{\"type\":\"session_start\",\"id\":\"factory-subtree\"}\n",
-                "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"selected payload\"}}\n"
+                "{\"timestamp\":\"2026-01-05T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-subtree\"}}\n",
+                "{\"timestamp\":\"2026-01-05T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"selected payload\"}}\n"
             ),
         },
         Case {
-            connector: Box::new(PrimeAgentConnector::new()),
-            source: ".prime/agent/sessions/project-a",
-            file: "session.jsonl",
-            content: concat!(
-                "{\"type\":\"session\",\"version\":1,\"id\":\"prime-subtree\"}\n",
-                "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"selected payload\"}}\n"
-            ),
+            connector: Box::new(QoderConnector::new()),
+            source: ".qoder/projects/project-a",
+            file: "11111111-1111-4111-8111-111111111111.jsonl",
+            content: "{\"uuid\":\"u1\",\"parentUuid\":null,\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"timestamp\":\"2026-01-05T10:00:00Z\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"selected payload\"}}\n",
         },
     ];
     for case in cases {

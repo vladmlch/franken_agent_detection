@@ -15,19 +15,11 @@ use tempfile::TempDir;
 const CHILD_ROOT: &str = "FAD_ROOT_PROBE_TEST_ROOT";
 const CHILD_SLUG: &str = "FAD_ROOT_PROBE_TEST_SLUG";
 const CHILD_EXPECTED: &str = "FAD_ROOT_PROBE_TEST_EXPECTED";
-const VARIABLES: [&str; 12] = [
+const VARIABLES: [&str; 4] = [
     "GEMINI_HOME",
     "OPENCODE_STORAGE_ROOT",
     "OPENCODE_SQLITE_DB",
-    "HERMES_HOME",
-    "HERMES_SQLITE_DB",
-    "CRUSH_SQLITE_DB",
-    "GOOSE_PATH_ROOT",
-    "GOOSE_SQLITE_DB",
     "CASS_CURSOR_PROJECTS_ROOT",
-    "CASS_OMP_DATA_ROOT",
-    "PI_CODING_AGENT_SESSION_DIR",
-    "PI_CONFIG_DIR",
 ];
 
 // Table columns: overrides, existing directories, existing files, expected roots.
@@ -68,7 +60,7 @@ fn run_cases(slug: &str, cases: &[ProbeCase<'_>]) {
             command.env_remove(variable);
         }
         for &(variable, value) in variables {
-            if value.trim().is_empty() || variable == "PI_CONFIG_DIR" {
+            if value.trim().is_empty() {
                 command.env(variable, value);
             } else {
                 command.env(variable, root.path().join(value));
@@ -241,150 +233,6 @@ fn opencode_custom_stores_are_additive_and_invalid_kinds_allow_fallbacks() {
 }
 
 #[test]
-fn hermes_selects_explicit_database_then_home_then_defaults() {
-    run_cases(
-        "hermes",
-        &[
-            (
-                &[("HERMES_SQLITE_DB", "selected")],
-                &[],
-                &["selected"],
-                &["selected"],
-            ),
-            (
-                &[("HERMES_HOME", "custom")],
-                &[],
-                &["custom/state.db"],
-                &["custom/state.db"],
-            ),
-            (
-                &[("HERMES_SQLITE_DB", "selected"), ("HERMES_HOME", "custom")],
-                &[],
-                &["selected", "custom/state.db", "home/.hermes/state.db"],
-                &["selected"],
-            ),
-            (
-                &[("HERMES_SQLITE_DB", "directory"), ("HERMES_HOME", "custom")],
-                &["directory"],
-                &["custom/state.db", "home/.hermes/state.db"],
-                &["custom/state.db"],
-            ),
-            (
-                &[("HERMES_SQLITE_DB", "missing"), ("HERMES_HOME", "custom")],
-                &["custom/state.db"],
-                &["home/.hermes/state.db"],
-                &["home/.hermes/state.db", "home/.hermes"],
-            ),
-            (
-                &[("HERMES_SQLITE_DB", "missing"), ("HERMES_HOME", "file")],
-                &[],
-                &["file", "home/.hermes/state.db"],
-                &["home/.hermes/state.db", "home/.hermes"],
-            ),
-        ],
-    );
-}
-
-#[test]
-fn crush_selects_an_explicit_file_and_falls_back_when_unavailable() {
-    run_cases(
-        "crush",
-        &[
-            (
-                &[("CRUSH_SQLITE_DB", "selected")],
-                &[],
-                &["selected"],
-                &["selected"],
-            ),
-            (
-                &[("CRUSH_SQLITE_DB", "selected")],
-                &[],
-                &["selected", "home/.crush/crush.db"],
-                &["selected"],
-            ),
-            (
-                &[("CRUSH_SQLITE_DB", "missing")],
-                &[],
-                &["home/.crush/crush.db"],
-                &["home/.crush", "home/.crush/crush.db"],
-            ),
-            (
-                &[("CRUSH_SQLITE_DB", "directory")],
-                &["directory"],
-                &["home/.crush/crush.db"],
-                &["home/.crush", "home/.crush/crush.db"],
-            ),
-        ],
-    );
-}
-
-#[test]
-fn goose_database_and_jsonl_directory_fallbacks_are_independent() {
-    run_cases(
-        "goose",
-        &[
-            (
-                &[("GOOSE_SQLITE_DB", "selected")],
-                &[],
-                &["selected"],
-                &["selected"],
-            ),
-            (
-                &[
-                    ("GOOSE_SQLITE_DB", "selected"),
-                    ("GOOSE_PATH_ROOT", "missing"),
-                ],
-                &[],
-                &["selected"],
-                &["selected"],
-            ),
-            (
-                &[("GOOSE_PATH_ROOT", "custom")],
-                &["custom/data/sessions"],
-                &[],
-                &["custom/data/sessions"],
-            ),
-            (
-                &[
-                    ("GOOSE_SQLITE_DB", "selected"),
-                    ("GOOSE_PATH_ROOT", "missing"),
-                ],
-                &["home/.local/share/goose/sessions"],
-                &["selected"],
-                &["selected", "home/.local/share/goose/sessions"],
-            ),
-            (
-                &[
-                    ("GOOSE_SQLITE_DB", "missing"),
-                    ("GOOSE_PATH_ROOT", "custom"),
-                ],
-                &["custom/data/sessions"],
-                &["home/.local/share/goose/sessions/sessions.db"],
-                &[
-                    "home/.local/share/goose/sessions/sessions.db",
-                    "custom/data/sessions",
-                ],
-            ),
-            (
-                &[
-                    ("GOOSE_SQLITE_DB", "directory"),
-                    ("GOOSE_PATH_ROOT", "custom"),
-                ],
-                &["directory", "home/.local/share/goose/sessions"],
-                &["custom/data/sessions/sessions.db"],
-                &["custom/data/sessions/sessions.db", "custom/data/sessions"],
-            ),
-            (
-                &[("GOOSE_PATH_ROOT", "file")],
-                &[],
-                &["file", "home/.goose/sessions/sessions.db"],
-                &["home/.goose/sessions/sessions.db", "home/.goose/sessions"],
-            ),
-        ],
-    );
-}
-
-#[test]
 fn cursor_projects_replace_agent_history_and_preserve_composer_probes() {
     run_cases(
         "cursor",
@@ -422,43 +270,6 @@ fn cursor_projects_replace_agent_history_and_preserve_composer_probes() {
 }
 
 #[test]
-fn omp_custom_roots_and_v18_session_and_config_overrides() {
-    run_cases(
-        "omp",
-        &[
-            (
-                &[("CASS_OMP_DATA_ROOT", "custom-omp")],
-                &["custom-omp", "home/.omp/agent/sessions"],
-                &[],
-                &["custom-omp"],
-            ),
-            (
-                &[("CASS_OMP_DATA_ROOT", "missing-omp")],
-                &["home/.omp/agent/sessions"],
-                &[],
-                &[],
-            ),
-            (
-                &[("PI_CODING_AGENT_SESSION_DIR", "launch-sessions")],
-                &["launch-sessions", "home/.omp/agent/sessions"],
-                &[],
-                &[
-                    "launch-sessions",
-                    "home/.omp/agent/sessions",
-                    "home/.omp/agent",
-                ],
-            ),
-            (
-                &[("PI_CONFIG_DIR", ".omp2")],
-                &["home/.omp2/agent/sessions", "home/.omp/agent/sessions"],
-                &[],
-                &["home/.omp2/agent/sessions", "home/.omp2/agent"],
-            ),
-        ],
-    );
-}
-
-#[test]
 fn unset_and_blank_custom_variables_preserve_default_probe_roots() {
     let defaults: &[DefaultProbeCase<'_>] = &[
         (
@@ -474,38 +285,10 @@ fn unset_and_blank_custom_variables_preserve_default_probe_roots() {
             &["home/.local/share/opencode"],
         ),
         (
-            "hermes",
-            &["HERMES_HOME", "HERMES_SQLITE_DB"],
-            &["home/.hermes"],
-            &["home/.hermes"],
-        ),
-        (
-            "crush",
-            &["CRUSH_SQLITE_DB"],
-            &["home/.crush"],
-            &["home/.crush"],
-        ),
-        (
-            "goose",
-            &["GOOSE_SQLITE_DB", "GOOSE_PATH_ROOT"],
-            &["home/.goose/sessions"],
-            &["home/.goose/sessions", "home/.goose"],
-        ),
-        (
             "cursor",
             &["CASS_CURSOR_PROJECTS_ROOT"],
             &["home/.cursor"],
             &["home/.cursor"],
-        ),
-        (
-            "omp",
-            &[
-                "CASS_OMP_DATA_ROOT",
-                "PI_CODING_AGENT_SESSION_DIR",
-                "PI_CONFIG_DIR",
-            ],
-            &["home/.omp/agent/sessions"],
-            &["home/.omp/agent/sessions", "home/.omp/agent"],
         ),
     ];
     for &(slug, variables, directories, expected) in defaults {

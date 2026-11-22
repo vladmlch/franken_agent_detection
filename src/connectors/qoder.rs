@@ -457,15 +457,7 @@ pub(crate) fn qoder_title_database_for_path_resolved(
     not(any(
         feature = "cursor",
         feature = "opencode",
-        feature = "goose",
-        feature = "hermes",
-        feature = "crush",
         feature = "devin",
-        feature = "shelley",
-        feature = "openclaw-sqlite",
-        feature = "copilot-vscdb",
-        feature = "pi-sqlite",
-        feature = "pi-durable",
         feature = "qoder-sqlite"
     )),
     allow(dead_code)
@@ -481,15 +473,7 @@ fn qoder_title_database_for_path(path: &Path) -> Option<PathBuf> {
 #[cfg(any(
     feature = "cursor",
     feature = "opencode",
-    feature = "goose",
-    feature = "hermes",
-    feature = "crush",
     feature = "devin",
-    feature = "shelley",
-    feature = "openclaw-sqlite",
-    feature = "copilot-vscdb",
-    feature = "pi-sqlite",
-    feature = "pi-durable",
     feature = "qoder-sqlite"
 ))]
 pub(crate) fn load_qoder_title_map_from_db(db_path: &Path) -> HashMap<String, String> {
@@ -565,15 +549,7 @@ pub(crate) fn load_qoder_title_map_from_db(db_path: &Path) -> HashMap<String, St
 #[cfg(not(any(
     feature = "cursor",
     feature = "opencode",
-    feature = "goose",
-    feature = "hermes",
-    feature = "crush",
     feature = "devin",
-    feature = "shelley",
-    feature = "openclaw-sqlite",
-    feature = "copilot-vscdb",
-    feature = "pi-sqlite",
-    feature = "pi-durable",
     feature = "qoder-sqlite"
 )))]
 pub(crate) fn load_qoder_title_map_from_db(_db_path: &Path) -> HashMap<String, String> {
@@ -1896,15 +1872,7 @@ mod tests {
     #[cfg(any(
         feature = "cursor",
         feature = "opencode",
-        feature = "goose",
-        feature = "hermes",
-        feature = "crush",
         feature = "devin",
-        feature = "shelley",
-        feature = "openclaw-sqlite",
-        feature = "copilot-vscdb",
-        feature = "pi-sqlite",
-        feature = "pi-durable",
         feature = "qoder-sqlite"
     ))]
     #[test]

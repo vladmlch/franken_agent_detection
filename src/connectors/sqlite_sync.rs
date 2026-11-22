@@ -1,37 +1,195 @@
-//! Synchronous bridge over the async `FrankenSQLite` 0.2 engine API.
+//! Synchronous `rusqlite` facade shared by every SQLite-backed connector.
 //!
-//! fsqlite 0.2 made every engine entry point `async` with `!Send` futures
-//! (the engine is `Rc<RefCell<..>>` internally). The connectors are fully
-//! synchronous, so this module drives each fsqlite future to completion on
-//! the calling thread with a private current-thread `asupersync` runtime.
+//! The connectors are fully synchronous, so this module wraps
+//! [`rusqlite::Connection`] directly and owns the zero-mutation open policy
+//! for external app stores: a store is opened strictly read-only in place
+//! whenever its on-disk state provably allows it
+//! ([`open_external_strict_in_place`]), and a private snapshot copy inside
+//! the system temp dir is used when it does not
+//! ([`open_read_only_with_snapshot_fallback`], cass F9). The user's files
+//! are a personal archive: the original db and its `-wal`, `-shm`, and
+//! `-journal` sidecars are never created, modified, or deleted — not even
+//! their mtimes.
 //!
-//! Every future is created, polled, and dropped entirely within one bridge
-//! call, so the engine's `Rc<RefCell<..>>` state never crosses a thread
-//! boundary. `Runtime::block_on` has no `Send` bound and saves/restores the
-//! ambient runtime handle, so nested use from inside a consumer's own
-//! `block_on` is safe (proven by the sqlmodel-frankensqlite
-//! `nested_block_on_*` probes for the same bridge pattern).
+//! Two empirically verified C SQLite traps drive the in-place open modes:
 //!
-//! The runtime is kept in a thread-local slot and *taken out* while a future
-//! is being driven: a reentrant bridge call (e.g. from a row-mapping closure)
-//! finds the slot empty and builds a fresh runtime instead of re-entering
-//! `block_on` on the same runtime instance.
+//! * **Trap 1:** if a SQLite file's 100-byte header has `header[18] == 2`
+//!   or `header[19] == 2` (WAL file-format version) and the `-shm` is
+//!   absent — e.g. a cleanly closed WAL database whose last connection
+//!   checkpointed and deleted both sidecars — then *any* plain
+//!   `SQLITE_OPEN_READ_ONLY` open (even `mode=ro`) makes C SQLite **create
+//!   `<db>-wal` and `<db>-shm` on disk**. A WAL-headered store without a
+//!   valid `-shm` therefore never reaches the engine on the original path;
+//!   it is read through the snapshot copy instead.
+//! * **Trap 2:** `mode=ro&readonly_shm=1` still requires the existing
+//!   `-shm` wal-index and `-wal` header to be sane before it can serve a
+//!   read without writing. Both are validated byte-for-byte up front (a
+//!   crashed app can leave them absent, zeroed, empty, torn, or garbage);
+//!   anything else is refused with [`SqliteError::BusyRecovery`], which the
+//!   fallback turns into a private snapshot copy.
 
-use std::cell::RefCell;
-use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use asupersync::runtime::{Runtime, RuntimeBuilder};
-use frankensqlite::FrankenError;
-use frankensqlite::Row;
-use frankensqlite::compat::ConnectionExt as AsyncConnectionExt;
-use frankensqlite::compat::{OpenFlags, ParamValue};
+pub use rusqlite::OpenFlags;
+use rusqlite::types::ToSqlOutput;
+pub use rusqlite::types::{FromSql, Value as SqliteValue, ValueRef as SqliteValueRef};
 
-thread_local! {
-    static DRIVER: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+/// The engine's row type, re-exported so row-mapping closures in the
+/// connectors name one `Row` no matter which facade produced it.
+pub type Row<'stmt> = rusqlite::Row<'stmt>;
+
+/// The one error type the SQLite connectors surface.
+///
+/// `BusyRecovery` is the typed signal that a store's WAL-index cannot serve
+/// a strictly read-only open without recovery writes — the marker
+/// [`open_read_only_with_snapshot_fallback`] turns into a snapshot copy.
+/// `Internal` carries the refusal/policy errors the facade itself produces
+/// (over-budget snapshot, vanished store, ...).
+#[derive(Debug, thiserror::Error)]
+pub enum SqliteError {
+    /// Any error the bundled SQLite engine itself produced.
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    /// A filesystem error while probing or copying store files.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// The store's WAL-index (or an active rollback journal) cannot serve a
+    /// strictly read-only open without recovery writes.
+    #[error("database WAL-index requires recovery for read-only open")]
+    BusyRecovery,
+    /// A policy refusal produced by this facade (snapshot budget, ...).
+    #[error("{0}")]
+    Internal(String),
+}
+
+/// Compatibility alias: downstream connectors were written against
+/// `frankensqlite::FrankenError`; the facade keeps that name working.
+pub type FrankenError = SqliteError;
+
+/// One query parameter in engine-typed form (compat name kept from the
+/// `frankensqlite::compat` surface the connectors were written against).
+#[derive(Debug, Clone)]
+pub struct ParamValue(pub SqliteValue);
+
+impl rusqlite::ToSql for ParamValue {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
+    }
+}
+
+impl From<i64> for ParamValue {
+    fn from(value: i64) -> Self {
+        Self(SqliteValue::Integer(value))
+    }
+}
+
+impl From<i32> for ParamValue {
+    fn from(value: i32) -> Self {
+        Self(SqliteValue::Integer(i64::from(value)))
+    }
+}
+
+impl From<u32> for ParamValue {
+    fn from(value: u32) -> Self {
+        Self(SqliteValue::Integer(i64::from(value)))
+    }
+}
+
+impl From<usize> for ParamValue {
+    fn from(value: usize) -> Self {
+        Self(SqliteValue::Integer(
+            i64::try_from(value).unwrap_or(i64::MAX),
+        ))
+    }
+}
+
+impl From<f64> for ParamValue {
+    fn from(value: f64) -> Self {
+        Self(SqliteValue::Real(value))
+    }
+}
+
+impl From<bool> for ParamValue {
+    fn from(value: bool) -> Self {
+        Self(SqliteValue::Integer(i64::from(value)))
+    }
+}
+
+impl From<&str> for ParamValue {
+    fn from(value: &str) -> Self {
+        Self(SqliteValue::Text(value.to_owned()))
+    }
+}
+
+impl From<String> for ParamValue {
+    fn from(value: String) -> Self {
+        Self(SqliteValue::Text(value))
+    }
+}
+
+impl From<&String> for ParamValue {
+    fn from(value: &String) -> Self {
+        Self(SqliteValue::Text(value.clone()))
+    }
+}
+
+impl From<&[u8]> for ParamValue {
+    fn from(value: &[u8]) -> Self {
+        Self(SqliteValue::Blob(value.to_vec()))
+    }
+}
+
+impl From<Vec<u8>> for ParamValue {
+    fn from(value: Vec<u8>) -> Self {
+        Self(SqliteValue::Blob(value))
+    }
+}
+
+impl<T> From<Option<T>> for ParamValue
+where
+    Self: From<T>,
+{
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Self(SqliteValue::Null), Self::from)
+    }
+}
+
+/// Positional parameters for the [`ConnectionExt`] methods: heterogeneous
+/// arguments collected into a `&[ParamValue]` slice (`params![]` is the
+/// empty slice).
+#[macro_export]
+macro_rules! fad_sqlite_params {
+    () => {{
+        const EMPTY: &[$crate::connectors::sqlite_sync::ParamValue] = &[];
+        EMPTY
+    }};
+    ($($val:expr),+ $(,)?) => {
+        &[$($crate::connectors::sqlite_sync::ParamValue::from($val)),+]
+    };
+}
+
+pub use fad_sqlite_params as params;
+
+/// Ergonomic row accessors matching the names the connectors already use.
+pub trait RowExt {
+    /// Column `idx` decoded into `T`.
+    fn get_typed<T: FromSql>(&self, idx: usize) -> Result<T, SqliteError>;
+    /// Column `idx` as a raw engine value.
+    fn get_value(&self, idx: usize) -> Result<SqliteValue, SqliteError>;
+}
+
+impl RowExt for rusqlite::Row<'_> {
+    fn get_typed<T: FromSql>(&self, idx: usize) -> Result<T, SqliteError> {
+        self.get(idx).map_err(SqliteError::from)
+    }
+
+    fn get_value(&self, idx: usize) -> Result<SqliteValue, SqliteError> {
+        self.get::<usize, SqliteValue>(idx)
+            .map_err(SqliteError::from)
+    }
 }
 
 /// Monotonic suffix for private snapshot-directory names (F9). No external
@@ -52,40 +210,11 @@ static SNAPSHOT_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// rebuilds its WAL-index.
 const SNAPSHOT_FALLBACK_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Drive a `!Send` fsqlite future to completion on the calling thread.
-fn drive<T>(future: impl Future<Output = T>) -> Result<T, FrankenError> {
-    let runtime = match DRIVER.with(|slot| slot.borrow_mut().take()) {
-        Some(runtime) => runtime,
-        None => RuntimeBuilder::current_thread().build().map_err(|error| {
-            FrankenError::Internal(format!("failed to build SQLite connector runtime: {error}"))
-        })?,
-    };
-    let output = runtime.block_on(future);
-    DRIVER.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(runtime);
-        }
-    });
-    Ok(output)
-}
-
-/// Shut down this thread's cached connector runtime, waiting up to 30 s for
-/// its worker threads. Returns `false` if they did not stop in time.
-///
-/// Call it on a thread that used a SQLite connector before that thread, or
-/// the process, ends. On Windows the main thread's thread-local destructors
-/// run during process exit, after the OS has already terminated every other
-/// thread. A runtime still cached then cannot join its blocking-pool threads,
-/// and the panic that follows aborts the process (exit 0xC0000409) after its
-/// work succeeded (cass GH #519). Drop the thread's connections first: one
-/// still open keeps the runtime busy, and shutdown then waits out the
-/// timeout. A later bridge call builds a new runtime.
+/// Compatibility no-op kept from the async-engine bridge: there is no
+/// connector runtime to release any more, so shutdown always succeeds.
 #[must_use]
-pub fn shutdown_driver() -> bool {
-    DRIVER
-        .with(|slot| slot.borrow_mut().take())
-        .is_none_or(|runtime| runtime.shutdown_timeout(std::time::Duration::from_secs(30)))
+pub const fn shutdown_driver() -> bool {
+    true
 }
 
 /// RAII owner of the private directory holding a store snapshot copy (F9).
@@ -109,11 +238,16 @@ impl Drop for SnapshotDir {
     }
 }
 
-/// Path of a SQLite sidecar file (`<db>-wal`, `<db>-shm`).
+/// Path of a SQLite sidecar file (`<db>-wal`, `<db>-shm`, `<db>-journal`).
 fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
     let mut raw = db.as_os_str().to_owned();
     raw.push(suffix);
     PathBuf::from(raw)
+}
+
+/// Whether the sidecar exists at all (any filesystem object).
+fn sidecar_exists(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
 }
 
 /// Size + mtime of one store file, to detect an app writing while we copy.
@@ -124,7 +258,7 @@ struct StableStamp {
 }
 
 /// [`StableStamp`] of `path`, or `None` when the file does not exist.
-fn stable_stamp(path: &Path) -> Result<Option<StableStamp>, FrankenError> {
+fn stable_stamp(path: &Path) -> Result<Option<StableStamp>, SqliteError> {
     match std::fs::metadata(path) {
         Ok(meta) => Ok(Some(StableStamp {
             len: meta.len(),
@@ -136,7 +270,7 @@ fn stable_stamp(path: &Path) -> Result<Option<StableStamp>, FrankenError> {
 }
 
 /// Create a fresh private directory for one store snapshot copy.
-fn fresh_snapshot_dir() -> Result<SnapshotDir, FrankenError> {
+fn fresh_snapshot_dir() -> Result<SnapshotDir, SqliteError> {
     let base = std::env::temp_dir();
     for _ in 0..8 {
         let sequence = SNAPSHOT_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -151,7 +285,7 @@ fn fresh_snapshot_dir() -> Result<SnapshotDir, FrankenError> {
             Err(error) => return Err(error.into()),
         }
     }
-    Err(FrankenError::Internal(
+    Err(SqliteError::Internal(
         "could not create a private SQLite snapshot directory".to_owned(),
     ))
 }
@@ -175,43 +309,86 @@ struct SnapshotBudget {
 /// (statvfs `f_bavail`), for the snapshot-copy free-space check. The temp
 /// dir is where [`fresh_snapshot_dir`] puts every copy, so this is the
 /// space a copy would consume.
-fn temp_dir_available_bytes() -> Result<u64, FrankenError> {
+fn temp_dir_available_bytes() -> Result<u64, SqliteError> {
     fs4::available_space(std::env::temp_dir()).map_err(|error| {
-        FrankenError::Internal(format!(
+        SqliteError::Internal(format!(
             "could not check the free space in the temp dir before snapshotting a SQLite \
              store: {error}"
         ))
     })
 }
 
-/// Copy the main db file and its `-wal` (never its `-shm`) into a fresh
-/// private directory, then open the copy with WAL-index recovery allowed —
-/// on our copy rebuilding the wal-index is fine, unlike on the user's
-/// store.
+/// Whether `<db>-journal` is a live rollback journal: a regular file with
+/// content whose first byte is nonzero. A zeroed first byte is SQLite's own
+/// mark for an invalidated journal. Unreadable journals count as inactive
+/// here — the strict open re-checks and reports the read error itself.
+fn journal_sidecar_is_active(db_path: &Path) -> bool {
+    use std::io::Read as _;
+    let journal_path = sidecar_path(db_path, "-journal");
+    let Ok(meta) = std::fs::metadata(&journal_path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return false;
+    }
+    let mut first = [0_u8; 1];
+    std::fs::File::open(&journal_path)
+        .and_then(|mut file| file.read_exact(&mut first))
+        .is_ok_and(|()| first[0] != 0)
+}
+
+/// `std::fs::copy` preserves the source's permission bits, so a store file
+/// archived read-only (0444) would hand the snapshot copy a read-only db,
+/// `-wal`, or `-journal` — and C SQLite then refuses the WAL-index rebuild
+/// and journal-rollback writes the copy exists to allow. The copy lives in
+/// a private temp dir, so the read-only flag is cleared on the copies
+/// only; the original store files are never chmod'ed.
+fn clear_copy_readonly(dst: &Path) -> Result<(), SqliteError> {
+    let mut permissions = std::fs::metadata(dst)?.permissions();
+    if !permissions.readonly() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions = std::fs::Permissions::from_mode(permissions.mode() | 0o600);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(dst, permissions)?;
+    Ok(())
+}
+
+/// Copy the main db file plus its `-wal` and `-journal` (never its `-shm`)
+/// into a fresh private directory, then open the copy with WAL-index and
+/// rollback-journal recovery allowed — on our copy rebuilding the wal-index
+/// or rolling back a hot journal is fine, unlike on the user's store.
 ///
-/// The copy is taken under a size+mtime stability stamp of the db and
-/// `-wal` recorded before and re-checked after the copy, so a store the
-/// app is actively writing is retried once and then refused with a clear
-/// error instead of being read half-written.
+/// The copy is taken under a size+mtime stability stamp of the db, `-wal`,
+/// and `-journal` recorded before and re-checked after the copy, so a store
+/// the app is actively writing is retried once and then refused with a
+/// clear error instead of being read half-written.
 ///
 /// `budget` bounds the copy (F18) before any file is copied: a store whose
 /// db + `-wal` total exceeds `budget.max_bytes`, or whose copy would leave
 /// the temp dir with less than the copy's own size free, is refused with a
 /// scan error and no copy at all. The user's files are never touched either
 /// way.
-fn open_snapshot_copy(db_path: &Path, budget: &SnapshotBudget) -> Result<Connection, FrankenError> {
+fn open_snapshot_copy(db_path: &Path, budget: &SnapshotBudget) -> Result<Connection, SqliteError> {
     let file_name = db_path.file_name().ok_or_else(|| {
-        FrankenError::Internal(format!(
+        SqliteError::Internal(format!(
             "cannot snapshot a non-file SQLite path: {}",
             db_path.display()
         ))
     })?;
     let wal_path = sidecar_path(db_path, "-wal");
+    let journal_path = sidecar_path(db_path, "-journal");
     for attempt in 0..2 {
         let before_db = stable_stamp(db_path)?;
         let before_wal = stable_stamp(&wal_path)?;
+        let before_journal = stable_stamp(&journal_path)?;
         let Some(before_db) = before_db else {
-            return Err(FrankenError::Internal(format!(
+            return Err(SqliteError::Internal(format!(
                 "the store vanished before it could be snapshotted: {}",
                 db_path.display()
             )));
@@ -229,7 +406,7 @@ fn open_snapshot_copy(db_path: &Path, budget: &SnapshotBudget) -> Result<Connect
         if total_bytes > budget.max_bytes {
             let db_bytes = before_db.len;
             let max_bytes = budget.max_bytes;
-            return Err(FrankenError::Internal(format!(
+            return Err(SqliteError::Internal(format!(
                 "the SQLite store {} is too large to read through a private snapshot copy \
                  ({db_bytes} bytes db + {wal_bytes} bytes write-ahead log = {total_bytes} \
                  bytes, over the {max_bytes}-byte snapshot limit): no copy is made and the \
@@ -245,7 +422,7 @@ fn open_snapshot_copy(db_path: &Path, budget: &SnapshotBudget) -> Result<Connect
         // is not less, so it still copies.
         let free_bytes = budget.free_bytes;
         if free_bytes < total_bytes.saturating_mul(2) {
-            return Err(FrankenError::Internal(format!(
+            return Err(SqliteError::Internal(format!(
                 "too little free space in the temp dir to copy the SQLite store {} for a \
                  read-only snapshot ({total_bytes} bytes to copy, {free_bytes} bytes \
                  available: the copy would leave less than the copy's own size free): no \
@@ -257,16 +434,25 @@ fn open_snapshot_copy(db_path: &Path, budget: &SnapshotBudget) -> Result<Connect
         let snapshot = fresh_snapshot_dir()?;
         let copy_db = snapshot.dir.join(file_name);
         std::fs::copy(db_path, &copy_db)?;
+        clear_copy_readonly(&copy_db)?;
         if wal_path.is_file() {
-            std::fs::copy(&wal_path, sidecar_path(&copy_db, "-wal"))?;
+            let copy_wal = sidecar_path(&copy_db, "-wal");
+            std::fs::copy(&wal_path, &copy_wal)?;
+            clear_copy_readonly(&copy_wal)?;
+        }
+        if journal_path.is_file() {
+            let copy_journal = sidecar_path(&copy_db, "-journal");
+            std::fs::copy(&journal_path, &copy_journal)?;
+            clear_copy_readonly(&copy_journal)?;
         }
         let stable = stable_stamp(db_path)?.is_some_and(|after| after == before_db)
-            && stable_stamp(&wal_path)? == before_wal;
+            && stable_stamp(&wal_path)? == before_wal
+            && stable_stamp(&journal_path)? == before_journal;
         if !stable {
             // The app wrote while we copied: discard this copy and retry once.
             drop(snapshot);
             if attempt == 1 {
-                return Err(FrankenError::Internal(format!(
+                return Err(SqliteError::Internal(format!(
                     "the store changed while copying it for a read-only snapshot ({}); \
                      retry the scan when the app is idle",
                     db_path.display()
@@ -274,11 +460,11 @@ fn open_snapshot_copy(db_path: &Path, budget: &SnapshotBudget) -> Result<Connect
             }
             continue;
         }
-        let inner = drive(
-            frankensqlite::Connection::open_schema_only_with_wal_index_recovery(
-                copy_db.to_string_lossy().into_owned(),
-            ),
-        )??;
+        // The copy lives in a private directory, so the engine may create
+        // its own `-shm`, rebuild the wal-index, or roll back the journal
+        // there without ever touching the store's files.
+        let inner = rusqlite::Connection::open(&copy_db)?;
+        inner.execute_batch("PRAGMA query_only = 1;")?;
         return Ok(Connection {
             inner,
             snapshot: Some(snapshot),
@@ -287,136 +473,10 @@ fn open_snapshot_copy(db_path: &Path, budget: &SnapshotBudget) -> Result<Connect
     unreachable!("the snapshot retry loop returns from both of its arms");
 }
 
-/// Open an external app store strictly read-only, the way every FAD SQLite
-/// connector does, and fall back to a private snapshot copy when the
-/// store's WAL-index is unusable (cass F9).
-///
-/// The open uses the fork's never-write mode
-/// (`SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_STRICT_READ_ONLY`): the engine may
-/// not create or modify any sidecar of the store, so it never performs
-/// WAL-index recovery. When the `-shm` wal-index is absent, zeroed, empty,
-/// torn, or garbage (typical after the app crashed) and recovery would be
-/// needed to read — a `-wal` with committed frames, or any damaged `-shm`
-/// beside one — the open fails with the typed
-/// [`FrankenError::BusyRecovery`]. Registry fsqlite 0.4.13 instead rebuilds
-/// a never-initialized `-shm` in place on a plain read-only open (GH#528),
-/// which would touch the user's files; the strict bit keeps that from ever
-/// happening. One read stays available without any write: a header-less
-/// (0-byte) `-wal` with no `-shm` reads the main file directly, exactly
-/// like stock SQLite (GH#515), so a cleanly checkpointed store needs no
-/// snapshot. The user's files are a personal archive and are never
-/// modified, not even the `-shm` sidecar. When the open is refused, the db
-/// and its `-wal` are copied into a private temporary directory (never the
-/// `-shm`), the copy is opened with WAL-index recovery allowed (it rebuilds
-/// only the copy's own `-shm`), and the copy is removed when the connection
-/// drops.
-///
-/// The copy is bounded (F18): a store whose db + `-wal` total exceeds
-/// [`SNAPSHOT_FALLBACK_MAX_BYTES`] (2 GiB, no environment knob), or whose
-/// copy would leave the temp dir with less than the copy's own size free,
-/// is refused before any copy with a scan error naming the store, its
-/// size, and the bound — the same error path any other unreadable store
-/// takes, so the scan reports it and keeps indexing the other stores. A
-/// refused store reads normally again on the app's next start, which
-/// rebuilds its WAL-index.
-///
-/// Any other open error — and a fallback that itself fails — is returned
-/// so the caller's scan surfaces it as an error instead of hiding it.
-pub fn open_read_only_with_snapshot_fallback(path: &str) -> Result<Connection, FrankenError> {
-    match open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
-    ) {
-        Ok(connection) => Ok(connection),
-        Err(FrankenError::BusyRecovery) => {
-            let db_path = Path::new(path);
-            // The unusable-WAL-index class requires a `-wal` (or at least a
-            // `-shm`) next to the db; without sidecars this BusyRecovery is
-            // not that class, and there is nothing to snapshot.
-            if !sidecar_path(db_path, "-wal").is_file() && !sidecar_path(db_path, "-shm").is_file()
-            {
-                return Err(FrankenError::BusyRecovery);
-            }
-            tracing::warn!(
-                store = path,
-                "SQLite store has an unusable WAL-index for a read-only open; \
-                 reading a private snapshot copy (the store's files are never modified)"
-            );
-            let budget = SnapshotBudget {
-                max_bytes: SNAPSHOT_FALLBACK_MAX_BYTES,
-                free_bytes: temp_dir_available_bytes()?,
-            };
-            open_snapshot_copy(db_path, &budget)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 /// The SQLite database file magic: bytes 0..16 of a database header
 /// (`SQLite format 3\0`). A file without it is not a database, however an
 /// engine build might otherwise treat it.
 const SQLITE_HEADER_MAGIC: [u8; 16] = *b"SQLite format 3\0";
-
-/// cass follow-up to F9 (2026-11-07): whether a store database is
-/// *provably empty* —
-///
-/// * a 0-byte main file with no `-wal` content: SQLite's own semantics make
-///   a 0-byte file an empty database, and a fresh install commonly creates
-///   the store file before its first write, or
-/// * a database file (header magic checked, so a large all-zeros file never
-///   passes) that opens read-only and whose schema holds no tables at all.
-///
-/// Both hold no sessions for any connector, so a scan reports them as
-/// "nothing to read" instead of a scan error on every index run.
-///
-/// Returns `false` for everything uncertain, so the caller falls through to
-/// its own read and surfaces its error exactly as before: garbage bytes and
-/// wrong header magic (including a large all-zeros file), a non-empty file
-/// too small for a header, a schema with *some* tables (schema drift, e.g.
-/// an app migration — the connector's own read must name it), and any open
-/// failure. A store whose wal-index is unusable (`BusyRecovery`) is
-/// deliberately not classified here: proving its emptiness would cost a
-/// snapshot copy of the store, so it falls through to the connector's
-/// [`open_read_only_with_snapshot_fallback`] read instead.
-#[must_use]
-pub fn store_is_provably_empty(db_path: &Path) -> bool {
-    use std::io::Read as _;
-
-    // Case 1: a 0-byte main file. Any bytes at all in the `-wal` could hold
-    // committed frames, so only an absent or 0-byte `-wal` proves emptiness.
-    let main_is_zero_bytes =
-        std::fs::metadata(db_path).is_ok_and(|meta| meta.is_file() && meta.len() == 0);
-    if main_is_zero_bytes {
-        let wal_has_content =
-            std::fs::metadata(sidecar_path(db_path, "-wal")).is_ok_and(|meta| meta.len() > 0);
-        return !wal_has_content;
-    }
-
-    // Case 2: a real database file whose schema holds no tables at all.
-    let mut magic = [0_u8; 16];
-    let header_is_sqlite = std::fs::File::open(db_path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .is_ok()
-        && magic == SQLITE_HEADER_MAGIC;
-    if !header_is_sqlite {
-        return false;
-    }
-    // A strict read-only open only (see above for why no snapshot fallback),
-    // so even this probe can never write a sidecar of the user's store.
-    let Ok(connection) = open_with_flags(
-        db_path.to_string_lossy().as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
-    ) else {
-        return false;
-    };
-    connection
-        .query_map_collect(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1",
-            &[],
-            |_row| Ok(()),
-        )
-        .is_ok_and(|tables| tables.is_empty())
-}
 
 /// Length of the standard SQLite database file header in bytes.
 const SQLITE_HEADER_PROBE_SIZE: usize = 100;
@@ -432,6 +492,408 @@ const SQLITE_WAL_HEADER_SIZE: usize = 32;
 const SQLITE_WAL_MAGIC_LE: u32 = 0x377f_0682;
 const SQLITE_WAL_MAGIC_BE: u32 = 0x377f_0683;
 const SQLITE_WAL_FORMAT_VERSION: u32 = 3_007_000;
+
+/// Length of the SQLite wal-index header in bytes.
+///
+/// The `-shm` file starts with two 48-byte copies of the header, so the
+/// file must hold at least those 96 bytes; real wal-indexes additionally
+/// carry at least one checkpoint-block region, and a file under the
+/// documented minimum of 136 bytes can never be a usable wal-index.
+const SQLITE_SHM_MIN_SIZE: u64 = 136;
+const SQLITE_SHM_HEADER_PAIR: usize = 96;
+
+/// Whether the `-wal` file's header is internally sane. A 0-byte `-wal` is
+/// valid (a cleanly checkpointed store); anything shorter than the 32-byte
+/// header, or a header whose magic, format version, or page size is wrong,
+/// means the wal-index cannot be trusted and the store must not be opened
+/// in place.
+#[cfg(unix)]
+fn wal_file_is_valid(wal_path: &Path) -> Result<bool, SqliteError> {
+    use std::io::Read as _;
+
+    let meta = match std::fs::metadata(wal_path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !meta.is_file() {
+        return Ok(false);
+    }
+    let len = meta.len();
+    if len == 0 {
+        return Ok(true);
+    }
+    if len < SQLITE_WAL_HEADER_SIZE as u64 {
+        return Ok(false);
+    }
+    let mut header = [0_u8; SQLITE_WAL_HEADER_SIZE];
+    let mut file = match std::fs::File::open(wal_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    file.read_exact(&mut header)?;
+    let magic = read_be_u32(&header, 0);
+    if magic != SQLITE_WAL_MAGIC_LE && magic != SQLITE_WAL_MAGIC_BE {
+        return Ok(false);
+    }
+    if read_be_u32(&header, 4) != SQLITE_WAL_FORMAT_VERSION {
+        return Ok(false);
+    }
+    let page_size = read_be_u32(&header, 8);
+    Ok(page_size == 65_536 || (512..65_536).contains(&page_size) && page_size.is_power_of_two())
+}
+
+/// The SQLite wal-index header checksum: five pairs of native-endian
+/// `u32`s over the header's first 40 bytes.
+#[cfg(unix)]
+fn wal_index_checksum(header_40: &[u8]) -> (u32, u32) {
+    let mut s0 = 0_u32;
+    let mut s1 = 0_u32;
+    for pair in header_40.chunks_exact(8) {
+        let x0 = u32::from_ne_bytes([pair[0], pair[1], pair[2], pair[3]]);
+        let x1 = u32::from_ne_bytes([pair[4], pair[5], pair[6], pair[7]]);
+        s0 = s0.wrapping_add(x0).wrapping_add(s1);
+        s1 = s1.wrapping_add(x1).wrapping_add(s0);
+    }
+    (s0, s1)
+}
+
+/// Whether the `-shm` file is a coherent wal-index: a regular file at
+/// least [`SQLITE_SHM_MIN_SIZE`] bytes, whose two 48-byte header copies
+/// agree and whose first header carries format version `3007000`, the
+/// `isInit` marker, a plausible `bigEndCksum` flag, a valid `szPage`, and a
+/// matching header checksum.
+#[cfg(unix)]
+fn shm_file_is_valid(shm_path: &Path) -> Result<bool, SqliteError> {
+    use std::io::Read as _;
+
+    let meta = match std::fs::metadata(shm_path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !meta.is_file() || meta.len() < SQLITE_SHM_MIN_SIZE {
+        return Ok(false);
+    }
+    let mut buf = [0_u8; SQLITE_SHM_HEADER_PAIR];
+    let mut file = std::fs::File::open(shm_path)?;
+    file.read_exact(&mut buf)?;
+    let (h0, h1) = buf.split_at(48);
+    if h0 != h1 {
+        return Ok(false);
+    }
+    if u32::from_ne_bytes([h0[0], h0[1], h0[2], h0[3]]) != SQLITE_WAL_FORMAT_VERSION {
+        return Ok(false);
+    }
+    if h0[12] != 1 || h0[13] > 1 {
+        return Ok(false);
+    }
+    let sz_page = u16::from_ne_bytes([h0[14], h0[15]]);
+    if !(sz_page == 1 || (sz_page >= 512 && sz_page.is_power_of_two())) {
+        return Ok(false);
+    }
+    let (s0, s1) = wal_index_checksum(&h0[..40]);
+    Ok(s0 == u32::from_ne_bytes([h0[40], h0[41], h0[42], h0[43]])
+        && s1 == u32::from_ne_bytes([h0[44], h0[45], h0[46], h0[47]]))
+}
+
+/// Build a `file:` URI for `db_path` in pure `std` (no `urlencoding`
+/// crate): iterate the raw path bytes so non-UTF-8 names survive,
+/// collapse consecutive `/` into one, keep `/` itself and every other
+/// printable ASCII byte unescaped, and percent-encode `%`, `?`, `#`,
+/// every byte `<= 0x20`, and every non-ASCII byte `>= 0x80` —
+/// `sqlite3ParseUri` decodes each `%XX` back into the exact raw byte.
+#[cfg(unix)]
+fn read_only_uri(db_path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let absolute = std::fs::canonicalize(db_path)
+        .unwrap_or_else(|_| std::path::absolute(db_path).unwrap_or_else(|_| db_path.to_path_buf()));
+    let mut encoded = String::with_capacity(absolute.as_os_str().len() + 16);
+    let mut prev_was_slash = false;
+    for &byte in absolute.as_os_str().as_bytes() {
+        if byte == b'/' {
+            if !prev_was_slash {
+                encoded.push('/');
+            }
+            prev_was_slash = true;
+            continue;
+        }
+        prev_was_slash = false;
+        if byte <= b' ' || matches!(byte, b'%' | b'?' | b'#') || byte >= 0x80 {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        } else {
+            encoded.push(char::from(byte));
+        }
+    }
+    format!("file:{encoded}?mode=ro&readonly_shm=1")
+}
+
+/// Whether an open or first-read failure is the WAL-index class a snapshot
+/// copy resolves (busy, cannot-open, or read-only), as opposed to the
+/// caller's own problem (SQL errors, missing file, ...).
+#[cfg(unix)]
+const fn wal_index_open_failure(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::CannotOpen
+                    | rusqlite::ErrorCode::ReadOnly,
+                ..
+            },
+            ..
+        )
+    )
+}
+
+/// Mode 2 of [`open_external_strict_in_place`]: a WAL store whose `-wal`
+/// and `-shm` both exist and validate is opened in place through a
+/// `mode=ro&readonly_shm=1` URI, which makes C SQLite mmap the wal-index
+/// read-only and take its read marks through locks instead of writing them
+/// — zero bytes and zero mtime changes on all three files.
+#[cfg(unix)]
+fn open_wal_in_place(
+    db_path: &Path,
+    wal_path: &Path,
+    shm_path: &Path,
+) -> Result<Connection, SqliteError> {
+    if !wal_file_is_valid(wal_path)? || !shm_file_is_valid(shm_path)? {
+        return Err(SqliteError::BusyRecovery);
+    }
+    let uri = read_only_uri(db_path);
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let inner = match rusqlite::Connection::open_with_flags(uri.as_str(), flags) {
+        Ok(inner) => inner,
+        Err(error) if wal_index_open_failure(&error) => {
+            return Err(SqliteError::BusyRecovery);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // The schema read forces C SQLite to actually attach the wal-index now,
+    // so a store that only fails on first access still reports
+    // `BusyRecovery` here instead of mid-scan.
+    match inner.query_row("PRAGMA schema_version;", [], |row| row.get::<usize, i64>(0)) {
+        Ok(_) => Ok(Connection {
+            inner,
+            snapshot: None,
+        }),
+        Err(error) if wal_index_open_failure(&error) => {
+            drop(inner);
+            Err(SqliteError::BusyRecovery)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Open an external app store strictly read-only *in place*: not one byte,
+/// mtime, or sidecar of the original db, `-wal`, `-shm`, or `-journal` may
+/// be created or modified.
+///
+/// Open modes, after the 100-byte header probe proves a real database and
+/// the `-journal` check refuses a live rollback journal
+/// (`BusyRecovery`):
+///
+/// * **Mode 1 — pure rollback db** (non-WAL header, no `-wal`, no `-shm`):
+///   a plain `READ_ONLY | NO_MUTEX` open on the original path; a
+///   rollback-mode store creates no sidecar on a read-only open.
+/// * **Mode 2 — Unix WAL store with `-wal` + `-shm`** present: both are
+///   validated byte-for-byte (WAL header magic/version/page-size; wal-index
+///   header copies, version, `isInit`, `szPage`, checksum), then the store
+///   opens through a `file:...?mode=ro&readonly_shm=1` URI.
+/// * **Every other WAL/sidecar shape** — a WAL-headered db with missing or
+///   invalid `-shm`, a `-wal` without `-shm`, a `-shm` without `-wal`, or
+///   any of it on a non-Unix platform — is refused with
+///   [`SqliteError::BusyRecovery`] *without* an open on the original path,
+///   because trap 1 shows C SQLite would create the missing sidecars there.
+///
+/// Missing, non-regular, sub-header, or non-SQLite files get the io/engine
+/// error back (never `BusyRecovery`): they must not be snapshotted.
+pub fn open_external_strict_in_place(db_path: &Path) -> Result<Connection, SqliteError> {
+    use std::io::Read as _;
+
+    let meta = std::fs::metadata(db_path)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("SQLite path is not a regular file: {}", db_path.display()),
+        )
+        .into());
+    }
+    if meta.len() < SQLITE_HEADER_PROBE_SIZE as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "SQLite path is too small for a database header: {}",
+                db_path.display()
+            ),
+        )
+        .into());
+    }
+    let mut header = [0_u8; SQLITE_HEADER_PROBE_SIZE];
+    std::fs::File::open(db_path)?.read_exact(&mut header)?;
+    if header[..16] != SQLITE_HEADER_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "file does not carry SQLite header magic: {}",
+                db_path.display()
+            ),
+        )
+        .into());
+    }
+
+    // A live rollback journal means the store needs recovery a read-only
+    // open must not perform: the snapshot copy will roll it back privately.
+    let journal_path = sidecar_path(db_path, "-journal");
+    if std::fs::metadata(&journal_path).is_ok_and(|meta| meta.is_file() && meta.len() > 0) {
+        let mut first = [0_u8; 1];
+        match std::fs::File::open(&journal_path).and_then(|mut f| f.read_exact(&mut first)) {
+            Ok(()) if first[0] != 0 => return Err(SqliteError::BusyRecovery),
+            Ok(()) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let is_wal_header = header[18] == 2 || header[19] == 2;
+    let wal_path = sidecar_path(db_path, "-wal");
+    let shm_path = sidecar_path(db_path, "-shm");
+    let wal_exists = sidecar_exists(&wal_path);
+    let shm_exists = sidecar_exists(&shm_path);
+
+    // Mode 1 — pure rollback-mode store: no WAL marker anywhere, so a
+    // read-only open cannot create `-wal` / `-shm`.
+    if !is_wal_header && !wal_exists && !shm_exists {
+        let inner = rusqlite::Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        return Ok(Connection {
+            inner,
+            snapshot: None,
+        });
+    }
+
+    #[cfg(unix)]
+    if wal_exists && shm_exists {
+        return open_wal_in_place(db_path, &wal_path, &shm_path);
+    }
+    #[cfg(not(unix))]
+    let _ = (wal_exists, shm_exists);
+
+    // Trap 1 (and every ambiguous sidecar shape): never let C SQLite near
+    // the original path; the caller's snapshot fallback reads it safely.
+    Err(SqliteError::BusyRecovery)
+}
+
+/// Strict read-only open with snapshot-copy fallback (cass F9).
+///
+/// The in-place open ([`open_external_strict_in_place`]) never lets the
+/// engine create, modify, or delete any byte or sidecar of the user's
+/// store: pure rollback-mode stores open read-only directly, and on Unix a
+/// WAL store whose `-wal` and `-shm` both validate opens through a
+/// `mode=ro&readonly_shm=1` URI. Everything else — an absent, zeroed,
+/// empty, torn, or garbage wal-index; a `-wal` without `-shm`; a WAL-header
+/// db whose last connection checkpointed the sidecars away (trap 1); an
+/// active rollback journal — is refused with [`SqliteError::BusyRecovery`].
+///
+/// When refused, the db, its `-wal`, and its `-journal` are copied into a
+/// private temporary directory (never the `-shm`), the copy is opened
+/// read-write so SQLite recovers the WAL/journal inside the private dir
+/// (it rebuilds only the copy's own sidecars), `PRAGMA query_only = 1` is
+/// set, and the copy is removed when the connection drops.
+///
+/// The copy is bounded (F18): a store whose db + `-wal` total exceeds
+/// [`SNAPSHOT_FALLBACK_MAX_BYTES`] (2 GiB, no environment knob), or whose
+/// copy would leave the temp dir with less than the copy's own size free,
+/// is refused before any copy with a scan error naming the store, its
+/// size, and the bound — the same error path any other unreadable store
+/// takes, so the scan reports it and keeps indexing the other stores. A
+/// refused store reads normally again on the app's next start, which
+/// rebuilds its WAL-index.
+///
+/// Any other open error — and a fallback that itself fails — is returned
+/// so the caller's scan surfaces it as an error instead of hiding it.
+pub fn open_read_only_with_snapshot_fallback(path: &str) -> Result<Connection, SqliteError> {
+    let db_path = Path::new(path);
+    match open_external_strict_in_place(db_path) {
+        Ok(connection) => Ok(connection),
+        Err(SqliteError::BusyRecovery) => {
+            tracing::warn!(
+                store = path,
+                "SQLite store has an unusable WAL-index or an active rollback journal for \
+                 a read-only open; reading a private snapshot copy (the store's files are \
+                 never modified)"
+            );
+            let budget = SnapshotBudget {
+                max_bytes: SNAPSHOT_FALLBACK_MAX_BYTES,
+                free_bytes: temp_dir_available_bytes()?,
+            };
+            open_snapshot_copy(db_path, &budget)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// cass follow-up to F9 (2026-11-07): whether a store database is
+/// *provably empty* —
+///
+/// * a 0-byte main file with no `-wal` content and no live `-journal`:
+///   SQLite's own semantics make a 0-byte file an empty database, and a
+///   fresh install commonly creates the store file before its first write,
+///   or
+/// * a database file that opens strictly read-only in place (header magic
+///   and sidecar state checked, so a large all-zeros file or a store
+///   needing recovery never passes) and whose schema holds no tables at
+///   all.
+///
+/// Both hold no sessions for any connector, so a scan reports them as
+/// "nothing to read" instead of a scan error on every index run.
+///
+/// Returns `false` for everything uncertain, so the caller falls through to
+/// its own read and surfaces its error exactly as before: garbage bytes and
+/// wrong header magic (including a large all-zeros file), a non-empty file
+/// too small for a header, a schema with *some* tables (schema drift, e.g.
+/// an app migration — the connector's own read must name it), an active
+/// rollback journal, and any open failure. A store whose wal-index is
+/// unusable (`BusyRecovery`) is deliberately not classified here: proving
+/// its emptiness would cost a snapshot copy of the store, so it falls
+/// through to the connector's [`open_read_only_with_snapshot_fallback`]
+/// read instead.
+#[must_use]
+pub fn store_is_provably_empty(db_path: &Path) -> bool {
+    // Case 1: a 0-byte main file. Any bytes at all in the `-wal` could hold
+    // committed frames, so only an absent or 0-byte `-wal` proves emptiness,
+    // and a live rollback journal could still roll writes back in.
+    let main_is_zero_bytes =
+        std::fs::metadata(db_path).is_ok_and(|meta| meta.is_file() && meta.len() == 0);
+    if main_is_zero_bytes {
+        let wal_has_content =
+            std::fs::metadata(sidecar_path(db_path, "-wal")).is_ok_and(|meta| meta.len() > 0);
+        return !wal_has_content && !journal_sidecar_is_active(db_path);
+    }
+
+    // Case 2: a real database file whose schema holds no tables at all.
+    // A strict in-place open only (see above for why no snapshot fallback),
+    // so even this probe can never write a sidecar of the user's store.
+    let Ok(connection) = open_external_strict_in_place(db_path) else {
+        return false;
+    };
+    connection
+        .query_map_collect(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1",
+            &[],
+            |_row| Ok(()),
+        )
+        .is_ok_and(|tables| tables.is_empty())
+}
 
 /// Default maximum re-verification interval (5 minutes).
 ///
@@ -708,12 +1170,12 @@ pub fn stat_sqlite_container_header(
     }))
 }
 
-/// Synchronous wrapper over [`frankensqlite::Connection`].
+/// Synchronous wrapper over [`rusqlite::Connection`].
 ///
-/// Exposes the subset of the engine surface the connectors use, with the
-/// pre-0.2 blocking signatures.
+/// Exposes the subset of the engine surface the connectors use, keeping the
+/// blocking signatures the connectors were written against.
 pub struct Connection {
-    inner: frankensqlite::Connection,
+    inner: rusqlite::Connection,
     /// Private snapshot copy backing this connection (F9), removed on drop.
     /// Declared after `inner` so the engine connection closes first.
     snapshot: Option<SnapshotDir>,
@@ -721,11 +1183,18 @@ pub struct Connection {
 
 impl Connection {
     /// Open (or create) a database at `path`.
-    pub fn open(path: &str) -> Result<Self, FrankenError> {
+    pub fn open(path: &str) -> Result<Self, SqliteError> {
         Ok(Self {
-            inner: drive(frankensqlite::Connection::open(path))??,
+            inner: rusqlite::Connection::open(path)?,
             snapshot: None,
         })
+    }
+
+    /// The wrapped engine connection, for engine-specific calls the facade
+    /// does not re-expose.
+    #[must_use]
+    pub const fn raw(&self) -> &rusqlite::Connection {
+        &self.inner
     }
 
     /// Whether this connection reads a private snapshot copy of the store
@@ -745,14 +1214,40 @@ impl Connection {
             .map(|snapshot| snapshot.dir.as_path())
     }
 
+    /// `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`: when `disable` is true, dropping
+    /// this connection will not run a final checkpoint and will not delete
+    /// the store's `-wal` / `-shm` — test fixtures use it to leave a
+    /// WAL-mode store's sidecars on disk.
+    pub fn set_no_ckpt_on_close(&self, disable: bool) -> Result<(), SqliteError> {
+        self.inner
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                disable,
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Sqlite)
+    }
+
     /// Execute a single SQL statement, returning the affected row count.
-    pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        drive(self.inner.execute(sql))?
+    ///
+    /// Statements that produce rows (`PRAGMA busy_timeout = 2000;` and
+    /// friends) are stepped to completion and report `0` changed rows —
+    /// `rusqlite::Statement::execute` would refuse them outright, while the
+    /// connectors use `execute` for pragma tuning calls.
+    pub fn execute(&self, sql: &str) -> Result<usize, SqliteError> {
+        let mut statement = self.inner.prepare(sql)?;
+        if statement.column_count() == 0 {
+            statement.execute([]).map_err(SqliteError::Sqlite)
+        } else {
+            let mut rows = statement.query([])?;
+            while rows.next()?.is_some() {}
+            Ok(0)
+        }
     }
 
     /// Execute a string of semicolon-separated SQL statements.
-    pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
-        drive(self.inner.execute_batch(sql))?
+    pub fn execute_batch(&self, sql: &str) -> Result<(), SqliteError> {
+        self.inner.execute_batch(sql).map_err(SqliteError::Sqlite)
     }
 
     /// Run `f` inside one deferred read transaction so every query it issues
@@ -765,7 +1260,7 @@ impl Connection {
     /// If `f` unwinds, rollback is attempted before resuming its original panic.
     pub fn read_transaction<T, E>(&self, f: impl FnOnce(&Self) -> Result<T, E>) -> Result<T, E>
     where
-        E: From<FrankenError>,
+        E: From<SqliteError>,
     {
         self.execute("BEGIN DEFERRED;").map_err(E::from)?;
         // The callback is never resumed after an unwind. Keep its existing
@@ -795,42 +1290,23 @@ impl Connection {
     }
 }
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        // fsqlite 0.2 no longer checkpoints on drop, and read-only opens are
-        // mutation-free (GH#294): they do not recover an unpublished WAL
-        // sidecar. Closing in place on drop restores the pre-0.2 observable
-        // contract that writes made through a dropped connection are visible
-        // to a later read-only open.
-        if let Err(error) = drive(self.inner.close_best_effort_in_place()) {
-            tracing::warn!(%error, "could not drive SQLite connector close");
-        }
-    }
-}
-
-/// Open a database with rusqlite-style open flags (synchronous form of
-/// [`frankensqlite::compat::open_with_flags`]).
+/// Open a database with rusqlite-style open flags.
 ///
-/// Strict engine semantics: no snapshot fallback. External app stores are
-/// opened through [`open_read_only_with_snapshot_fallback`] instead.
-pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
+/// Strict semantics: no snapshot fallback. External app stores are opened
+/// through [`open_read_only_with_snapshot_fallback`] instead.
+pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, SqliteError> {
     Ok(Connection {
-        inner: drive(frankensqlite::compat::open_with_flags(path, flags))??,
+        inner: rusqlite::Connection::open_with_flags(path, flags)?,
         snapshot: None,
     })
 }
 
-/// Synchronous form of [`frankensqlite::compat::ConnectionExt`].
+/// Ergonomic query helpers matching the names the connectors already use.
 pub trait ConnectionExt {
     /// Execute a query that returns exactly one row, mapping it with `f`.
-    fn query_row_map<T, F>(
-        &self,
-        sql: &str,
-        params: &[ParamValue],
-        f: F,
-    ) -> Result<T, FrankenError>
+    fn query_row_map<T, F>(&self, sql: &str, params: &[ParamValue], f: F) -> Result<T, SqliteError>
     where
-        F: FnOnce(&Row) -> Result<T, FrankenError>;
+        F: FnOnce(&Row<'_>) -> Result<T, SqliteError>;
 
     /// Execute a query and collect all rows into a `Vec<T>` via mapping closure.
     fn query_map_collect<T, F>(
@@ -838,59 +1314,75 @@ pub trait ConnectionExt {
         sql: &str,
         params: &[ParamValue],
         f: F,
-    ) -> Result<Vec<T>, FrankenError>
+    ) -> Result<Vec<T>, SqliteError>
     where
-        F: FnMut(&Row) -> Result<T, FrankenError>;
+        F: FnMut(&Row<'_>) -> Result<T, SqliteError>;
+
+    /// Execute a query and visit every row with `f`, streaming with no
+    /// intermediate `Vec` allocation.
+    fn query_for_each<F>(&self, sql: &str, params: &[ParamValue], f: F) -> Result<(), SqliteError>
+    where
+        F: FnMut(&Row<'_>) -> Result<(), SqliteError>;
 
     /// Execute a SQL statement with `ParamValue` parameters.
-    fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError>;
+    fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, SqliteError>;
 }
 
 impl ConnectionExt for Connection {
-    fn query_row_map<T, F>(&self, sql: &str, params: &[ParamValue], f: F) -> Result<T, FrankenError>
+    fn query_row_map<T, F>(&self, sql: &str, params: &[ParamValue], f: F) -> Result<T, SqliteError>
     where
-        F: FnOnce(&Row) -> Result<T, FrankenError>,
+        F: FnOnce(&Row<'_>) -> Result<T, SqliteError>,
     {
-        drive(AsyncConnectionExt::query_row_map(
-            &self.inner,
-            sql,
-            params,
-            f,
-        ))?
+        let mut statement = self.inner.prepare(sql)?;
+        statement.query_row(rusqlite::params_from_iter(params.iter()), |row| Ok(f(row)))?
     }
 
     fn query_map_collect<T, F>(
         &self,
         sql: &str,
         params: &[ParamValue],
-        f: F,
-    ) -> Result<Vec<T>, FrankenError>
+        mut f: F,
+    ) -> Result<Vec<T>, SqliteError>
     where
-        F: FnMut(&Row) -> Result<T, FrankenError>,
+        F: FnMut(&Row<'_>) -> Result<T, SqliteError>,
     {
-        drive(AsyncConnectionExt::query_map_collect(
-            &self.inner,
-            sql,
-            params,
-            f,
-        ))?
+        let mut statement = self.inner.prepare(sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(params.iter()))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(f(row)?);
+        }
+        Ok(out)
     }
 
-    fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {
-        drive(AsyncConnectionExt::execute_compat(&self.inner, sql, params))?
+    fn query_for_each<F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        mut f: F,
+    ) -> Result<(), SqliteError>
+    where
+        F: FnMut(&Row<'_>) -> Result<(), SqliteError>,
+    {
+        let mut statement = self.inner.prepare(sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(params.iter()))?;
+        while let Some(row) = rows.next()? {
+            f(row)?;
+        }
+        Ok(())
+    }
+
+    fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, SqliteError> {
+        self.inner
+            .execute(sql, rusqlite::params_from_iter(params.iter()))
+            .map_err(SqliteError::Sqlite)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asupersync::{Cx, cx::CapMask};
-    use frankensqlite::compat::RowExt;
     use serial_test::serial;
-
-    fn driver_cached() -> bool {
-        DRIVER.with(|slot| slot.borrow().is_some())
-    }
 
     /// Snapshot copies this process has under the system temp dir.
     fn leaked_snapshot_dirs() -> Vec<PathBuf> {
@@ -910,7 +1402,7 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Path of a SQLite sidecar file (`<db>-wal`, `<db>-shm`).
+    /// Path of a SQLite sidecar file (`<db>-wal`, `<db>-shm`, `-journal`).
     fn sidecar(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
         let mut raw = db.as_os_str().to_owned();
         raw.push(suffix);
@@ -919,6 +1411,10 @@ mod tests {
 
     /// A WAL-mode database whose writer exited after a TRUNCATE checkpoint,
     /// leaving a `-wal` and a `-shm` behind.
+    ///
+    /// C SQLite checkpoints and *deletes* `-wal` and `-shm` when closing the
+    /// last writable connection, so `no_ckpt_on_close` is set before the
+    /// drop to keep both sidecars on disk.
     fn wal_mode_store(dir: &std::path::Path) -> std::path::PathBuf {
         let db = dir.join("store.db");
         let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
@@ -932,6 +1428,7 @@ mod tests {
             Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
         })
         .unwrap();
+        conn.set_no_ckpt_on_close(true).unwrap();
         drop(conn);
         assert!(sidecar(&db, "-wal").is_file());
         assert!(sidecar(&db, "-shm").is_file());
@@ -958,10 +1455,10 @@ mod tests {
         }
     }
 
-    /// `(bytes, mtime)` of the db / `-wal` / `-shm` trio, for never-modify
-    /// assertions.
-    fn trio_state(db: &std::path::Path) -> Vec<(Option<Vec<u8>>, Option<std::time::SystemTime>)> {
-        ["", "-wal", "-shm"]
+    /// `(bytes, mtime)` of the db / `-wal` / `-shm` / `-journal` quad, for
+    /// never-modify assertions.
+    fn quad_state(db: &std::path::Path) -> Vec<(Option<Vec<u8>>, Option<std::time::SystemTime>)> {
+        ["", "-wal", "-shm", "-journal"]
             .iter()
             .map(|suffix| {
                 let path = sidecar(db, suffix);
@@ -977,7 +1474,7 @@ mod tests {
 
     /// The names of every entry in the store's directory, for the
     /// no-file-created assertion: a refused or strict open must not leave
-    /// any new sidecar (`-shm`, `-journal`, the MVCC companion, ...) behind.
+    /// any new sidecar (`-shm`, `-journal`, ...) behind.
     fn directory_names(db: &std::path::Path) -> Vec<String> {
         let dir = db.parent().expect("the store has a parent directory");
         let mut names: Vec<String> = std::fs::read_dir(dir)
@@ -994,41 +1491,33 @@ mod tests {
         names
     }
 
-    /// A strict read-only open never performs WAL-index recovery and never
-    /// writes any sidecar: with the `-shm` wal-index absent, garbage, torn,
+    /// A strict in-place open never performs WAL-index recovery and never
+    /// writes any sidecar: with the `-shm` wal-index garbage, torn, absent,
     /// zeroed, or empty, the open fails with the typed `BusyRecovery` and
     /// the db / `-wal` / `-shm` bytes and mtimes are untouched, with no
     /// file created next to the store. This is the premise the snapshot
-    /// fallback (cass F9) exists for. Registry fsqlite 0.4.13 rebuilds the
-    /// zeroed and empty classes in place on a *plain* read-only open
-    /// (GH#528); the strict bit refuses them instead, so the original files
-    /// survive every class byte- and mtime-identically. (`absent` refuses
-    /// too: this fixture's checkpoint leaves a valid 32-byte WAL header, and
-    /// a strict open never creates the missing `-shm`. The one no-write
-    /// read — a 0-byte header-less `-wal` with no `-shm`, GH#515 — is
-    /// covered by the engine's own keepers.)
+    /// fallback (cass F9) exists for: C SQLite would otherwise rebuild the
+    /// missing or damaged wal-index in place — or, for `absent`, create
+    /// both sidecars outright (trap 1).
     #[test]
     fn strict_read_only_open_refuses_an_unusable_wal_index() {
         for state in ["garbage", "torn", "absent", "zeroed", "empty"] {
             let dir = tempfile::TempDir::new().unwrap();
             let db = wal_mode_store(dir.path());
             damage_shm(&db, state);
-            let before_trio = trio_state(&db);
+            let before_quad = quad_state(&db);
             let before_names = directory_names(&db);
 
-            let Err(error) = open_with_flags(
-                db.to_string_lossy().as_ref(),
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
-            ) else {
+            let Err(error) = open_external_strict_in_place(&db) else {
                 panic!("{state}: the strict open must refuse an unusable wal-index");
             };
             assert!(
-                matches!(error, FrankenError::BusyRecovery),
+                matches!(error, SqliteError::BusyRecovery),
                 "{state}: expected the typed BusyRecovery, got {error:?}"
             );
             assert_eq!(
-                trio_state(&db),
-                before_trio,
+                quad_state(&db),
+                before_quad,
                 "{state}: a refused strict open must leave the db, `-wal`, and `-shm` \
                  byte- and mtime-identical"
             );
@@ -1048,15 +1537,10 @@ mod tests {
 
     /// The snapshot fallback (cass F9) reads a store left with an unusable
     /// wal-index through a private copy. The contract, for every damaged
-    /// state and on every frankensqlite build:
+    /// state:
     ///   * the store's rows are readable in every state;
-    ///   * the fallback engages exactly when the strict read-only open
-    ///     refuses the store (the fork's strict bit refuses every class
-    ///     this fixture can produce — `absent` included, since its
-    ///     checkpoint leaves a valid 32-byte WAL header that a strict open
-    ///     never builds an `-shm` for; engine builds without the strict bit
-    ///     may instead accept a never-initialized class and rebuild it in
-    ///     place, which is exactly what the fallback protects against);
+    ///   * the fallback engages exactly when the strict in-place open
+    ///     refuses the store;
     ///   * when it engages, the original db / `-wal` / `-shm` bytes and
     ///     mtimes never change, no new file appears next to the original,
     ///     the copy exists while the connection lives, and it is removed
@@ -1069,19 +1553,10 @@ mod tests {
             let db = wal_mode_store(dir.path());
             damage_shm(&db, state);
 
-            // Whether this engine's strict open refuses the damaged store.
-            // The probe uses the strict bit, so on the fork every class
-            // that would need a WAL-index write is refused; an engine
-            // without it may accept a class and rebuild the
-            // never-initialized `-shm` in place, so capture the originals
-            // only afterwards.
-            let strict = open_with_flags(
-                db.to_string_lossy().as_ref(),
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
-            );
-            let strict_refused = strict.is_err();
-            drop(strict.ok());
-            let before = trio_state(&db);
+            // Whether this store's damaged wal-index makes the strict
+            // in-place open refuse it.
+            let strict_refused = open_external_strict_in_place(&db).is_err();
+            let before = quad_state(&db);
             let before_names = directory_names(&db);
 
             let conn = open_read_only_with_snapshot_fallback(db.to_string_lossy().as_ref())
@@ -1113,7 +1588,7 @@ mod tests {
                     "{state}: the snapshot copy must be removed when the connection drops"
                 );
                 assert_eq!(
-                    trio_state(&db),
+                    quad_state(&db),
                     before,
                     "{state}: the original db, `-wal`, and `-shm` must never be modified"
                 );
@@ -1136,7 +1611,7 @@ mod tests {
                 drop(conn);
                 // Nothing is ever written by a strict read-only open.
                 assert_eq!(
-                    trio_state(&db),
+                    quad_state(&db),
                     before,
                     "{state}: the db, `-wal`, and `-shm` must never be modified"
                 );
@@ -1154,8 +1629,8 @@ mod tests {
     }
 
     /// A non-WAL-index open failure is passed through unchanged: a file that
-    /// is not a database surfaces as the engine's own error, and no
-    /// snapshot copy is taken.
+    /// is not a database surfaces as an io-level error, and no snapshot copy
+    /// is taken.
     #[serial]
     #[test]
     fn snapshot_fallback_passes_other_open_failures_through() {
@@ -1172,6 +1647,259 @@ mod tests {
             leaked_snapshot_dirs().is_empty(),
             "no snapshot copy may be taken for a non-WAL-index failure"
         );
+    }
+
+    /// A live rollback journal on a plain (non-WAL) store engages the
+    /// snapshot copy: the in-place open must never touch it, and the
+    /// private copy rolls back or ignores the journal inside the temp dir.
+    #[serial]
+    #[test]
+    fn snapshot_fallback_handles_an_active_rollback_journal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        {
+            let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=delete; CREATE TABLE t (v INTEGER); \
+                 INSERT INTO t VALUES (7);",
+            )
+            .unwrap();
+        }
+        std::fs::write(sidecar(&db, "-journal"), b"\xd9live journal bytes").unwrap();
+        let before = quad_state(&db);
+        let before_names = directory_names(&db);
+        assert!(
+            !store_is_provably_empty(&db),
+            "an active rollback journal is never provable emptiness"
+        );
+
+        let conn = open_read_only_with_snapshot_fallback(db.to_string_lossy().as_ref())
+            .unwrap_or_else(|error| panic!("fallback failed: {error:?}"));
+        assert!(
+            conn.used_snapshot_fallback(),
+            "a live `-journal` must engage the snapshot copy"
+        );
+        let value: i64 = conn
+            .query_row_map("SELECT v FROM t", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(value, 7);
+        drop(conn);
+        assert_eq!(
+            quad_state(&db),
+            before,
+            "the original db and `-journal` must never be modified"
+        );
+        assert_eq!(
+            directory_names(&db),
+            before_names,
+            "no new file may appear next to the original store"
+        );
+        assert!(
+            leaked_snapshot_dirs().is_empty(),
+            "no snapshot copy may outlive its connection"
+        );
+    }
+
+    /// `std::fs::copy` preserves the source's permission bits, so a store
+    /// archived read-only (0444) would hand the snapshot copy a read-only
+    /// db and `-wal`, and C SQLite would then refuse the recovery writes
+    /// the copy exists to allow. The copies get their read-only flag
+    /// cleared — the originals are never chmod'ed — the store still reads
+    /// through the fallback, and the original files stay byte- and
+    /// mtime-identical.
+    #[cfg(unix)]
+    #[serial]
+    #[test]
+    fn snapshot_copy_of_a_read_only_store_recovers_and_leaves_it_untouched() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = wal_mode_store(dir.path());
+        damage_shm(&db, "garbage");
+        // Archive every store file read-only, the way an external store
+        // that must never be written would arrive.
+        for suffix in ["", "-wal", "-shm"] {
+            let path = sidecar(&db, suffix);
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o444);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        let before = quad_state(&db);
+
+        let conn = open_read_only_with_snapshot_fallback(db.to_string_lossy().as_ref())
+            .unwrap_or_else(|error| panic!("fallback failed: {error:?}"));
+        assert!(
+            conn.used_snapshot_fallback(),
+            "a damaged wal-index must engage the snapshot copy"
+        );
+        let value: i64 = conn
+            .query_row_map("SELECT v FROM t", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(value, 7, "the read-only store's rows must be readable");
+        let snapshot_dir = conn
+            .snapshot_dir()
+            .expect("a snapshot copy must exist")
+            .to_path_buf();
+        // The copies must be writable even though the sources were 0444.
+        for name in ["store.db", "store.db-wal"] {
+            let mode = std::fs::metadata(snapshot_dir.join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(
+                mode & 0o222,
+                0,
+                "{name}: the private copy must be writable (mode {mode:o})"
+            );
+        }
+        drop(conn);
+        assert!(
+            !snapshot_dir.exists(),
+            "the snapshot copy must be removed when the connection drops"
+        );
+        assert_eq!(
+            quad_state(&db),
+            before,
+            "the original 0444 files must stay byte- and mtime-identical"
+        );
+        for suffix in ["", "-wal", "-shm"] {
+            let path = sidecar(&db, suffix);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o444,
+                "the original store files must keep their read-only mode"
+            );
+        }
+        assert!(
+            leaked_snapshot_dirs().is_empty(),
+            "no snapshot copy may outlive its connection"
+        );
+    }
+
+    /// Trap 1: a cleanly closed WAL database keeps `header[18..20] == (2, 2)`
+    /// but has no `-wal` / `-shm` on disk, and any plain read-only open on
+    /// the original path would *create* both. The facade must route it
+    /// through the snapshot copy instead, leaving zero sidecars behind.
+    #[serial]
+    #[test]
+    fn cleanly_closed_wal_store_falls_back_without_creating_sidecars() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("store.db");
+        {
+            let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=wal; CREATE TABLE t (v INTEGER); \
+                 INSERT INTO t VALUES (7);",
+            )
+            .unwrap();
+            // No `set_no_ckpt_on_close`: a clean close checkpoints and
+            // deletes `-wal` and `-shm`.
+        }
+        assert!(
+            !sidecar(&db, "-wal").exists(),
+            "a clean WAL close removes the `-wal`"
+        );
+        assert!(
+            !sidecar(&db, "-shm").exists(),
+            "a clean WAL close removes the `-shm`"
+        );
+        let header = std::fs::read(&db).unwrap();
+        assert_eq!(
+            &header[18..20],
+            &[2, 2],
+            "the db header must still carry the WAL file-format version"
+        );
+        let before = quad_state(&db);
+        let before_names = directory_names(&db);
+
+        let conn = open_read_only_with_snapshot_fallback(db.to_string_lossy().as_ref())
+            .unwrap_or_else(|error| panic!("fallback failed: {error:?}"));
+        assert!(
+            conn.used_snapshot_fallback(),
+            "a cleanly closed WAL store must read through the snapshot copy"
+        );
+        let value: i64 = conn
+            .query_row_map("SELECT v FROM t", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(value, 7);
+        drop(conn);
+        assert_eq!(quad_state(&db), before, "the store must never be modified");
+        assert_eq!(directory_names(&db), before_names, "no sidecars created");
+        assert!(
+            !sidecar(&db, "-wal").exists() && !sidecar(&db, "-shm").exists(),
+            "zero `-wal`/`-shm` may be created next to the original file"
+        );
+        assert!(
+            leaked_snapshot_dirs().is_empty(),
+            "no snapshot copy may outlive its connection"
+        );
+    }
+
+    /// On Unix, a WAL store whose `-wal` and `-shm` are both intact opens in
+    /// place through `mode=ro&readonly_shm=1`: no snapshot copy, no byte or
+    /// mtime change on any of the three files, no new file created.
+    #[cfg(unix)]
+    #[serial]
+    #[test]
+    fn strict_in_place_open_reads_a_valid_wal_store_without_touching_anything() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = wal_mode_store(dir.path());
+        let before = quad_state(&db);
+        let before_names = directory_names(&db);
+
+        let conn = open_external_strict_in_place(&db)
+            .unwrap_or_else(|error| panic!("the in-place open must succeed: {error:?}"));
+        assert!(
+            !conn.used_snapshot_fallback(),
+            "a valid WAL store reads in place, not through a snapshot"
+        );
+        let value: i64 = conn
+            .query_row_map("SELECT v FROM t", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(value, 7);
+        drop(conn);
+        assert_eq!(
+            quad_state(&db),
+            before,
+            "readonly_shm=1 must leave db, `-wal`, and `-shm` byte- and mtime-identical"
+        );
+        assert_eq!(
+            directory_names(&db),
+            before_names,
+            "the in-place open must not create any file"
+        );
+    }
+
+    /// The `file:` URI used for the in-place open escapes `%`, `?`, `#`,
+    /// spaces, and non-ASCII bytes so stores living under such directory
+    /// names — Cyrillic and other Unicode names included — still open.
+    #[cfg(unix)]
+    #[test]
+    fn strict_in_place_open_handles_uri_special_characters_in_the_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in [
+            "sp ace",
+            "per%cent",
+            "ques?tion",
+            "ha#sh",
+            "mix ed%?#.dbdir",
+            "кириллица",
+            "ストア",
+        ] {
+            let odd = dir.path().join(name);
+            std::fs::create_dir(&odd).unwrap();
+            let db = wal_mode_store(&odd);
+            let before = quad_state(&db);
+
+            let conn = open_external_strict_in_place(&db)
+                .unwrap_or_else(|error| panic!("{name}: in-place open failed: {error:?}"));
+            let value: i64 = conn
+                .query_row_map("SELECT v FROM t", &[], |row| row.get_typed(0))
+                .unwrap_or_else(|error| panic!("{name}: query failed: {error:?}"));
+            assert_eq!(value, 7, "{name}");
+            drop(conn);
+            assert_eq!(quad_state(&db), before, "{name}: files untouched");
+        }
     }
 
     // cass F18 (2026-11-09): the snapshot-copy budget — size cap and
@@ -1201,7 +1929,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = wal_mode_store(dir.path());
         damage_shm(&db, "garbage");
-        let before_trio = trio_state(&db);
+        let before_quad = quad_state(&db);
         let before_names = directory_names(&db);
         let db_bytes = std::fs::metadata(&db).unwrap().len();
         let wal_bytes = std::fs::metadata(sidecar(&db, "-wal")).map_or(0, |meta| meta.len());
@@ -1215,7 +1943,7 @@ mod tests {
         let Err(error) = open_snapshot_copy(&db, &budget) else {
             panic!("an over-cap store must be refused instead of copied");
         };
-        let FrankenError::Internal(message) = error else {
+        let SqliteError::Internal(message) = error else {
             panic!("expected the typed Internal refusal, got {error:?}");
         };
         assert!(
@@ -1247,8 +1975,8 @@ mod tests {
             "no temp copy may be created for an over-cap store"
         );
         assert_eq!(
-            trio_state(&db),
-            before_trio,
+            quad_state(&db),
+            before_quad,
             "a refused over-cap store must never be modified"
         );
         assert_eq!(
@@ -1308,7 +2036,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = wal_mode_store(dir.path());
         damage_shm(&db, "garbage");
-        let before_trio = trio_state(&db);
+        let before_quad = quad_state(&db);
         let before_names = directory_names(&db);
         let total_bytes = store_total_bytes(&db);
 
@@ -1340,7 +2068,7 @@ mod tests {
         let Err(error) = open_snapshot_copy(&db, &budget) else {
             panic!("a low-free-space store must be refused instead of copied");
         };
-        let FrankenError::Internal(message) = error else {
+        let SqliteError::Internal(message) = error else {
             panic!("expected the typed Internal refusal, got {error:?}");
         };
         assert!(
@@ -1368,8 +2096,8 @@ mod tests {
             "no temp copy may be created for a low-free-space store"
         );
         assert_eq!(
-            trio_state(&db),
-            before_trio,
+            quad_state(&db),
+            before_quad,
             "a refused low-free-space store must never be modified"
         );
         assert_eq!(
@@ -1379,40 +2107,29 @@ mod tests {
         );
     }
 
-    /// cass GH #519: a runtime left in the thread-local slot is dropped by
-    /// the process-exit destructors on Windows and aborts the process.
-    /// `shutdown_driver` must empty the slot, and the bridge must keep
-    /// working after it.
+    /// `shutdown_driver` is a compatibility no-op now that no connector
+    /// runtime exists: it must keep succeeding, and the facade keeps working
+    /// before and after it.
     #[test]
-    fn shutdown_driver_releases_the_cached_runtime_and_the_bridge_still_works() {
+    fn shutdown_driver_is_a_no_op_and_the_facade_still_works() {
         std::thread::spawn(|| {
-            assert!(shutdown_driver(), "nothing cached yet");
-            assert!(!driver_cached());
+            assert!(shutdown_driver());
             let connection = Connection::open(":memory:").unwrap();
             connection
                 .execute_batch("CREATE TABLE t (v INTEGER)")
                 .unwrap();
             drop(connection);
-            assert!(driver_cached(), "a bridge call caches its runtime");
-            let started = std::time::Instant::now();
             assert!(shutdown_driver());
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(10),
-                "an idle runtime shuts down promptly"
-            );
-            assert!(!driver_cached(), "shutdown must release the runtime");
             let connection = Connection::open(":memory:").unwrap();
             connection
                 .execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);")
                 .unwrap();
-            assert!(driver_cached(), "a later call builds a new runtime");
             let count: i64 = connection
                 .query_row_map("SELECT count(*) FROM t", &[], |row| row.get_typed(0))
                 .unwrap();
             assert_eq!(count, 1);
             drop(connection);
             assert!(shutdown_driver());
-            assert!(!driver_cached());
         })
         .join()
         .unwrap();
@@ -1420,60 +2137,45 @@ mod tests {
 
     #[test]
     fn read_transaction_rolls_back_callback_and_row_mapper_panics() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            for restricted in [false, true] {
-                let restriction = restricted.then(|| Cx::push_restriction(CapMask::none()));
-                let caller = Cx::current().expect("caller context");
-                for panic_in_mapper in [false, true] {
-                    let connection = Connection::open(":memory:").unwrap();
-                    connection
-                        .execute_batch(
-                            "CREATE TABLE values_seen (value INTEGER); \
-                             INSERT INTO values_seen VALUES (1);",
-                        )
-                        .unwrap();
-                    let panic = catch_unwind(AssertUnwindSafe(|| {
-                        connection.read_transaction::<(), FrankenError>(|connection| {
-                            connection.execute("INSERT INTO values_seen VALUES (2)")?;
-                            if panic_in_mapper {
-                                return connection.query_row_map("SELECT 1", &[], |_| {
-                                    panic!("read-transaction callback panic"); // ubs:ignore[rust.ownership.panic-macro] — Inject mapper unwind to prove rollback and caller-context restoration.
-                                });
-                            }
-                            panic!("read-transaction callback panic"); // ubs:ignore[rust.ownership.panic-macro] — catch_unwind verifies this original callback payload survives.
-                        })
-                    }))
-                    .expect_err("callback must keep unwinding");
-                    assert_eq!(
-                        panic.downcast_ref::<&str>(),
-                        Some(&"read-transaction callback panic")
-                    );
-                    let restored = Cx::current().expect("restored caller context");
-                    assert_eq!(restored.task_id(), caller.task_id());
-                    assert_eq!(restored.region_id(), caller.region_id());
-                    assert_eq!(restored.capabilities(), caller.capabilities());
+        for panic_in_mapper in [false, true] {
+            let connection = Connection::open(":memory:").unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE values_seen (value INTEGER); \
+                     INSERT INTO values_seen VALUES (1);",
+                )
+                .unwrap();
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                connection.read_transaction::<(), FrankenError>(|connection| {
+                    connection.execute("INSERT INTO values_seen VALUES (2)")?;
+                    if panic_in_mapper {
+                        return connection.query_row_map("SELECT 1", &[], |_| {
+                            panic!("read-transaction callback panic"); // ubs:ignore[rust.ownership.panic-macro] — Inject mapper unwind to prove rollback releases the transaction.
+                        });
+                    }
+                    panic!("read-transaction callback panic"); // ubs:ignore[rust.ownership.panic-macro] — catch_unwind verifies this original callback payload survives.
+                })
+            }))
+            .expect_err("callback must keep unwinding");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"read-transaction callback panic")
+            );
 
-                    // The same connection must admit a new transaction, and
-                    // work before the callback panic must not be committed.
-                    let values: Vec<i64> = connection
-                        .read_transaction(|connection| {
-                            connection.query_map_collect(
-                                "SELECT value FROM values_seen ORDER BY value",
-                                &[],
-                                |row| row.get_typed(0),
-                            )
-                        })
-                        .unwrap();
-                    assert_eq!(values, vec![1]);
-                    drop(connection);
-                    let restored = Cx::current().expect("caller context after close");
-                    assert_eq!(restored.task_id(), caller.task_id());
-                    assert_eq!(restored.capabilities(), caller.capabilities());
-                }
-                drop(restriction);
-            }
-        });
+            // The same connection must admit a new transaction, and
+            // work before the callback panic must not be committed.
+            let values: Vec<i64> = connection
+                .read_transaction(|connection| {
+                    connection.query_map_collect(
+                        "SELECT value FROM values_seen ORDER BY value",
+                        &[],
+                        |row| row.get_typed(0),
+                    )
+                })
+                .unwrap();
+            assert_eq!(values, vec![1]);
+            drop(connection);
+        }
     }
 
     #[test]
@@ -1557,53 +2259,63 @@ mod tests {
         assert_eq!(value, 1, "the pre-existing transaction must remain owned");
     }
 
+    /// `params!` builds `&[ParamValue]` slices usable directly with the
+    /// `ConnectionExt` `&[ParamValue]` signatures — bare `params![...]`,
+    /// `params![]`, and a `let`-bound binding all work.
     #[test]
-    fn nested_sql_bridge_preserves_caller_context() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            let parent = Cx::current().expect("outer runtime context");
-            for restricted in [false, true] {
-                let restriction = restricted.then(|| Cx::push_restriction(CapMask::none()));
-                let caller = Cx::current().expect("caller context");
-                let assert_caller = || {
-                    let current = Cx::current().expect("restored caller context");
-                    assert_eq!(current.task_id(), caller.task_id());
-                    assert_eq!(current.region_id(), caller.region_id());
-                    assert_eq!(current.capabilities(), caller.capabilities());
-                };
+    fn params_macro_builds_param_slices() {
+        let a = params![1_i64, "x", 2.5_f64, true, Option::<i64>::None];
+        assert_eq!(a.len(), 5);
+        assert!(matches!(a[0].0, SqliteValue::Integer(1)));
+        assert!(matches!(a[1].0, SqliteValue::Text(ref s) if s == "x"));
+        assert!(matches!(a[2].0, SqliteValue::Real(_)));
+        assert!(matches!(a[3].0, SqliteValue::Integer(1)));
+        assert!(matches!(a[4].0, SqliteValue::Null));
+        let empty = params![];
+        assert_eq!(empty.len(), 0);
+        let bound: &[ParamValue] = params![9_i64, "z"];
+        assert_eq!(bound.len(), 2);
 
-                let connection = Connection::open(":memory:").unwrap();
-                assert_caller();
-                connection
-                    .execute_batch("CREATE TABLE values_seen (value INTEGER); INSERT INTO values_seen VALUES (40);")
-                    .unwrap();
-                assert_caller();
-                let value = connection
-                    .query_row_map("SELECT value FROM values_seen", &[], |row| {
-                        // Row mapping runs inside drive(). A nested bridge must
-                        // use a separate runtime, then restore the mapping task.
-                        let mapping = Cx::current().expect("mapping context");
-                        let nested = Connection::open(":memory:")?;
-                        let extra: i64 = nested.query_row_map("SELECT 2", &[], |row| {
-                            row.get_typed(0)
-                        })?;
-                        drop(nested);
-                        let restored = Cx::current().expect("restored mapping context");
-                        assert_eq!(restored.task_id(), mapping.task_id());
-                        assert_eq!(restored.capabilities(), mapping.capabilities());
-                        Ok(row.get_typed::<i64>(0)? + extra)
-                    })
-                    .unwrap();
-                assert_eq!(value, 42);
-                assert_caller();
-                drop(connection);
-                assert_caller();
-                drop(restriction);
-                let restored = Cx::current().expect("restored outer runtime context");
-                assert_eq!(restored.task_id(), parent.task_id());
-                assert_eq!(restored.capabilities(), parent.capabilities());
-            }
-        });
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER, s TEXT);")
+            .unwrap();
+        conn.execute_compat("INSERT INTO t VALUES (?, ?)", params![7_i64, "hi"])
+            .unwrap();
+        let v: i64 = conn
+            .query_row_map("SELECT v FROM t", params![], |r| r.get_typed(0))
+            .unwrap();
+        assert_eq!(v, 7);
+    }
+
+    /// `query_for_each` visits every row without collecting a `Vec`.
+    #[test]
+    fn query_for_each_streams_rows_and_propagates_callback_errors() {
+        let connection = Connection::open(":memory:").unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE values_seen (value INTEGER); \
+                 INSERT INTO values_seen VALUES (1); \
+                 INSERT INTO values_seen VALUES (2); \
+                 INSERT INTO values_seen VALUES (3);",
+            )
+            .unwrap();
+        let mut seen = Vec::new();
+        connection
+            .query_for_each("SELECT value FROM values_seen ORDER BY value", &[], |row| {
+                seen.push(row.get_typed::<i64>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, vec![1, 2, 3]);
+
+        let error = connection
+            .query_for_each("SELECT value FROM values_seen ORDER BY value", &[], |row| {
+                let value: i64 = row.get_typed(0)?;
+                assert_eq!(value, 1);
+                Err(FrankenError::Internal("stop".to_owned()))
+            })
+            .unwrap_err();
+        assert!(matches!(error, FrankenError::Internal(message) if message == "stop"));
     }
 
     // cass follow-up to F9 (2026-11-07): the provably-empty classifier.
@@ -1633,6 +2345,14 @@ mod tests {
         // A 0-byte `-wal` still proves emptiness.
         std::fs::write(sidecar(&db, "-wal"), []).unwrap();
         assert!(store_is_provably_empty(&db));
+
+        // An invalidated `-journal` (first byte zero) still proves emptiness.
+        std::fs::write(sidecar(&db, "-journal"), [0_u8; 64]).unwrap();
+        assert!(store_is_provably_empty(&db));
+
+        // A live `-journal` defeats the proof.
+        std::fs::write(sidecar(&db, "-journal"), b"\xd9live journal").unwrap();
+        assert!(!store_is_provably_empty(&db));
     }
 
     #[test]
@@ -1661,12 +2381,19 @@ mod tests {
                 .query_row_map("PRAGMA journal_mode=wal;", &[], |row| row.get_typed(0))
                 .unwrap();
             assert_eq!(mode.to_ascii_lowercase(), "wal");
+            // A WAL commit is what makes SQLite record `szPage` in the
+            // wal-index header; without one it stays 0 and the strict
+            // in-place open rightfully refuses the store.
+            conn.execute_batch("CREATE TABLE wal_probe (x INTEGER); DROP TABLE wal_probe;")
+                .unwrap();
             conn.query_row_map::<(i64, i64, i64), _>(
                 "PRAGMA wal_checkpoint(TRUNCATE);",
                 &[],
                 |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
             )
             .unwrap();
+            // Keep `-wal` and `-shm` on disk across the drop.
+            conn.set_no_ckpt_on_close(true).unwrap();
         }
         assert!(sidecar(&db, "-wal").is_file());
         assert!(store_is_provably_empty(&db));

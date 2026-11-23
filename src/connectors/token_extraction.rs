@@ -885,7 +885,7 @@ fn extract_generic_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
 /// `extra.token_usage`) for `input_tokens`, `output_tokens`, `cache_read_tokens`,
 /// and `cache_creation_tokens`, ignoring JSON `null` values, and prefers
 /// `extra.generation_model` over `extra.model`. Falls back to
-/// [`extract_generic_tokens`] when no API metrics are present.
+/// `extract_generic_tokens` when no API metrics are present.
 #[must_use]
 pub fn extract_devin_tokens(extra: &Value) -> ExtractedTokenUsage {
     let role = extra.get("role").and_then(Value::as_str).unwrap_or("");

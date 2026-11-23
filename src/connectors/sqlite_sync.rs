@@ -312,7 +312,7 @@ fn open_snapshot_copy(db_path: &Path, budget: &SnapshotBudget) -> Result<Connect
 /// drops.
 ///
 /// The copy is bounded (F18): a store whose db + `-wal` total exceeds
-/// [`SNAPSHOT_FALLBACK_MAX_BYTES`] (2 GiB, no environment knob), or whose
+/// `SNAPSHOT_FALLBACK_MAX_BYTES` (2 GiB, no environment knob), or whose
 /// copy would leave the temp dir with less than the copy's own size free,
 /// is refused before any copy with a scan error naming the store, its
 /// size, and the bound — the same error path any other unreadable store

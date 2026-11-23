@@ -61,11 +61,12 @@
 //!     reply; `thinking` is the model's reasoning, preserved in `extra.thinking`.
 //!   - any other `MODEL` kind (`VIEW_FILE`, `EDIT_FILE`, `RUN_COMMAND`, …) → a
 //!     `role: "tool"` step. `content` is the tool result; `tool_calls` (when
-//!     present) are the structured calls. We synthesize a [`NormalizedInvocation`]
-//!     named after the step so the tool is searchable even when `tool_calls` is
-//!     absent. The raw `type` is preserved in `extra.agy_type`. An error-only
-//!     step (no `content`, `thinking` or calls) lifts its `error` text as the
-//!     message content instead of being dropped, like `ERROR_MESSAGE` does.
+//!     present) are the structured calls. We synthesize a
+//!     [`NormalizedInvocation`](crate::types::NormalizedInvocation) named after
+//!     the step so the tool is searchable even when `tool_calls` is absent.
+//!     The raw `type` is preserved in `extra.agy_type`. An error-only step (no
+//!     `content`, `thinking` or calls) lifts its `error` text as the message
+//!     content instead of being dropped, like `ERROR_MESSAGE` does.
 //!   - `EPHEMERAL_MESSAGE` / `SYSTEM_MESSAGE` (`SYSTEM`) → `role: "system"`
 //!     (preserved faithfully; tagged in `extra` so consumers can down-rank the
 //!     repetitive ephemeral reminders).
@@ -75,7 +76,8 @@
 //!   - `CONVERSATION_HISTORY` (`SYSTEM`) — a marker record. It emits no message
 //!     when content-less, but when it carries `content` that text is emitted as
 //!     a `role: "system"` message instead of vanishing with the record (cass F10).
-//! - `created_at` — RFC3339 UTC (`2026-06-11T20:14:42Z`), read by [`parse_timestamp`].
+//! - `created_at` — RFC3339 UTC (`2026-06-11T20:14:42Z`), read by
+//!   [`parse_timestamp`](crate::connectors::parse_timestamp).
 //!
 //! Unknown future `type`s are never dropped or crashed on: they are emitted as a
 //! best-effort message keyed off `source`, with the raw `type` kept in
@@ -103,7 +105,7 @@
 //! block inventory from `agy_raw` field by field (indexed text, lifted calls,
 //! structural metadata) instead of treating every canonicalized record as
 //! structurally unverifiable. The clone happens in
-//! [`insert_passthrough_extras`], so all eight record arms archive the same
+//! `insert_passthrough_extras`, so all eight record arms archive the same
 //! way; records the connector drops whole (empty-body `USER_INPUT` turns with
 //! no attachments, content-less markers) still emit no message and therefore
 //! no archive.

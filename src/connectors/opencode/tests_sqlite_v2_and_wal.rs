@@ -21,8 +21,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use frankensqlite::compat::RowExt;
-use frankensqlite::params;
 use serde_json::json;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -37,7 +35,7 @@ use super::tests_support::{
     write_part, write_session,
 };
 use crate::connectors::Connector;
-use crate::connectors::sqlite_sync::ConnectionExt;
+use crate::connectors::sqlite_sync::{ConnectionExt, RowExt, params};
 
 #[test]
 fn sqlite_v2_session_only_in_session_v2_is_indexed_in_seq_order() {
@@ -1121,11 +1119,14 @@ fn create_wal_mode_sqlite_db(dir: &Path) -> PathBuf {
     .unwrap();
 
     // The incident shape: every frame checkpointed into the db, so the
-    // `-wal` remains on disk at 0 bytes after the writer exits.
+    // `-wal` remains on disk at 0 bytes after the writer exits. Closing
+    // the last connection would checkpoint and unlink the sidecars, so
+    // the writer disables the close-time checkpoint to leave them.
     conn.query_row_map::<(i64, i64, i64), _>("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
         Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
     })
     .unwrap();
+    conn.set_no_ckpt_on_close(true).unwrap();
     drop(conn);
 
     assert!(
@@ -1167,7 +1168,7 @@ fn damage_wal_index(db: &Path, state: &str) {
 /// modifying the user's files. The db and `-wal` are never written by any
 /// read-only open; the `-shm` is never written whenever the snapshot
 /// fallback engages, and `garbage`/`torn` wal-indexes refuse the strict
-/// open on every frankensqlite build, so the fallback always engages for
+/// open on every build, so the fallback always engages for
 /// them.
 #[serial]
 #[test]

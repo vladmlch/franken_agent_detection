@@ -21,7 +21,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-use frankensqlite::{SqliteValue, params};
 use tempfile::TempDir;
 
 use super::OpenCodeConnector;
@@ -29,7 +28,7 @@ use super::parts::normalize_sqlite_ts_value;
 use super::tests_support::{create_test_sqlite_db, open_test_connection, remote_scan_context};
 use crate::connectors::Connector;
 use crate::connectors::scan::{ScanContext, ScanRoot};
-use crate::connectors::sqlite_sync::ConnectionExt;
+use crate::connectors::sqlite_sync::{ConnectionExt, SqliteValue, params};
 
 #[test]
 fn sqlite_extract_simple_session() {
@@ -606,7 +605,7 @@ fn normalize_sqlite_ts_value_empty_text() {
 
 #[test]
 fn normalize_sqlite_ts_value_real() {
-    let val = SqliteValue::Float(1_700_000_000.5);
+    let val = SqliteValue::Real(1_700_000_000.5);
     assert_eq!(normalize_sqlite_ts_value(&val), Some(1_700_000_000_000));
 }
 

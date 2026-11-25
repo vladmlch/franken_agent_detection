@@ -21,10 +21,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use frankensqlite::params;
 use tempfile::TempDir;
 
-use super::super::sqlite_sync::{Connection, ConnectionExt};
+use super::super::sqlite_sync::{Connection, ConnectionExt, params};
 
 pub(super) fn open_test_connection(path: &Path) -> Connection {
     Connection::open(path.to_string_lossy().as_ref()).unwrap()

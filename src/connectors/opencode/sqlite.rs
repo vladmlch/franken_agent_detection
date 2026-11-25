@@ -22,8 +22,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ParamValue, RowExt};
-use frankensqlite::{Row, params};
 
 use super::OpenCodeConnector;
 use super::models::{
@@ -37,7 +35,8 @@ use super::parts::{
     sort_loaded_parts,
 };
 use crate::connectors::sqlite_sync::{
-    Connection, ConnectionExt, open_read_only_with_snapshot_fallback,
+    Connection, ConnectionExt, FrankenError, ParamValue, Row, RowExt,
+    open_read_only_with_snapshot_fallback, params,
 };
 use crate::connectors::unwrap_skill_invocations;
 use crate::types::{NormalizedConversation, NormalizedInvocation, NormalizedMessage};
@@ -251,7 +250,7 @@ impl OpenCodeConnector {
         progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<HashMap<String, Vec<NormalizedMessage>>> {
         const SELECT: &str = "SELECT session_id, id, type, seq, data, time_created FROM session_message WHERE data IS NOT NULL AND session_id IS NOT NULL AND id IS NOT NULL AND type IS NOT NULL";
-        let map_row = |row: &Row| -> Result<SqliteV2MessageRow, frankensqlite::FrankenError> {
+        let map_row = |row: &Row<'_>| -> Result<SqliteV2MessageRow, FrankenError> {
             Ok(SqliteV2MessageRow {
                 session_id: row.get_typed(0)?,
                 id: row.get_typed(1)?,

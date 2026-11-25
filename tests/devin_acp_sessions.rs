@@ -10,9 +10,8 @@ use franken_agent_detection::connectors::devin::DevinConnector;
 use franken_agent_detection::connectors::scan::{
     DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion, SourceScanHooks,
 };
-use franken_agent_detection::connectors::sqlite_sync::{Connection, ConnectionExt};
+use franken_agent_detection::connectors::sqlite_sync::{Connection, ConnectionExt, params};
 use franken_agent_detection::{Connector, franken_detection_for_connector};
-use frankensqlite::params;
 use serde_json::json;
 use tempfile::TempDir;
 

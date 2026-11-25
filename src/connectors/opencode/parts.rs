@@ -22,10 +22,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::{Row, SqliteValue};
 use walkdir::WalkDir;
 
 use super::models::{LoadedPart, MessageInfo, PartInfo, SessionInfo};
+use crate::connectors::sqlite_sync::{Row, RowExt, SqliteValue};
 use crate::connectors::unwrap_skill_invocations;
 use crate::connectors::utils::{file_modified_since, path_is_excluded, read_capped};
 use crate::types::{NormalizedInvocation, NormalizedMessage};
@@ -140,14 +140,10 @@ pub(super) fn error_text_of(error: Option<&serde_json::Value>) -> Option<&str> {
     }
 }
 
-pub(super) fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
-    row.get(index).and_then(|value| {
-        if matches!(value, SqliteValue::Null) {
-            None
-        } else {
-            Some(value.clone())
-        }
-    })
+pub(super) fn optional_sqlite_value(row: &Row<'_>, index: usize) -> Option<SqliteValue> {
+    row.get_value(index)
+        .ok()
+        .filter(|value| !matches!(value, SqliteValue::Null))
 }
 
 /// Normalize a raw SQLite value to epoch milliseconds.
@@ -160,7 +156,7 @@ pub(super) fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteVal
 pub(super) fn normalize_sqlite_ts_value(val: &SqliteValue) -> Option<i64> {
     match val {
         SqliteValue::Integer(i) => normalize_opencode_timestamp(Some(*i)),
-        SqliteValue::Float(f) => normalize_opencode_timestamp(Some(*f as i64)),
+        SqliteValue::Real(f) => normalize_opencode_timestamp(Some(*f as i64)),
         SqliteValue::Text(s) => {
             // Try common SQLite/Drizzle datetime formats (space separator)
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {

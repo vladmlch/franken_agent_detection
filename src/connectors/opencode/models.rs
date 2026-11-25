@@ -18,9 +18,9 @@
     clippy::unreadable_literal
 )]
 
-use frankensqlite::SqliteValue;
 use serde::Deserialize;
 
+use crate::connectors::sqlite_sync::SqliteValue;
 use crate::types::NormalizedMessage;
 
 pub(super) struct SqliteMessageRow {

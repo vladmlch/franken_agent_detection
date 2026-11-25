@@ -47,12 +47,10 @@ aes-gcm = { version = "0.11", optional = true }
 base64 = { version = "0.23", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
-frankensqlite = { version = "0.4.1", package = "fsqlite", optional = true }
-# Drives fsqlite's async (!Send) engine futures to completion behind the
-# connectors' synchronous API surface (see connectors/sqlite_sync.rs).
-# fsqlite 0.4 names asupersync 0.5.x types in its public API, so the two
-# must move in lockstep to preserve the bridge's runtime type identity.
-asupersync = { version = "0.5.0", default-features = false, optional = true }
+# Bundled SQLite engine behind the synchronous facade in
+# connectors/sqlite_sync.rs; that module owns the zero-mutation open
+# policy for external app stores.
+rusqlite = { version = "=0.40.2", features = ["bundled", "modern_sqlite"], optional = true }
 # Temp-dir free-space probe for the F9 snapshot-copy budget (F18,
 # src/connectors/sqlite_sync.rs): this crate forbids `unsafe`, so the
 # statvfs call rides fs4's safe API. default-features = false — only the
@@ -76,19 +74,23 @@ connectors = [
 ]
 # ChatGPT: AES-256-GCM decryption for v2/v3 encrypted conversations
 chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
+# Internal base for the SQLite-backed connectors: the bundled `rusqlite`
+# engine plus the `fs4` free-space probe the F18 snapshot budget needs.
+# Also usable alone to build and test the `sqlite_sync` facade.
+_sqlite-sync = ["connectors", "dep:rusqlite", "dep:fs4"]
 # Cursor: SQLite database access for state.vscdb
-cursor = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync", "dep:fs4"]
+cursor = ["_sqlite-sync", "dep:urlencoding"]
 # OpenCode: SQLite database access for v1.2+ opencode.db
-opencode = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync", "dep:fs4"]
+opencode = ["_sqlite-sync", "dep:urlencoding"]
 # Devin CLI: read-only access to the shared ~/.local/share/devin/cli/sessions.db
 # (cass #449). Without it the devin connector is detection-only.
-devin = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync", "dep:fs4"]
+devin = ["_sqlite-sync", "dep:urlencoding"]
 # Codex: read `rollout-*.jsonl.zst`, the form Codex's
 # `local_thread_store_compression` feature gives a finished session. Without
 # it those sessions are not discovered.
 codex-zstd = ["connectors", "dep:zstd"]
 # Qoder: read-only access to Electron main.sqlite native session titles
-qoder-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:fs4"]
+qoder-sqlite = ["_sqlite-sync"]
 # All connectors enabled
 all-connectors = [
     "connectors",
@@ -118,49 +120,3 @@ missing_panics_doc = "allow"
 # the form `assert!(x.is_empty())` across connectors. The lint offers no
 # mechanical rewrite; keep the established assertion style until then.
 assert_is_empty = "allow"
-
-# fsqlite's async engine builds enormous debug-mode futures; at opt-level 0
-# a single statement poll can overflow a 2 MiB test-thread stack. Upstream
-# frankensqlite itself develops at `[profile.dev] opt-level = 1` for the same
-# reason. Applies to dependencies only, never this crate's own test code.
-[profile.dev.package."*"]
-opt-level = 1
-
-# cass F17 (2026-11-09): redirect of the fsqlite family to the fork that
-# adds the strict read-only open mode (SQLITE_OPEN_STRICT_READ_ONLY,
-# `Connection::open_strict_read_only`, `compat::open_strict_read_only`), which
-# never creates or modifies any sidecar of a store it opens. Registry fsqlite
-# 0.4.13 rebuilds a never-initialized `-shm` in place on a plain read-only
-# open (GH#528), which touches the user's files; the fork refuses those
-# classes with the typed BusyRecovery instead, so the F9 snapshot fallback
-# engages again and the originals stay byte- and mtime-identical.
-#
-# Every family member the lockfile can resolve is listed: the fork's crates
-# depend on each other through the fork workspace, so patching only the
-# facade would mix the fork facade with registry siblings and fail to build.
-# This table affects only FAD's own standalone builds and tests; the cass
-# monorepo root ignores a member crate's patch table and pins the family
-# through its own committed [patch.crates-io] table at the same rev. The
-# entries point at the fork's pushed git revision (branch
-# cass-local-fixes-0413-ro) so a fresh clone resolves the same bytes.
-[patch.crates-io]
-fsqlite = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-ast = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-btree = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-core = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-error = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-ext-fts5 = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-ext-icu = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-ext-json = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-ext-misc = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-ext-rtree = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-func = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-mvcc = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-observability = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-pager = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-parser = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-planner = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-types = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-vdbe = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-vfs = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }
-fsqlite-wal = { git = "https://github.com/vladmlch/frankensqlite", rev = "898c43612b36301168b97644a89df2fb933ca457" }

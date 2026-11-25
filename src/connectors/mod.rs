@@ -24,12 +24,10 @@ pub mod scan;
 // cannot be read fails the scan instead of hiding.
 #[cfg(any(feature = "cursor", feature = "opencode", feature = "devin"))]
 pub(crate) mod checked_scan;
-#[cfg(any(
-    feature = "cursor",
-    feature = "opencode",
-    feature = "devin",
-    feature = "qoder-sqlite"
-))]
+// Internal synchronous `rusqlite` facade shared by every `*-sqlite`
+// connector feature (see connectors/sqlite_sync.rs); `_sqlite-sync` alone
+// builds it without the connector modules.
+#[cfg(feature = "_sqlite-sync")]
 pub mod sqlite_sync;
 pub mod token_extraction;
 pub mod utils;

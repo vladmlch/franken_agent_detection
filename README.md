@@ -415,9 +415,11 @@ traversal immediately, including when a source error was already deferred.
 | `codebuff`, `grok-bot` | Codebuff / Freebuff shared history; Grok Bot desktop replicas |
 | `all-connectors` | All of the above |
 
-SQLite stores are read with [FrankenSQLite](https://crates.io/crates/fsqlite)
-opened read-only inside one read transaction, so a live WAL is seen as one
-coherent snapshot and nothing is recovered or checkpointed.
+SQLite stores are read through a bundled `rusqlite` facade that opens them
+strictly read-only — in place when the store's WAL state allows it, or through
+a private snapshot copy when it does not — inside one read transaction, so a
+live WAL is seen as one coherent snapshot and the user's files are never
+recovered, checkpointed, or modified.
 
 ### Coverage
 
@@ -495,7 +497,7 @@ cargo test --locked --all-features
 
 - **Default detection-only build (`default = []`, `rust-version = "1.85"`)**: uses standard Rust 2024 edition syntax with zero optional dependencies.
 - **Non-SQLite connector features (`connectors`, `codex-zstd`, `chatgpt`)**: use Rust `1.88+` `let`-chains.
-- **SQLite-backed connector features** (`cursor`, `opencode`, `goose`, `hermes`, `crush`, `devin`, `shelley`, `openclaw-sqlite`, `pi-sqlite`, `pi-durable`, `all-connectors`): depend on `frankensqlite` and `asupersync`, which require the repository's pinned `rust-toolchain.toml` (`nightly-2026-08-31` or newer).
+- **SQLite-backed connector features** (`cursor`, `opencode`, `devin`, `qoder-sqlite`): depend on the bundled `rusqlite` engine; the repository's pinned `rust-toolchain.toml` (`nightly-2026-08-31` or newer) remains required for the `-Z threads=4` rustflags in `.cargo/config.toml`.
 - **Repository `.cargo/config.toml`**: sets `rustflags = ["-Z", "threads=4"]` for the pinned nightly toolchain; pass `RUSTFLAGS=""` if building non-SQLite feature slices with a stable compiler inside a checkout of this repository.
 
 ## Troubleshooting
@@ -506,8 +508,8 @@ cargo test --locked --all-features
 | Empty detection results | No roots exist on this machine | Set `include_undetected = true` to inspect evidence |
 | A connector scans nothing | Its storage needs a cargo feature (SQLite, crypto) | Enable the feature from the table above, or `all-connectors` |
 | Non-deterministic tests | Real home-dir probing | Use `root_overrides` / explicit `ScanRoot`s over temp directories |
-| Stack overflow in SQLite tests | fsqlite's large debug-mode futures | `.cargo/config.toml` sets `RUST_MIN_STACK`; keep it when vendoring |
-| `-Z threads=4` or `asupersync` MSRV error on stable | Building repository checkout or SQLite features without `rust-toolchain.toml` | Let `rustup` select `rust-toolchain.toml`, or pass `RUSTFLAGS=""` when building non-SQLite features on stable `1.88+` |
+| Stack overflow in SQLite tests | Deep debug-build call stacks in the connector tests | `.cargo/config.toml` sets `RUST_MIN_STACK`; keep it when vendoring |
+| `-Z threads=4` error on stable | Building the repository checkout without `rust-toolchain.toml` | Let `rustup` select `rust-toolchain.toml`, or pass `RUSTFLAGS=""` when building on stable `1.88+` |
 
 ## Limitations
 

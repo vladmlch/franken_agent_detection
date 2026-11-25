@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, ensure};
-use frankensqlite::compat::{ParamValue, RowExt};
 
+use super::super::sqlite_sync::{ParamValue, RowExt};
 use super::{Connection, ConnectionExt, DevinChain, DevinNode, walk_main_chain};
 
 const NODE_BATCH: usize = 256;

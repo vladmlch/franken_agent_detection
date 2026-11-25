@@ -71,6 +71,34 @@ window is since `v0.3.11` (2026-11-03).
 
 ## [Unreleased]
 
+### Changed
+
+- **Migrated SQLite connectors from `frankensqlite`/`asupersync` to bundled `rusqlite` (`=0.40.2`):**
+  replaced `frankensqlite`, `asupersync`, `[profile.dev.package."*"]` `opt-level = 1`, and the
+  20 `[patch.crates-io]` `fsqlite*` entries in `Cargo.toml` with
+  `rusqlite = { version = "=0.40.2", features = ["bundled", "modern_sqlite"], optional = true }`
+  under the internal `_sqlite-sync = ["connectors", "dep:rusqlite", "dep:fs4"]` feature. Wired
+  `_sqlite-sync` into the 4 surviving SQLite connector features (`cursor`, `opencode`, `devin`,
+  and `qoder-sqlite`), gated `connectors::sqlite_sync` behind `#[cfg(feature = "_sqlite-sync")]`,
+  and ported all 4 connectors, fixtures, and tests onto the synchronous `sqlite_sync` facade
+  (`SqliteValue::Real`, `Row<'_>`, `FrankenError` alias for `SqliteError`, and `const fn
+  shutdown_driver() -> bool` compatibility no-op).
+- **Split `src/connectors/sqlite_sync.rs` to stay under the 2,000-LOC limit:**
+  separated unit tests into `src/connectors/sqlite_sync/tests.rs` (1,479 lines) alongside
+  `src/connectors/sqlite_sync.rs` (1,561 lines).
+
+### Fixed
+
+- **WAL/SHM coherence guard and `SQLITE_PROTOCOL` fallback in `sqlite_sync`:**
+  before opening a Unix WAL store in place via `mode=ro&readonly_shm=1`, `open_wal_in_place`
+  now runs `wal_and_shm_are_coherent` (`read_valid_wal_header` + `read_valid_shm_header`) to
+  verify `-wal` magic/version/page size, `-shm` duplicated header agreement/format/checksum,
+  matching `page_size` and `aSalt` values, and checked `-wal` length
+  `>= 32 + mxFrame * (24 + page_size)` (or `mx_frame == 0` for a 0-byte `-wal`). Any
+  incoherent, truncated, or stale sidecar — as well as `ErrorCode::FileLockingProtocolFailed`
+  (`SQLITE_PROTOCOL`) during open or first read — maps to `SqliteError::BusyRecovery` and falls
+  back cleanly to a 2 GiB-bounded private snapshot copy without modifying the user's store.
+
 ## [0.3.11] -- 2026-11-03
 
 ### Added

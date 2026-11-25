@@ -406,19 +406,18 @@ traversal immediately, including when a source error was already deferred.
 |---|---|
 | `connectors` | Connector framework and every connector that needs no extra dependencies |
 | `chatgpt` | ChatGPT desktop, including AES-GCM encrypted v2/v3 conversations |
-| `cursor`, `opencode`, `goose`, `hermes`, `crush`, `devin`, `shelley` | SQLite-backed stores for those agents |
-| `openclaw-sqlite` | OpenClaw 2 per-agent SQLite transcripts (zstd events included) |
+| `cursor`, `opencode`, `devin`, `qoder-sqlite` | SQLite-backed stores for those agents (via internal `_sqlite-sync` / bundled `rusqlite`) |
 | `codex-zstd` | Codex rollouts compressed to `rollout-*.jsonl.zst` (Codex's `local_thread_store_compression`) |
-| `copilot-vscdb` | Legacy VS Code Copilot chat sessions in `state.vscdb` |
-| `pi-sqlite` | `pi_agent_rust` SQLite sessions for the Pi family |
-| `pi-durable` | SQLite stores of Pi's experimental durable harness |
 | `codebuff`, `grok-bot` | Codebuff / Freebuff shared history; Grok Bot desktop replicas |
 | `all-connectors` | All of the above |
 
-SQLite stores are read through a bundled `rusqlite` facade that opens them
-strictly read-only — in place when the store's WAL state allows it, or through
-a private snapshot copy when it does not — inside one read transaction, so a
-live WAL is seen as one coherent snapshot and the user's files are never
+SQLite stores are read through a bundled `rusqlite` (`=0.40.2`, `bundled`,
+`modern_sqlite`) facade (`connectors::sqlite_sync`, gated behind `_sqlite-sync`)
+that opens them strictly read-only — in place when the store's rollback or
+validated `-wal`/`-shm` state allows it (`mode=ro&readonly_shm=1` after checking
+header magic, page size, `aSalt` coherence, and frame bounds), or through a
+bounded private snapshot copy when it does not — inside one read transaction,
+so a live WAL is seen as one coherent snapshot and the user's files are never
 recovered, checkpointed, or modified.
 
 ### Coverage

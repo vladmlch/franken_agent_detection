@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use frankensqlite::params;
 use serde_json::{Map, Value};
 
 use super::CursorConnector;
@@ -14,7 +13,8 @@ use super::agent_transcripts::{
 use super::subagent_evidence::{ComposerDataCell, ComposerSubagentEvidence, ComposerSubagentFlag};
 use crate::connectors::scan::ScanRoot;
 use crate::connectors::sqlite_sync::{
-    Connection, ConnectionExt, open_read_only_with_snapshot_fallback, store_is_provably_empty,
+    Connection, ConnectionExt, open_read_only_with_snapshot_fallback, params,
+    store_is_provably_empty,
 };
 use crate::types::{NormalizedConversation, NormalizedMessage, reindex_messages};
 

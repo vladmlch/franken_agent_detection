@@ -1,12 +1,10 @@
-use frankensqlite::compat::RowExt;
-use frankensqlite::params;
 use serde_json::json;
 use tempfile::TempDir;
 
 use super::CursorConnector;
 use super::tests_support::{cursor_verdicts, verdict_test_db};
 use crate::connectors::scan::ScanRoot;
-use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
+use crate::connectors::sqlite_sync::{Connection, ConnectionExt, RowExt, params};
 
 // ------------------------------------------------------------------
 // Round 7: emitted-row evidence merge (N6) / one read snapshot (N7)
@@ -1001,6 +999,13 @@ fn extraction_reads_own_header_after_composer_rows() {
     let dir = TempDir::new().unwrap();
     let db = dir.path().join("state.vscdb");
     let conn = verdict_test_db(&db);
+    // The injected writer must be able to commit while the reader's row
+    // statement is still active. A rollback-journal store cannot do that
+    // — the reader's SHARED lock holds the writer's COMMIT until after
+    // the header read — so the fixture runs in WAL mode, the shape a
+    // live Cursor store has, with its sidecars left on disk for the
+    // strict read-only open.
+    conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
     for id in [c, other] {
         conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
@@ -1022,27 +1027,30 @@ fn extraction_reads_own_header_after_composer_rows() {
         )
         .unwrap();
     }
+    conn.set_no_ckpt_on_close(true).unwrap();
     drop(conn);
     let db_str = db.to_string_lossy().to_string();
     // Fires inside the composerData range read: one commit — C's header
     // flips to true. On the held-transaction implementation this attempt
     // is lock-blocked until after the verdict's snapshot; on the ordered
-    // reads it lands before the own-header read and is seen.
+    // reads it lands before the own-header read and is seen. The commit
+    // must come from a separate process: the strict read-only open's
+    // `readonly_shm` wal-index is read-only for every later opener in
+    // this process, so a same-process writer can never commit while the
+    // reader holds the store.
+    let exe = std::env::current_exe().unwrap();
     let inj = inject_on_tick(1, move || {
-        let Ok(w) = Connection::open(&db_str) else {
-            return false;
-        };
-        let ok = w.execute("BEGIN").is_ok()
-            && w.execute_compat(
-                "UPDATE composerHeaders SET isSubagent = ? WHERE composerId = ?",
-                params![1i64, c],
-            )
-            .is_ok()
-            && w.execute("COMMIT").is_ok();
-        if !ok {
-            let _ = w.execute("ROLLBACK");
-        }
-        ok
+        let output = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "connectors::cursor::tests_subagent_concurrency::\
+                 wal_store_commit_child_process_helper",
+                "--nocapture",
+            ])
+            .env("FAD_CURSOR_WAL_WRITER_DB", &db_str)
+            .env("FAD_CURSOR_WAL_WRITER_COMPOSER", c)
+            .output();
+        matches!(output, Ok(output) if output.status.success())
     });
     let convs = CursorConnector::extract_from_db(&db, None, inj.tick.as_ref()).unwrap();
     assert!(
@@ -1065,6 +1073,33 @@ fn extraction_reads_own_header_after_composer_rows() {
          committed true (writer committed_at_tick={})",
         inj.committed.get()
     );
+}
+
+/// Child-process half of `extraction_reads_own_header_after_composer_rows`:
+/// the parent spawns this test binary with the writer env vars set so the
+/// commit comes from a separate process — the shape of the live Cursor app
+/// writing while a scan reads. Without the env vars (an ordinary suite
+/// run) it returns immediately.
+#[test]
+fn wal_store_commit_child_process_helper() {
+    let (Ok(db), Ok(composer)) = (
+        std::env::var("FAD_CURSOR_WAL_WRITER_DB"),
+        std::env::var("FAD_CURSOR_WAL_WRITER_COMPOSER"),
+    ) else {
+        return;
+    };
+    let w = Connection::open(&db).unwrap();
+    let ok = w.execute("BEGIN").is_ok()
+        && w.execute_compat(
+            "UPDATE composerHeaders SET isSubagent = ? WHERE composerId = ?",
+            params![1i64, composer.as_str()],
+        )
+        .is_ok()
+        && w.execute("COMMIT").is_ok();
+    if !ok {
+        let _ = w.execute("ROLLBACK");
+        std::process::exit(1);
+    }
 }
 
 /// M2 (round-7): an uninterpretable `isSubagent` component vetoes an

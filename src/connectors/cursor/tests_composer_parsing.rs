@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use frankensqlite::params;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -10,7 +9,7 @@ use super::CursorConnector;
 use super::tests_support::create_test_db;
 use crate::connectors::Connector;
 use crate::connectors::scan::{ScanContext, ScanRoot};
-use crate::connectors::sqlite_sync::ConnectionExt;
+use crate::connectors::sqlite_sync::{ConnectionExt, params};
 
 #[test]
 fn remote_mirrors_discover_and_scan_cursor_databases() {

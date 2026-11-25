@@ -4,14 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::RowExt;
-use frankensqlite::params;
 use serde_json::Value;
 
 use super::CursorConnector;
 use super::subagent_evidence::{ComposerDataCell, ComposerSubagentEvidence};
 use crate::connectors::sqlite_sync::{
-    Connection, ConnectionExt, open_read_only_with_snapshot_fallback,
+    Connection, ConnectionExt, RowExt, open_read_only_with_snapshot_fallback, params,
 };
 use crate::connectors::utils::unwrap_skill_invocations;
 use crate::connectors::{
@@ -32,10 +30,10 @@ mod bubble_type {
 type BubbleDataMap = HashMap<String, Value>;
 
 /// One key-prefix range of `cursorDiskKV` (`?1` inclusive, `?2` exclusive).
-/// It must stay a bare key range: frankensqlite plans any residual predicate
-/// (such as `value IS NOT NULL`) as a full table scan, and a real
-/// multi-gigabyte `state.vscdb` then reads the whole table once per composer
-/// (cass F8). Callers skip NULL values in the row mapper instead.
+/// It must stay a bare key range: a residual predicate (such as
+/// `value IS NOT NULL`) can push a planner off the key-range seek, and a
+/// real multi-gigabyte `state.vscdb` then reads the whole table once per
+/// composer (cass F8). Callers skip NULL values in the row mapper instead.
 pub(super) const CURSOR_DISK_KV_RANGE_SQL: &str =
     "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?";
 

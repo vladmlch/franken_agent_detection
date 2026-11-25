@@ -8,7 +8,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use frankensqlite::params;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -16,7 +15,7 @@ use super::CursorConnector;
 use super::agent_transcripts::AGENT_TRANSCRIPTS_DIR;
 use crate::connectors::Connector;
 use crate::connectors::scan::{ScanContext, ScanRoot};
-use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
+use crate::connectors::sqlite_sync::{Connection, ConnectionExt, params};
 use crate::types::{NormalizedConversation, NormalizedMessage};
 
 // ------------------------------------------------------------------

@@ -2,8 +2,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use frankensqlite::compat::RowExt;
-use frankensqlite::params;
 use serde_json::json;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -14,7 +12,7 @@ use super::composer_parser::CURSOR_DISK_KV_RANGE_SQL;
 use super::tests_support::create_test_db;
 use crate::connectors::Connector;
 use crate::connectors::scan::{ScanContext, ScanRoot};
-use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
+use crate::connectors::sqlite_sync::{Connection, ConnectionExt, RowExt, params};
 
 // =========================================================================
 // Detection tests
@@ -92,11 +90,14 @@ fn create_wal_mode_state_vscdb(dir: &Path) -> PathBuf {
     .unwrap();
 
     // The incident shape: every frame checkpointed into the db, so the
-    // `-wal` remains on disk at 0 bytes after the writer exits.
+    // `-wal` remains on disk at 0 bytes after the writer exits. C SQLite
+    // checkpoints and deletes `-wal`/`-shm` when the last writable
+    // connection closes, so the fixture opts out of close-time cleanup.
     conn.query_row_map::<(i64, i64, i64), _>("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
         Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
     })
     .unwrap();
+    conn.set_no_ckpt_on_close(true).unwrap();
     drop(conn);
 
     assert!(
@@ -138,7 +139,7 @@ fn damage_wal_index(db: &Path, state: &str) {
 /// still be read, without modifying the user's files. The db and `-wal`
 /// are never written by any read-only open; the `-shm` is never written
 /// whenever the snapshot fallback engages, and `garbage`/`torn`
-/// wal-indexes refuse the strict open on every frankensqlite build, so the
+/// wal-indexes refuse the strict open on every engine build, so the
 /// fallback always engages for them.
 #[serial]
 #[test]
@@ -305,9 +306,10 @@ fn scan_processes_global_storage() {
 
 /// Cursor declares `key TEXT UNIQUE`, so the key range is served by the
 /// `sqlite_autoindex_cursorDiskKV_1` index. A residual predicate in this
-/// SQL (it once carried `value IS NOT NULL`) makes frankensqlite plan a
-/// full table scan, which on a real 2.9 GB store read the whole table for
-/// each of 1,488 composers: about 0.8 s each, 20+ minutes per scan.
+/// SQL (it once carried `value IS NOT NULL`) can make a planner fall back
+/// to a full table scan, which on a real 2.9 GB store read the whole
+/// table for each of 1,488 composers: about 0.8 s each, 20+ minutes per
+/// scan.
 #[test]
 fn cursor_disk_kv_range_query_seeks_the_key_index() {
     let dir = TempDir::new().unwrap();

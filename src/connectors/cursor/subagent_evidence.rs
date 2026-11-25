@@ -3,8 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use frankensqlite::compat::RowExt;
-use frankensqlite::{SqliteValue, params};
 use serde_json::{Map, Value};
 
 use super::CursorConnector;
@@ -12,7 +10,8 @@ use super::composer_parser::CURSOR_DISK_KV_RANGE_SQL;
 use crate::connectors::parse_timestamp;
 use crate::connectors::scan::ScanRoot;
 use crate::connectors::sqlite_sync::{
-    Connection, ConnectionExt, open_read_only_with_snapshot_fallback, store_is_provably_empty,
+    Connection, ConnectionExt, Row, RowExt, SqliteError, SqliteValueRef,
+    open_read_only_with_snapshot_fallback, params, store_is_provably_empty,
 };
 use crate::types::NormalizedConversation;
 
@@ -75,7 +74,7 @@ pub(super) struct ComposerSubagentEvidence {
 /// same (`v.decode("utf-8", errors="ignore")` then `json.loads`,
 /// claude_viewer viewer/providers/cursor/discovery.py). Any other storage
 /// class (INTEGER, REAL) is evidence this connector cannot decode. Reading
-/// the raw `SqliteValue` instead of `Option<String>` keeps one such cell
+/// the raw `SqliteValueRef` instead of `Option<String>` keeps one such cell
 /// from aborting the whole range query (round-8 N6 residual); a genuinely
 /// undecodable row marks the store uncertain for false, not just its own id.
 pub(super) enum ComposerDataCell {
@@ -217,16 +216,20 @@ impl CursorConnector {
     }
 
     fn text_or_bytes_column(
-        row: &frankensqlite::Row,
+        row: &Row<'_>,
         idx: usize,
-    ) -> std::result::Result<Option<String>, frankensqlite::FrankenError> {
-        match row.get_typed::<Option<String>>(idx) {
-            Ok(val) => Ok(val),
-            Err(err) => match row.get_typed::<Option<Vec<u8>>>(idx) {
-                Ok(Some(bytes)) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
-                Ok(None) => Ok(None),
-                Err(_) => Err(err),
-            },
+    ) -> std::result::Result<Option<String>, SqliteError> {
+        // TEXT and BLOB cells both decode through the same lossy UTF-8 view
+        // the typed `Option<String>`/`Option<Vec<u8>>` pair produced; any
+        // other storage class (or an unreadable column) is an error.
+        match row.get_ref(idx) {
+            Ok(SqliteValueRef::Null) => Ok(None),
+            Ok(SqliteValueRef::Text(bytes) | SqliteValueRef::Blob(bytes)) => {
+                Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+            }
+            _ => Err(SqliteError::Internal(format!(
+                "column {idx} is not TEXT, BLOB, or NULL"
+            ))),
         }
     }
 
@@ -236,14 +239,16 @@ impl CursorConnector {
         v as i64
     }
 
-    fn header_cell(row: &frankensqlite::Row, idx: usize) -> HeaderCell {
-        match row.get(idx) {
-            Some(SqliteValue::Null) => HeaderCell::Null,
-            Some(SqliteValue::Integer(i)) => HeaderCell::Int(*i),
-            Some(SqliteValue::Float(f)) => HeaderCell::Real(*f),
-            Some(SqliteValue::Text(s)) => HeaderCell::Text(s.as_str().to_string()),
-            Some(SqliteValue::Blob(b)) => HeaderCell::Blob(b.to_vec()),
-            None => HeaderCell::Unreadable,
+    fn header_cell(row: &Row<'_>, idx: usize) -> HeaderCell {
+        match row.get_ref(idx) {
+            Ok(SqliteValueRef::Null) => HeaderCell::Null,
+            Ok(SqliteValueRef::Integer(i)) => HeaderCell::Int(i),
+            Ok(SqliteValueRef::Real(f)) => HeaderCell::Real(f),
+            Ok(SqliteValueRef::Text(bytes)) => {
+                HeaderCell::Text(String::from_utf8_lossy(bytes).into_owned())
+            }
+            Ok(SqliteValueRef::Blob(bytes)) => HeaderCell::Blob(bytes.to_vec()),
+            Err(_) => HeaderCell::Unreadable,
         }
     }
 
@@ -252,7 +257,7 @@ impl CursorConnector {
     /// undecodable `isSubagent` cell sets `sub_unknown` so the composer does not
     /// get an own-header false, while the row's readable evidence is kept.
     fn read_composer_header_row(
-        row: &frankensqlite::Row,
+        row: &Row<'_>,
         sub_idx: Option<usize>,
         parent_idx: Option<usize>,
         value_idx: Option<usize>,
@@ -344,17 +349,15 @@ impl CursorConnector {
     /// lossy/ignore-errors recovery, because replacement characters inside
     /// an identifier would invent composers (e.g. `P�`) that can shadow a
     /// real parent or listing. Raw (non-UTF-8) TEXT gets the same verdict.
-    pub(super) fn composer_data_cell(row: &frankensqlite::Row, idx: usize) -> ComposerDataCell {
-        match row.get(idx) {
-            Some(SqliteValue::Text(s)) => match s.as_str_checked() {
-                Some(t) => ComposerDataCell::Text(t.to_string()),
-                None => ComposerDataCell::Undecodable,
-            },
-            Some(SqliteValue::Blob(b)) => match std::str::from_utf8(b) {
-                Ok(t) => ComposerDataCell::Text(t.to_string()),
-                Err(_) => ComposerDataCell::Undecodable,
-            },
-            Some(SqliteValue::Null) => ComposerDataCell::Null,
+    pub(super) fn composer_data_cell(row: &Row<'_>, idx: usize) -> ComposerDataCell {
+        match row.get_ref(idx) {
+            Ok(SqliteValueRef::Text(bytes) | SqliteValueRef::Blob(bytes)) => {
+                match std::str::from_utf8(bytes) {
+                    Ok(t) => ComposerDataCell::Text(t.to_string()),
+                    Err(_) => ComposerDataCell::Undecodable,
+                }
+            }
+            Ok(SqliteValueRef::Null) => ComposerDataCell::Null,
             _ => ComposerDataCell::Undecodable,
         }
     }
@@ -517,7 +520,7 @@ impl CursorConnector {
     ) -> ComposerSubagentEvidence {
         let prefix = "composerData:";
         let limit = Self::prefix_upper_bound(prefix);
-        // The raw SqliteValue capture keeps a single non-TEXT cell (e.g. a
+        // The raw SqliteValueRef capture keeps a single non-TEXT cell (e.g. a
         // BLOB under composerData) from voiding the whole range read —
         // every row that decodes keeps its positive/parent evidence.
         let rows = conn.query_map_collect(

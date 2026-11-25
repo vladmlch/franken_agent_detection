@@ -4,12 +4,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use frankensqlite::params;
 use serde_json::Value;
 use tempfile::TempDir;
 
 use super::CursorConnector;
-use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
+use crate::connectors::sqlite_sync::{Connection, ConnectionExt, params};
 
 /// Create a test SQLite database with the cursorDiskKV table
 pub(super) fn create_test_db(path: &Path) -> Connection {

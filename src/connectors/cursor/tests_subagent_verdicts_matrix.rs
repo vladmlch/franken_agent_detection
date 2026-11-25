@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
 
-use frankensqlite::params;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -9,7 +8,7 @@ use super::CursorConnector;
 use super::tests_support::{cursor_verdicts, verdict_test_db};
 use crate::connectors::Connector;
 use crate::connectors::scan::{ScanContext, ScanRoot};
-use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
+use crate::connectors::sqlite_sync::{Connection, ConnectionExt, params};
 
 #[test]
 fn is_subagent_explicit_decoding_across_json_itemtable_and_sql() {

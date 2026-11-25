@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
 
-use frankensqlite::params;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use super::CursorConnector;
 use super::tests_support::{cursor_store, cursor_verdicts, verdict_test_db};
 use crate::connectors::scan::{ScanContext, ScanRoot};
-use crate::connectors::sqlite_sync::ConnectionExt;
+use crate::connectors::sqlite_sync::{ConnectionExt, params};
 use crate::connectors::{Connector, parse_timestamp};
 
 #[test]

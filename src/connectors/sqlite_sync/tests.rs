@@ -1477,3 +1477,44 @@ fn wal_database_with_table_only_in_wal_and_damaged_shm_is_not_provably_empty() {
     damage_shm(&db, "garbage");
     assert!(!store_is_provably_empty(&db));
 }
+
+#[cfg(unix)]
+#[test]
+fn same_process_live_wal_writer_falls_back_without_mutating_shm_read_marks() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("store.db");
+    let writer = rusqlite::Connection::open(&db).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t (v INTEGER);
+             INSERT INTO t VALUES (1);
+             SELECT COUNT(*) FROM t;",
+        )
+        .unwrap();
+    // Advance WAL past aReadMark without running a read on `writer` so a
+    // shared-pShmNode reader would bump `-shm` aReadMark[1] (offset 104).
+    writer.execute("INSERT INTO t VALUES (2);", []).unwrap();
+    let before = quad_state(&db);
+    let before_names = directory_names(&db);
+
+    let Err(err) = open_external_strict_in_place(&db) else {
+        panic!("same-process live WAL writer must refuse in-place open");
+    };
+    assert!(matches!(err, SqliteError::BusyRecovery), "unexpected: {err:?}");
+    assert_eq!(quad_state(&db), before, "strict refusal must not touch shm");
+
+    let conn = open_read_only_with_snapshot_fallback(db.to_string_lossy().as_ref())
+        .unwrap_or_else(|error| panic!("snapshot fallback failed: {error:?}"));
+    assert!(conn.used_snapshot_fallback());
+    let mut values: Vec<i64> = conn
+        .query_map_collect("SELECT v FROM t ORDER BY v", &[], |row| row.get_typed(0))
+        .unwrap();
+    values.sort_unstable();
+    assert_eq!(values, vec![1, 2]);
+    drop(conn);
+    assert_eq!(quad_state(&db), before, "reader must preserve db/wal/shm bytes");
+    assert_eq!(directory_names(&db), before_names);
+    drop(writer);
+}

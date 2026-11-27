@@ -771,6 +771,44 @@ const fn wal_index_open_failure(error: &rusqlite::Error) -> bool {
     )
 }
 
+/// Whether the current process already holds an open file descriptor to
+/// `db_path` or `shm_path` (fail-closed `true` if descriptor inspection fails).
+#[cfg(unix)]
+fn same_process_holds_sqlite_fd(db_path: &Path, shm_path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(db_meta) = std::fs::metadata(db_path) else {
+        return true;
+    };
+    let Ok(shm_meta) = std::fs::metadata(shm_path) else {
+        return true;
+    };
+    let fd_dir = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let Ok(entries) = std::fs::read_dir(fd_dir) else {
+        return true;
+    };
+    let same_file = |meta: &std::fs::Metadata, target: &std::fs::Metadata| -> bool {
+        if cfg!(target_os = "linux") {
+            meta.dev() == target.dev() && meta.ino() == target.ino()
+        } else {
+            meta.ino() == target.ino()
+        }
+    };
+    for entry in entries.flatten() {
+        if let Ok(meta) = std::fs::metadata(entry.path())
+            && meta.is_file()
+            && (same_file(&meta, &db_meta) || same_file(&meta, &shm_meta))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Mode 2 of [`open_external_strict_in_place`]: a WAL store whose `-wal`
 /// and `-shm` both exist, validate, and are mutually coherent (`wal.aSalt ==
 /// shm.aSalt` and `-wal` covers `mxFrame` frames) is opened in place through
@@ -784,6 +822,13 @@ fn open_wal_in_place(
     shm_path: &Path,
 ) -> Result<Connection, SqliteError> {
     if !wal_and_shm_are_coherent(wal_path, shm_path)? {
+        return Err(SqliteError::BusyRecovery);
+    }
+    // C SQLite shares one `unixShmNode` per `(dev, ino)` across the process:
+    // if another handle in this process already holds `db` or `-shm` open
+    // read-write, `readonly_shm=1` still reuses its writable mmap and mutates
+    // `aReadMark` in `-shm`. Fall back to a private snapshot copy instead.
+    if same_process_holds_sqlite_fd(db_path, shm_path) {
         return Err(SqliteError::BusyRecovery);
     }
     let uri = read_only_uri(db_path);
